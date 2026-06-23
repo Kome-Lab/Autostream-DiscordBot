@@ -64,8 +64,8 @@ go build ./...
 ## Deployment
 
 - Docker / Compose: `Dockerfile`、`docker-compose.yml`
-- Host install: `docs/deployment/host.md`
 - systemd unit: `systemd/autostream-discord-bot.service.example`
+- Detailed deployment, Discord audio, and security documentation is maintained in the `autostream-docs` repository.
 
 ## Security
 

@@ -1,0 +1,297 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/example/autostream-discord-bot/internal/control"
+	"github.com/example/autostream-discord-bot/internal/discord"
+	"github.com/example/autostream-discord-bot/internal/jobs"
+)
+
+type httpFakeVoice struct {
+	joined discord.VoiceJob
+}
+
+func (f *httpFakeVoice) Connect() error { return nil }
+
+func (f *httpFakeVoice) JoinVoice(job discord.VoiceJob) error {
+	f.joined = job
+	return nil
+}
+
+func (f *httpFakeVoice) LeaveVoice(streamID string) error { return nil }
+
+func (f *httpFakeVoice) Status() discord.Status {
+	return discord.Status{Connected: f.joined.StreamID != "", VoiceConnected: f.joined.StreamID != ""}
+}
+
+func TestProtectedEndpointsRejectMissingToken(t *testing.T) {
+	server := httptest.NewServer(NewServer("discord_bot", jobs.NewManager(&discord.NoopClient{}), TokenVerifier{PlainToken: "expected"}))
+	defer server.Close()
+
+	res, err := http.Post(server.URL+"/jobs/start", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", res.StatusCode)
+	}
+}
+
+func TestStartJobRequiresValidTokenAndUpdatesStatus(t *testing.T) {
+	server := httptest.NewServer(NewServer("discord_bot", jobs.NewManager(&discord.NoopClient{}), TokenVerifier{PlainToken: "expected"}))
+	defer server.Close()
+
+	body := []byte(`{"stream_id":"stream-01","guild_id":"guild-01","voice_channel_id":"voice-01","text_channel_id":"text-01","encoder_audio_url":"` + "https://" + "user:" + "secret" + "@encoder.example.com" + `","stream_ingest_token":"ingest-secret"}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer expected")
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", res.StatusCode)
+	}
+
+	statusRes, err := http.Get(server.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statusRes.Body.Close()
+	if statusRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", statusRes.StatusCode)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(statusRes.Body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "stream-01") {
+		t.Fatalf("status should include current stream id: %s", buf.String())
+	}
+	for _, raw := range []string{"secret", "encoder_audio_url", "guild-01", "voice-01", "text-01", "stream_ingest_token"} {
+		if strings.Contains(buf.String(), raw) {
+			t.Fatalf("status leaked sensitive job field %q: %s", raw, buf.String())
+		}
+	}
+}
+
+func TestStartJobAppliesRuntimeStreamDiscordConfig(t *testing.T) {
+	voice := &httpFakeVoice{}
+	handler := NewServerWithRuntimeConfig("discord_bot", jobs.NewManager(voice), TokenVerifier{PlainToken: "expected"}, func(ctx context.Context) (control.RuntimeConfig, error) {
+		return control.RuntimeConfig{
+			Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+			Assignments: []control.StreamServiceAssignment{{
+				StreamID:       "stream-01",
+				ServiceID:      "discord-bot-01",
+				ServiceType:    "discord_bot",
+				AssignmentRole: "primary",
+			}},
+			StreamDiscordConfigs: []control.StreamDiscordConfig{{
+				StreamID:        "stream-01",
+				AssignmentRole:  "primary",
+				DiscordConfigID: "discord-config-01",
+				GuildID:         "guild-stream",
+				VoiceChannelID:  "voice-stream",
+				TextChannelID:   "text-stream",
+				CaptionAudioURL: "https://caption.example.com/stream",
+			}},
+		}, nil
+	})
+
+	body := []byte(`{"stream_id":"stream-01"}`)
+	req := httptest.NewRequest(http.MethodPost, "/jobs/start", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer expected")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", res.Code, res.Body.String())
+	}
+	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "https://caption.example.com/stream" {
+		t.Fatalf("runtime stream discord config was not applied: %#v", voice.joined)
+	}
+	if strings.Contains(res.Body.String(), "guild-stream") || strings.Contains(res.Body.String(), "voice-stream") || strings.Contains(res.Body.String(), "text-stream") || strings.Contains(res.Body.String(), "caption.example.com") {
+		t.Fatalf("start response leaked stream channel config: %s", res.Body.String())
+	}
+}
+
+func TestStartJobDoesNotUseStandbyRuntimeStreamDiscordConfig(t *testing.T) {
+	voice := &httpFakeVoice{}
+	handler := NewServerWithRuntimeConfig("discord_bot", jobs.NewManager(voice), TokenVerifier{PlainToken: "expected"}, func(ctx context.Context) (control.RuntimeConfig, error) {
+		return control.RuntimeConfig{
+			Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+			Assignments: []control.StreamServiceAssignment{{
+				StreamID:       "stream-01",
+				ServiceID:      "discord-bot-01",
+				ServiceType:    "discord_bot",
+				AssignmentRole: "standby",
+			}},
+			StreamDiscordConfigs: []control.StreamDiscordConfig{{
+				StreamID:        "stream-01",
+				AssignmentRole:  "standby",
+				DiscordConfigID: "discord-config-standby",
+				GuildID:         "guild-standby",
+				VoiceChannelID:  "voice-standby",
+			}},
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/jobs/start", strings.NewReader(`{"stream_id":"stream-01"}`))
+	req.Header.Set("Authorization", "Bearer expected")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("expected standby-only runtime config to fail assignment policy, got %d body=%s", res.Code, res.Body.String())
+	}
+	if voice.joined.StreamID != "" {
+		t.Fatalf("standby config must not start a job: %#v", voice.joined)
+	}
+	if strings.Contains(res.Body.String(), "guild-standby") || strings.Contains(res.Body.String(), "voice-standby") {
+		t.Fatalf("standby channel config leaked in error response: %s", res.Body.String())
+	}
+}
+
+func TestStartJobRejectsUnassignedRuntimeStreamEvenWithRequestChannels(t *testing.T) {
+	voice := &httpFakeVoice{}
+	handler := NewServerWithRuntimeConfig("discord_bot", jobs.NewManager(voice), TokenVerifier{PlainToken: "expected"}, func(ctx context.Context) (control.RuntimeConfig, error) {
+		return control.RuntimeConfig{
+			Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+			Assignments: []control.StreamServiceAssignment{{
+				StreamID:       "stream-01",
+				ServiceID:      "discord-bot-02",
+				ServiceType:    "discord_bot",
+				AssignmentRole: "primary",
+			}},
+			StreamDiscordConfigs: []control.StreamDiscordConfig{{
+				StreamID:        "stream-01",
+				AssignmentRole:  "primary",
+				DiscordConfigID: "discord-config-01",
+				GuildID:         "guild-runtime",
+				VoiceChannelID:  "voice-runtime",
+			}},
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/jobs/start", strings.NewReader(`{"stream_id":"stream-01","guild_id":"guild-request","voice_channel_id":"voice-request"}`))
+	req.Header.Set("Authorization", "Bearer expected")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("expected unassigned stream to be rejected, got %d body=%s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"code":"stream_not_assigned_to_service"`) {
+		t.Fatalf("expected stream assignment error code, got %s", res.Body.String())
+	}
+	if voice.joined.StreamID != "" {
+		t.Fatalf("unassigned stream must not start a job: %#v", voice.joined)
+	}
+	for _, leaked := range []string{"guild-request", "voice-request", "guild-runtime", "voice-runtime"} {
+		if strings.Contains(res.Body.String(), leaked) {
+			t.Fatalf("assignment rejection leaked channel config %q: %s", leaked, res.Body.String())
+		}
+	}
+}
+
+func TestStartJobFailsClosedWhenRuntimeConfigFetchFailsEvenWithRequestChannels(t *testing.T) {
+	voice := &httpFakeVoice{}
+	handler := NewServerWithRuntimeConfig("discord_bot", jobs.NewManager(voice), TokenVerifier{PlainToken: "expected"}, func(ctx context.Context) (control.RuntimeConfig, error) {
+		return control.RuntimeConfig{}, errors.New("control panel unavailable")
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/jobs/start", strings.NewReader(`{"stream_id":"stream-01","guild_id":"guild-request","voice_channel_id":"voice-request"}`))
+	req.Header.Set("Authorization", "Bearer expected")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusBadGateway {
+		t.Fatalf("expected runtime config fetch failure to fail closed, got %d body=%s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"code":"runtime_config_fetch_failed"`) {
+		t.Fatalf("expected runtime config fetch error code, got %s", res.Body.String())
+	}
+	if voice.joined.StreamID != "" {
+		t.Fatalf("runtime config fetch failure must not start a job: %#v", voice.joined)
+	}
+	for _, leaked := range []string{"guild-request", "voice-request", "control panel unavailable"} {
+		if strings.Contains(res.Body.String(), leaked) {
+			t.Fatalf("runtime config fetch rejection leaked %q: %s", leaked, res.Body.String())
+		}
+	}
+}
+
+func TestSHA256TokenVerifier(t *testing.T) {
+	sum := sha256.Sum256([]byte("expected"))
+	verifier := TokenVerifier{SHA256Hex: hex.EncodeToString(sum[:])}
+	if !verifier.Verify("Bearer expected") {
+		t.Fatal("expected token to verify")
+	}
+	if verifier.Verify("Bearer wrong") {
+		t.Fatal("wrong token verified")
+	}
+}
+
+func TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackInProduction(t *testing.T) {
+	t.Setenv("CONTROL_PANEL_TOKEN", "control-panel-token")
+	t.Setenv("AUTOSTREAM_ENV", "production")
+	verifier := TokenVerifierFromEnv()
+	if verifier.Verify("Bearer control-panel-token") {
+		t.Fatal("CONTROL_PANEL_TOKEN must not authorize inbound Discord Bot control requests in production")
+	}
+}
+
+func TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackWhenRuntimeConfigRequired(t *testing.T) {
+	t.Setenv("CONTROL_PANEL_TOKEN", "control-panel-token")
+	t.Setenv("AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG", "true")
+	verifier := TokenVerifierFromEnv()
+	if verifier.Verify("Bearer control-panel-token") {
+		t.Fatal("CONTROL_PANEL_TOKEN must not authorize inbound Discord Bot control requests when runtime config is required")
+	}
+}
+
+func TestTokenVerifierFromEnvAllowsControlPanelTokenFallbackOutsideProduction(t *testing.T) {
+	t.Setenv("CONTROL_PANEL_TOKEN", "control-panel-token")
+	verifier := TokenVerifierFromEnv()
+	if !verifier.Verify("Bearer control-panel-token") {
+		t.Fatal("expected local compatibility CONTROL_PANEL_TOKEN fallback outside production")
+	}
+}
+
+func TestErrorDoesNotEchoBearerToken(t *testing.T) {
+	server := httptest.NewServer(NewServer("discord_bot", jobs.NewManager(&discord.NoopClient{}), TokenVerifier{PlainToken: "secret-token"}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":"","guild_id":"","voice_channel_id":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(res.Body); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "secret-token") {
+		t.Fatalf("token leaked in response: %s", buf.String())
+	}
+}
