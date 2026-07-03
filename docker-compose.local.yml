@@ -1,14 +1,9 @@
 services:
   discord-bot:
     environment:
-      SERVICE_ID: discord-bot-local-01
-      SERVICE_NAME: Discord Bot Local
-      SERVICE_PUBLIC_URL: http://host.docker.internal:8083
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-node/config.yml
       SERVICE_VERSION: 0.1.0-local
-      CONTROL_PANEL_URL: http://host.docker.internal:8080
-      CONTROL_PANEL_TOKEN: ${AUTOSTREAM_LOCAL_DISCORD_TOKEN:?AUTOSTREAM_LOCAL_DISCORD_TOKEN is required}
       CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC: 5
-      SERVICE_CONTROL_TOKEN_SHA256: 133dd58081fce1840b7eabfb72582af6a8413e8b9dab2845ee7e0ce4f86f3a38
       WORKER_URL: http://host.docker.internal:8084
       WORKER_TOKEN: dev-only-control-to-service-token
       ENCODER_AUDIO_TOKEN: dev-only-discord-audio-token
@@ -17,3 +12,5 @@ services:
       TZ: Asia/Tokyo
     ports: !override
       - "8083:8080"
+    volumes: !override
+      - ./config/autostream-node.yml:/etc/autostream-node/config.yml:ro

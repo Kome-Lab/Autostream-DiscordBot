@@ -43,10 +43,17 @@ type TokenVerifier struct {
 var errStreamNotAssignedToService = errors.New("stream is not assigned to this discord bot as primary")
 
 func TokenVerifierFromEnv() TokenVerifier {
-	return TokenVerifier{
+	verifier := TokenVerifier{
 		PlainToken: os.Getenv("SERVICE_CONTROL_TOKEN"),
 		SHA256Hex:  os.Getenv("SERVICE_CONTROL_TOKEN_SHA256"),
 	}
+	if verifier.PlainToken == "" && verifier.SHA256Hex == "" {
+		if token := control.NodeRuntimeTokenFromEnv(); token != "" {
+			sum := sha256.Sum256([]byte(token))
+			verifier.SHA256Hex = hex.EncodeToString(sum[:])
+		}
+	}
+	return verifier
 }
 
 func (v TokenVerifier) Verify(header string) bool {
