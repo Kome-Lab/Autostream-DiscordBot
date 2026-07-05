@@ -13,6 +13,7 @@ This archive contains the Linux binary, systemd example, and placeholder environ
 
 ```bash
 sudo install -o root -g root -m 0755 bin/discord-bot /usr/local/bin/discord-bot
+sudo ln -sf /usr/local/bin/discord-bot /usr/local/bin/autostream-discord-bot
 sudo install -d -o autostream -g autostream /var/lib/autostream/discord-bot
 sudo install -o root -g root -m 0644 systemd/autostream-discord-bot.service.example /etc/systemd/system/autostream-discord-bot.service
 sudo install -o root -g root -m 0640 .env.example /etc/autostream/discord-bot.env
