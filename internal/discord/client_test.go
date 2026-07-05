@@ -15,8 +15,12 @@ import (
 type fakeEventSink struct {
 	activeStreamID string
 	activeUserID   string
+	voiceJoin      VoiceJoinEvent
 }
 
+func (f *fakeEventSink) VoiceUserJoined(event VoiceJoinEvent) {
+	f.voiceJoin = event
+}
 func (f *fakeEventSink) ParticipantChanged(ParticipantEvent) {}
 func (f *fakeEventSink) ActiveSpeakerDetected(streamID, userID string) {
 	f.activeStreamID = streamID
@@ -236,5 +240,27 @@ func TestOwnVoiceStateDisconnectUpdatesStatus(t *testing.T) {
 	}
 	if client.job.StreamID != "stream-01" {
 		t.Fatalf("voice disconnect should preserve current job for control-plane stop handling: %#v", client.job)
+	}
+}
+
+func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
+	sink := &fakeEventSink{}
+	client := &RealClient{sink: sink}
+	session := &discordgo.Session{State: discordgo.NewState()}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+
+	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
+		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+	})
+
+	if sink.voiceJoin.GuildID != "guild-01" || sink.voiceJoin.VoiceChannelID != "voice-01" || sink.voiceJoin.UserID != "user-01" {
+		t.Fatalf("voice join did not trigger auto-start event: %#v", sink.voiceJoin)
+	}
+
+	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
+		VoiceState: &discordgo.VoiceState{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-02"},
+	})
+	if sink.voiceJoin.VoiceChannelID != "voice-01" {
+		t.Fatalf("bot's own voice join should not trigger auto-start event: %#v", sink.voiceJoin)
 	}
 }

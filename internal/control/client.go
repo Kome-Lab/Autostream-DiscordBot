@@ -270,6 +270,14 @@ func (c Client) ResolveRuntimeSecret(ctx context.Context, secretName string) (Ru
 	return out, nil
 }
 
+func (c Client) StartStream(ctx context.Context, streamID string) error {
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return errors.New("stream_id is required")
+	}
+	return c.post(ctx, "/services/streams/"+url.PathEscape(streamID)+"/start", map[string]any{})
+}
+
 func (c Client) RunHeartbeatLoop(ctx context.Context, currentStreamID func() string, onError func(error)) {
 	c.RunHeartbeatLoopWithMetrics(ctx, currentStreamID, nil, onError)
 }

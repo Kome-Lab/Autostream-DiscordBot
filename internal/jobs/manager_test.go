@@ -29,6 +29,13 @@ type fakeReporter struct {
 	err                 error
 }
 
+type fakeStreamStarter struct {
+	mu      sync.Mutex
+	started []string
+	ch      chan string
+	err     error
+}
+
 func (f *fakeVoice) Connect() error { return f.err }
 func (f *fakeVoice) JoinVoice(job discord.VoiceJob) error {
 	f.mu.Lock()
@@ -75,6 +82,19 @@ func (f *fakeReporter) ActiveSpeakerChanged(streamID, userID, displayName string
 	f.speakerUserID = userID
 	f.speakerDisplayName = displayName
 	f.speakerCallCount++
+	return f.err
+}
+
+func (f *fakeStreamStarter) StartStream(streamID string) error {
+	f.mu.Lock()
+	f.started = append(f.started, streamID)
+	f.mu.Unlock()
+	if f.ch != nil {
+		select {
+		case f.ch <- streamID:
+		default:
+		}
+	}
 	return f.err
 }
 
@@ -131,6 +151,63 @@ func TestManagerStartAppliesStreamVoiceDefaults(t *testing.T) {
 	}
 	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "https://caption.example.com/stream" {
 		t.Fatalf("stream voice defaults were not applied: %#v", voice.joined)
+	}
+}
+
+func TestVoiceUserJoinedStartsMatchingConfiguredStream(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	})
+	starter := &fakeStreamStarter{ch: make(chan string, 2)}
+	manager.SetStreamStarter(starter)
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-01"})
+
+	select {
+	case got := <-starter.ch:
+		if got != "stream-01" {
+			t.Fatalf("unexpected auto-start stream: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auto-start")
+	}
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-02"})
+	select {
+	case got := <-starter.ch:
+		t.Fatalf("duplicate join should be throttled, got %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestVoiceUserJoinedDoesNotStartAmbiguousOrActiveStream(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+		"stream-02": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	})
+	starter := &fakeStreamStarter{ch: make(chan string, 1)}
+	manager.SetStreamStarter(starter)
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-01"})
+	select {
+	case got := <-starter.ch:
+		t.Fatalf("ambiguous voice channel should not start a stream, got %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	})
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-02"})
+	select {
+	case got := <-starter.ch:
+		t.Fatalf("active stream should suppress auto-start, got %q", got)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

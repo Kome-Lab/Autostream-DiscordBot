@@ -12,10 +12,13 @@ import (
 type Manager struct {
 	voice               discord.Client
 	reporter            EventReporter
+	streamStarter       StreamStarter
 	mu                  sync.Mutex
 	current             discord.VoiceJob
 	defaults            VoiceDefaults
 	streamDefaults      map[string]VoiceDefaults
+	autoStartPending    map[string]time.Time
+	autoStartCooldown   time.Duration
 	reconnectPolicy     ReconnectPolicy
 	reconnectGeneration int64
 	startedAt           time.Time
@@ -46,6 +49,10 @@ type EventReporter interface {
 	ActiveSpeakerChanged(streamID, userID, displayName string) error
 }
 
+type StreamStarter interface {
+	StartStream(streamID string) error
+}
+
 type Participant struct {
 	UserID   string    `json:"user_id"`
 	Username string    `json:"username,omitempty"`
@@ -71,7 +78,7 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 	if voice == nil {
 		voice = &discord.NoopClient{}
 	}
-	return &Manager{voice: voice, reporter: reporter, participants: map[string]Participant{}, streamDefaults: map[string]VoiceDefaults{}}
+	return &Manager{voice: voice, reporter: reporter, participants: map[string]Participant{}, streamDefaults: map[string]VoiceDefaults{}, autoStartPending: map[string]time.Time{}, autoStartCooldown: 30 * time.Second}
 }
 
 func (m *Manager) Start(job discord.VoiceJob) error {
@@ -105,7 +112,14 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	m.lastEventAt = now
 	m.participants = map[string]Participant{}
 	m.activeSpeaker = ""
+	delete(m.autoStartPending, job.StreamID)
 	return nil
+}
+
+func (m *Manager) SetStreamStarter(starter StreamStarter) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.streamStarter = starter
 }
 
 func (m *Manager) SetReconnectPolicy(policy ReconnectPolicy) {
@@ -313,6 +327,54 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 			m.recordWorkerPublishFailure()
 		}
 	}
+}
+
+func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
+	if strings.TrimSpace(event.GuildID) == "" || strings.TrimSpace(event.VoiceChannelID) == "" || strings.TrimSpace(event.UserID) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	m.mu.Lock()
+	if m.current.StreamID != "" {
+		m.mu.Unlock()
+		return
+	}
+	streamID := m.matchingAutoStartStreamLocked(event.GuildID, event.VoiceChannelID)
+	if streamID == "" || m.streamStarter == nil {
+		m.mu.Unlock()
+		return
+	}
+	if last, ok := m.autoStartPending[streamID]; ok && now.Sub(last) < m.autoStartCooldown {
+		m.mu.Unlock()
+		return
+	}
+	m.autoStartPending[streamID] = now
+	starter := m.streamStarter
+	m.lastEventAt = now
+	m.mu.Unlock()
+
+	go func() {
+		_ = starter.StartStream(streamID)
+	}()
+}
+
+func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) string {
+	guildID = strings.TrimSpace(guildID)
+	voiceChannelID = strings.TrimSpace(voiceChannelID)
+	if guildID == "" || voiceChannelID == "" {
+		return ""
+	}
+	matched := ""
+	for streamID, defaults := range m.streamDefaults {
+		if defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {
+			continue
+		}
+		if matched != "" {
+			return ""
+		}
+		matched = streamID
+	}
+	return matched
 }
 
 func (m *Manager) DiscordConnected() {

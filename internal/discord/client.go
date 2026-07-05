@@ -32,7 +32,15 @@ type ParticipantEvent struct {
 	Present        bool   `json:"present"`
 }
 
+type VoiceJoinEvent struct {
+	GuildID        string `json:"guild_id"`
+	VoiceChannelID string `json:"voice_channel_id"`
+	UserID         string `json:"user_id"`
+	Username       string `json:"username,omitempty"`
+}
+
 type EventSink interface {
+	VoiceUserJoined(event VoiceJoinEvent)
 	ParticipantChanged(event ParticipantEvent)
 	ActiveSpeakerDetected(streamID, userID string)
 	DiscordConnected()
@@ -357,10 +365,18 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	job := c.job
 	sink := c.sink
 	c.mu.Unlock()
+	selfUserID := sessionUserID(session)
+	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) {
+		sink.VoiceUserJoined(VoiceJoinEvent{
+			GuildID:        event.GuildID,
+			VoiceChannelID: event.ChannelID,
+			UserID:         event.UserID,
+		})
+	}
 	if job.StreamID == "" || event.GuildID != job.GuildID {
 		return
 	}
-	if event.UserID == sessionUserID(session) && event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID && event.ChannelID != job.VoiceChannelID {
+	if event.UserID == selfUserID && event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID && event.ChannelID != job.VoiceChannelID {
 		c.markVoiceDisconnected("voice_state_disconnected", true)
 		return
 	}

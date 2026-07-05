@@ -95,6 +95,9 @@ func main() {
 		}
 	}
 	manager := jobs.NewManagerWithReporter(voiceClient, buildWorkerReporter())
+	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
+		manager.SetStreamStarter(controlStreamStarter{client: controlClient})
+	}
 	if eventSource, ok := voiceClient.(discordclient.EventSource); ok {
 		eventSource.SetEventSink(manager)
 	}
@@ -145,6 +148,20 @@ func main() {
 			}
 		}
 	}
+}
+
+type controlStreamStarter struct {
+	client control.Client
+}
+
+func (s controlStreamStarter) StartStream(streamID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	err := s.client.StartStream(ctx, streamID)
+	if err != nil {
+		log.Printf("control panel auto-start failed for stream %s: %v", streamID, err)
+	}
+	return err
 }
 
 func logRuntimeConfig(ctx context.Context, client control.Client) (control.RuntimeConfig, bool) {

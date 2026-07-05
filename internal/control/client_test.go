@@ -168,6 +168,33 @@ func TestResolveRuntimeSecretPostsScopedServiceRequest(t *testing.T) {
 	}
 }
 
+func TestStartStreamPostsServiceStartRequest(t *testing.T) {
+	var gotAuth string
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services/streams/stream-01/start" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}}
+	if err := client.StartStream(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer secret-token" {
+		t.Fatalf("unexpected auth header: %q", gotAuth)
+	}
+	if len(gotBody) != 0 {
+		t.Fatalf("auto-start request should not send stream overrides: %#v", gotBody)
+	}
+}
+
 func TestResolveRuntimeSecretLeaseActiveIsTypedAndRedacted(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/services/runtime-secrets/resolve" {
