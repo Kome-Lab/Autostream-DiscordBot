@@ -1,7 +1,7 @@
 services:
   discord-bot:
     environment:
-      AUTOSTREAM_NODE_CONFIG: /etc/autostream-node/config.yml
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-discord-bot/config.yml
       SERVICE_VERSION: 0.1.0-local
       CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC: 5
       WORKER_URL: http://host.docker.internal:8084
@@ -13,4 +13,4 @@ services:
     ports: !override
       - "8083:8080"
     volumes: !override
-      - ./config/autostream-node.yml:/etc/autostream-node/config.yml:ro
+      - ./config/config.yml:/etc/autostream-discord-bot/config.yml:ro
