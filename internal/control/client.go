@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/example/autostream-discord-bot/internal/version"
 )
 
 const ServiceType = "discord_bot"
@@ -69,6 +71,7 @@ type Heartbeat struct {
 	ServiceID       string             `json:"service_id"`
 	Status          string             `json:"status"`
 	CurrentStreamID string             `json:"current_stream_id,omitempty"`
+	Version         string             `json:"version,omitempty"`
 	Metrics         map[string]float64 `json:"metrics,omitempty"`
 }
 
@@ -151,7 +154,7 @@ func ConfigFromEnv() Config {
 		ServiceID:        envDefault("SERVICE_ID", "discord-bot-01"),
 		ServiceName:      envDefault("SERVICE_NAME", "Discord BOT"),
 		ServicePublicURL: os.Getenv("SERVICE_PUBLIC_URL"),
-		Version:          envDefault("SERVICE_VERSION", "dev"),
+		Version:          envDefault("SERVICE_VERSION", version.Current()),
 		HeartbeatEvery:   envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
 	}
 	applyNodeConfigFromEnv(&cfg, ServiceType)
@@ -241,7 +244,7 @@ func (c Client) HeartbeatWithMetrics(ctx context.Context, status, currentStreamI
 	if status == "" {
 		status = "online"
 	}
-	body := Heartbeat{ServiceID: c.Config.ServiceID, Status: status, CurrentStreamID: currentStreamID, Metrics: metrics}
+	body := Heartbeat{ServiceID: c.Config.ServiceID, Status: status, CurrentStreamID: currentStreamID, Version: c.Config.Version, Metrics: metrics}
 	return c.post(ctx, "/services/heartbeat", body)
 }
 

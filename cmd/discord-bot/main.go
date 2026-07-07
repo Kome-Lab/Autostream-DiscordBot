@@ -18,10 +18,15 @@ import (
 	discordclient "github.com/example/autostream-discord-bot/internal/discord"
 	"github.com/example/autostream-discord-bot/internal/httpapi"
 	"github.com/example/autostream-discord-bot/internal/jobs"
+	"github.com/example/autostream-discord-bot/internal/version"
 	"github.com/example/autostream-discord-bot/internal/worker"
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Printf("autostream-discord-bot %s\ncommit: %s\nbuild_date: %s\n", version.Current(), version.Commit, version.BuildDate)
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "configure" {
 		if err := control.RunConfigureCommand(os.Args[2:], control.ServiceType, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "configure failed: %v\n", err)
