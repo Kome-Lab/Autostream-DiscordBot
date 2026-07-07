@@ -49,6 +49,10 @@ func main() {
 	var runtimeCfg control.RuntimeConfig
 	hasRuntimeConfig := false
 	requireRuntimeConfig := requireControlPanelRuntimeConfig()
+	configPending := control.NodeConfigPendingFromEnv()
+	if shouldUseControlPanelRuntimeConfig(controlCfg) {
+		runtimeConfigProvider = controlRuntimeConfigFromEnv
+	}
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		if err := controlClient.Register(ctx); err != nil {
 			if requireRuntimeConfig {
@@ -64,9 +68,14 @@ func main() {
 				log.Fatal("control panel runtime config is required in this environment")
 			}
 		}
-		runtimeConfigProvider = controlClient.RuntimeConfig
 	} else if requireRuntimeConfig {
-		log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
+		if configPending {
+			log.Printf("node config pending: waiting for %s", control.NodeConfigPathFromEnv())
+		} else if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
+			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
+		} else {
+			log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
+		}
 	}
 
 	discordCfg := discordclient.ConfigFromEnv()
@@ -97,7 +106,7 @@ func main() {
 		}
 	}
 
-	voiceClient, err := buildDiscordClient(discordCfg, tokenSource, !requireRuntimeConfig)
+	voiceClient, err := buildDiscordClient(discordCfg, tokenSource, !requireRuntimeConfig || configPending)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -162,6 +171,16 @@ func main() {
 			}
 		}
 	}
+}
+
+func shouldUseControlPanelRuntimeConfig(cfg control.Config) bool {
+	return requireControlPanelRuntimeConfig() ||
+		control.NodeConfigPendingFromEnv() ||
+		(strings.TrimSpace(cfg.ControlPanelURL) != "" && strings.TrimSpace(cfg.Token) != "")
+}
+
+func controlRuntimeConfigFromEnv(ctx context.Context) (control.RuntimeConfig, error) {
+	return control.Client{Config: control.ConfigFromEnv()}.RuntimeConfig(ctx)
 }
 
 type controlStreamStarter struct {
