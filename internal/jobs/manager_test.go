@@ -26,6 +26,8 @@ type fakeReporter struct {
 	speakerUserID       string
 	speakerDisplayName  string
 	speakerCallCount    int
+	chatStreamID        string
+	chatMessage         ChatMessage
 	err                 error
 }
 
@@ -82,6 +84,12 @@ func (f *fakeReporter) ActiveSpeakerChanged(streamID, userID, displayName string
 	f.speakerUserID = userID
 	f.speakerDisplayName = displayName
 	f.speakerCallCount++
+	return f.err
+}
+
+func (f *fakeReporter) ChatMessageReceived(streamID string, message ChatMessage) error {
+	f.chatStreamID = streamID
+	f.chatMessage = message
 	return f.err
 }
 
@@ -157,7 +165,7 @@ func TestManagerStartAppliesStreamVoiceDefaults(t *testing.T) {
 func TestVoiceUserJoinedStartsMatchingConfiguredStream(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
-		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
 	})
 	starter := &fakeStreamStarter{ch: make(chan string, 2)}
 	manager.SetStreamStarter(starter)
@@ -181,11 +189,27 @@ func TestVoiceUserJoinedStartsMatchingConfiguredStream(t *testing.T) {
 	}
 }
 
-func TestVoiceUserJoinedDoesNotStartAmbiguousOrActiveStream(t *testing.T) {
+func TestVoiceUserJoinedRequiresAutoStartEnabled(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
 		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
-		"stream-02": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	})
+	starter := &fakeStreamStarter{ch: make(chan string, 1)}
+	manager.SetStreamStarter(starter)
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-01"})
+	select {
+	case got := <-starter.ch:
+		t.Fatalf("stream without auto-start trigger should not start, got %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestVoiceUserJoinedDoesNotStartAmbiguousOrActiveStream(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
+		"stream-02": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
 	})
 	starter := &fakeStreamStarter{ch: make(chan string, 1)}
 	manager.SetStreamStarter(starter)
@@ -198,7 +222,7 @@ func TestVoiceUserJoinedDoesNotStartAmbiguousOrActiveStream(t *testing.T) {
 	}
 
 	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
-		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01"},
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
 	})
 	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
 		t.Fatal(err)
@@ -283,6 +307,40 @@ func TestActiveSpeakerMustBeParticipant(t *testing.T) {
 	}
 	if err := manager.SetActiveSpeaker("stream-01", "missing"); err == nil {
 		t.Fatal("expected missing participant to be rejected")
+	}
+}
+
+func TestChatMessageReceivedPublishesOnlyCurrentTextChannel(t *testing.T) {
+	reporter := &fakeReporter{}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", TextChannelID: "text-01"}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.ChatMessageReceived(discord.ChatMessageEvent{
+		StreamID:      "stream-01",
+		GuildID:       "guild-01",
+		TextChannelID: "text-other",
+		MessageID:     "msg-ignored",
+		UserID:        "user-01",
+		Content:       "wrong channel",
+	})
+	if reporter.chatMessage.MessageID != "" {
+		t.Fatalf("wrong text channel message should be ignored: %#v", reporter.chatMessage)
+	}
+
+	manager.ChatMessageReceived(discord.ChatMessageEvent{
+		StreamID:      "stream-01",
+		GuildID:       "guild-01",
+		TextChannelID: "text-01",
+		MessageID:     "msg-01",
+		UserID:        "user-01",
+		Username:      "alice",
+		Content:       " こんにちは ",
+		CreatedAt:     time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if reporter.chatStreamID != "stream-01" || reporter.chatMessage.MessageID != "msg-01" || reporter.chatMessage.Content != "こんにちは" || reporter.chatMessage.Username != "alice" {
+		t.Fatalf("chat message was not published: stream=%q message=%#v", reporter.chatStreamID, reporter.chatMessage)
 	}
 }
 

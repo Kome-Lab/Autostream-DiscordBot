@@ -39,9 +39,21 @@ type VoiceJoinEvent struct {
 	Username       string `json:"username,omitempty"`
 }
 
+type ChatMessageEvent struct {
+	StreamID      string    `json:"stream_id"`
+	GuildID       string    `json:"guild_id"`
+	TextChannelID string    `json:"text_channel_id"`
+	MessageID     string    `json:"message_id"`
+	UserID        string    `json:"user_id"`
+	Username      string    `json:"username,omitempty"`
+	Content       string    `json:"content"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 type EventSink interface {
 	VoiceUserJoined(event VoiceJoinEvent)
 	ParticipantChanged(event ParticipantEvent)
+	ChatMessageReceived(event ChatMessageEvent)
 	ActiveSpeakerDetected(streamID, userID string)
 	DiscordConnected()
 	DiscordDisconnected(reason string)
@@ -124,11 +136,12 @@ func NewRealClient(cfg Config) (*RealClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildVoiceStates
+	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildVoiceStates | discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
 	client := &RealClient{cfg: cfg, session: session}
 	session.AddHandler(client.onGatewayDisconnect)
 	session.AddHandler(client.onGatewayResumed)
 	session.AddHandler(client.onVoiceStateUpdate)
+	session.AddHandler(client.onMessageCreate)
 	return client, nil
 }
 
@@ -402,6 +415,43 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 			Present:        false,
 		})
 	}
+}
+
+func (c *RealClient) onMessageCreate(session *discordgo.Session, event *discordgo.MessageCreate) {
+	if event == nil || event.Message == nil || event.Author == nil {
+		return
+	}
+	if event.Author.Bot || event.Author.ID == sessionUserID(session) {
+		return
+	}
+	c.mu.Lock()
+	job := c.job
+	sink := c.sink
+	c.mu.Unlock()
+	if sink == nil || strings.TrimSpace(job.StreamID) == "" || strings.TrimSpace(job.TextChannelID) == "" {
+		return
+	}
+	if event.ChannelID != job.TextChannelID || event.GuildID != job.GuildID {
+		return
+	}
+	content := strings.TrimSpace(event.Content)
+	if content == "" {
+		return
+	}
+	createdAt := time.Now().UTC()
+	if !event.Timestamp.IsZero() {
+		createdAt = time.Time(event.Timestamp).UTC()
+	}
+	sink.ChatMessageReceived(ChatMessageEvent{
+		StreamID:      job.StreamID,
+		GuildID:       job.GuildID,
+		TextChannelID: job.TextChannelID,
+		MessageID:     event.ID,
+		UserID:        event.Author.ID,
+		Username:      strings.TrimSpace(event.Author.Username),
+		Content:       content,
+		CreatedAt:     createdAt,
+	})
 }
 
 func sessionUserID(session *discordgo.Session) string {

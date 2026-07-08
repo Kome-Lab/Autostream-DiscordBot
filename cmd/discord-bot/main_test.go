@@ -9,6 +9,15 @@ import (
 	"github.com/example/autostream-discord-bot/internal/jobs"
 )
 
+type fakeStreamStarter struct {
+	started chan string
+}
+
+func (f fakeStreamStarter) StartStream(streamID string) error {
+	f.started <- streamID
+	return nil
+}
+
 func TestDiscordDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfile(t *testing.T) {
 	cfg := control.RuntimeConfig{
 		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
@@ -47,7 +56,7 @@ func TestDiscordDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfile(t *testing.T)
 	}
 
 	defaults := discordDefaultsFromRuntimeConfig(cfg)
-	if defaults.GuildID != "guild-own" || defaults.VoiceChannelID != "voice-own" || defaults.TextChannelID != "text-own" || defaults.CaptionAudioURL != "https://caption.example.com/own" {
+	if defaults.GuildID != "" || defaults.VoiceChannelID != "" || defaults.TextChannelID != "" || defaults.CaptionAudioURL != "https://caption.example.com/own" {
 		t.Fatalf("expected own discord defaults, got %#v", defaults)
 	}
 	if got := discordBotTokenSecretNameFromRuntimeConfig(cfg); got != "discord-bot-own" {
@@ -88,7 +97,7 @@ func TestDiscordDefaultsFromRuntimeConfigAllowsUnscopedFallback(t *testing.T) {
 	}
 
 	defaults := discordDefaultsFromRuntimeConfig(cfg)
-	if defaults.GuildID != "guild-global" || defaults.VoiceChannelID != "voice-global" {
+	if defaults.GuildID != "" || defaults.VoiceChannelID != "" || defaults.TextChannelID != "" {
 		t.Fatalf("expected unscoped discord fallback profile, got %#v", defaults)
 	}
 	if got := discordBotTokenSecretNameFromRuntimeConfig(cfg); got != "discord-bot-global" {
@@ -123,6 +132,64 @@ func TestDiscordDefaultsFromRuntimeConfigRejectsMalformedServiceID(t *testing.T)
 	}
 	if got := discordBotTokenSecretNameFromRuntimeConfig(cfg); got != "" {
 		t.Fatalf("malformed service-scoped profile should not provide a bot token secret: %q", got)
+	}
+}
+
+func TestApplyRuntimeConfigToManagerRefreshesAutoStartDefaults(t *testing.T) {
+	manager := jobs.NewManager(&discordclient.NoopClient{})
+	starter := fakeStreamStarter{started: make(chan string, 1)}
+	manager.SetStreamStarter(starter)
+
+	cfg := control.RuntimeConfig{
+		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+		StreamDiscordConfigs: []control.StreamDiscordConfig{
+			{
+				StreamID:         "stream-new",
+				AssignmentRole:   "primary",
+				GuildID:          "guild-new",
+				VoiceChannelID:   "voice-new",
+				TextChannelID:    "text-new",
+				CaptionAudioURL:  "https://caption.example.com/new",
+				AutoStartTrigger: "discord_voice_join",
+			},
+		},
+	}
+	applyRuntimeConfigToManager(manager, cfg, reconnectPolicyFromEnv())
+
+	manager.VoiceUserJoined(discordclient.VoiceJoinEvent{GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
+	select {
+	case got := <-starter.started:
+		if got != "stream-new" {
+			t.Fatalf("unexpected auto-start stream: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refreshed auto-start defaults")
+	}
+}
+
+func TestApplyRuntimeConfigToManagerDoesNotAutoStartWithoutTrigger(t *testing.T) {
+	manager := jobs.NewManager(&discordclient.NoopClient{})
+	starter := fakeStreamStarter{started: make(chan string, 1)}
+	manager.SetStreamStarter(starter)
+
+	cfg := control.RuntimeConfig{
+		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+		StreamDiscordConfigs: []control.StreamDiscordConfig{
+			{
+				StreamID:       "stream-new",
+				AssignmentRole: "primary",
+				GuildID:        "guild-new",
+				VoiceChannelID: "voice-new",
+			},
+		},
+	}
+	applyRuntimeConfigToManager(manager, cfg, reconnectPolicyFromEnv())
+
+	manager.VoiceUserJoined(discordclient.VoiceJoinEvent{GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
+	select {
+	case got := <-starter.started:
+		t.Fatalf("stream without auto-start trigger should not start, got %q", got)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

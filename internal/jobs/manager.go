@@ -31,10 +31,11 @@ type Manager struct {
 }
 
 type VoiceDefaults struct {
-	GuildID         string
-	VoiceChannelID  string
-	TextChannelID   string
-	CaptionAudioURL string
+	GuildID          string
+	VoiceChannelID   string
+	TextChannelID    string
+	CaptionAudioURL  string
+	AutoStartEnabled bool
 }
 
 type ReconnectPolicy struct {
@@ -47,6 +48,7 @@ type ReconnectPolicy struct {
 type EventReporter interface {
 	ParticipantsChanged(streamID string, participants []Participant) error
 	ActiveSpeakerChanged(streamID, userID, displayName string) error
+	ChatMessageReceived(streamID string, message ChatMessage) error
 }
 
 type StreamStarter interface {
@@ -57,6 +59,15 @@ type Participant struct {
 	UserID   string    `json:"user_id"`
 	Username string    `json:"username,omitempty"`
 	JoinedAt time.Time `json:"joined_at"`
+}
+
+type ChatMessage struct {
+	MessageID     string    `json:"message_id"`
+	UserID        string    `json:"user_id"`
+	Username      string    `json:"username,omitempty"`
+	Content       string    `json:"content"`
+	TextChannelID string    `json:"text_channel_id"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type Status struct {
@@ -141,10 +152,11 @@ func (m *Manager) SetVoiceDefaults(defaults VoiceDefaults) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.defaults = VoiceDefaults{
-		GuildID:         strings.TrimSpace(defaults.GuildID),
-		VoiceChannelID:  strings.TrimSpace(defaults.VoiceChannelID),
-		TextChannelID:   strings.TrimSpace(defaults.TextChannelID),
-		CaptionAudioURL: strings.TrimSpace(defaults.CaptionAudioURL),
+		GuildID:          strings.TrimSpace(defaults.GuildID),
+		VoiceChannelID:   strings.TrimSpace(defaults.VoiceChannelID),
+		TextChannelID:    strings.TrimSpace(defaults.TextChannelID),
+		CaptionAudioURL:  strings.TrimSpace(defaults.CaptionAudioURL),
+		AutoStartEnabled: defaults.AutoStartEnabled,
 	}
 }
 
@@ -158,10 +170,11 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 			continue
 		}
 		m.streamDefaults[streamID] = VoiceDefaults{
-			GuildID:         strings.TrimSpace(item.GuildID),
-			VoiceChannelID:  strings.TrimSpace(item.VoiceChannelID),
-			TextChannelID:   strings.TrimSpace(item.TextChannelID),
-			CaptionAudioURL: strings.TrimSpace(item.CaptionAudioURL),
+			GuildID:          strings.TrimSpace(item.GuildID),
+			VoiceChannelID:   strings.TrimSpace(item.VoiceChannelID),
+			TextChannelID:    strings.TrimSpace(item.TextChannelID),
+			CaptionAudioURL:  strings.TrimSpace(item.CaptionAudioURL),
+			AutoStartEnabled: item.AutoStartEnabled,
 		}
 	}
 }
@@ -200,6 +213,9 @@ func mergeVoiceDefaults(base, override VoiceDefaults) VoiceDefaults {
 	}
 	if override.CaptionAudioURL != "" {
 		base.CaptionAudioURL = override.CaptionAudioURL
+	}
+	if override.AutoStartEnabled {
+		base.AutoStartEnabled = true
 	}
 	return base
 }
@@ -358,6 +374,47 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	}()
 }
 
+func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
+	content := trimDiscordChatContent(event.Content)
+	if content == "" {
+		return
+	}
+	m.mu.Lock()
+	if m.current.StreamID == "" || event.StreamID != m.current.StreamID || event.GuildID != m.current.GuildID || event.TextChannelID != m.current.TextChannelID {
+		m.mu.Unlock()
+		return
+	}
+	streamID := m.current.StreamID
+	reporter := m.reporter
+	m.lastEventAt = time.Now().UTC()
+	message := ChatMessage{
+		MessageID:     strings.TrimSpace(event.MessageID),
+		UserID:        strings.TrimSpace(event.UserID),
+		Username:      strings.TrimSpace(event.Username),
+		Content:       content,
+		TextChannelID: strings.TrimSpace(event.TextChannelID),
+		CreatedAt:     event.CreatedAt,
+	}
+	if message.CreatedAt.IsZero() {
+		message.CreatedAt = time.Now().UTC()
+	}
+	m.mu.Unlock()
+	if reporter != nil {
+		if err := reporter.ChatMessageReceived(streamID, message); err != nil {
+			m.recordWorkerPublishFailure()
+		}
+	}
+}
+
+func trimDiscordChatContent(content string) string {
+	content = strings.TrimSpace(content)
+	runes := []rune(content)
+	if len(runes) <= 1000 {
+		return content
+	}
+	return strings.TrimSpace(string(runes[:1000]))
+}
+
 func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) string {
 	guildID = strings.TrimSpace(guildID)
 	voiceChannelID = strings.TrimSpace(voiceChannelID)
@@ -366,6 +423,9 @@ func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) 
 	}
 	matched := ""
 	for streamID, defaults := range m.streamDefaults {
+		if !defaults.AutoStartEnabled {
+			continue
+		}
 		if defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {
 			continue
 		}

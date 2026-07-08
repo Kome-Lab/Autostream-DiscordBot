@@ -34,7 +34,7 @@ TZ=Asia/Tokyo
 
 Production mode sets `AUTOSTREAM_ENV=production` or `AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true`. In that mode the Discord Bot must register with Control Panel, fetch service-scoped runtime config, resolve `bot_token_secret_name` through `/services/runtime-secrets/resolve`, and initialize a real Discord client. It does not fall back to `DISCORD_BOT_TOKEN` or dry-run mode when Control Panel runtime config or runtime secret resolution fails. Dry-run Discord mode is for local migration checks only.
 
-When the runtime config provider is configured, `/jobs/start` fails closed if the Control Panel runtime config refresh fails. Request-supplied guild or voice channel IDs do not bypass primary assignment validation.
+When the runtime config provider is configured, `/jobs/start` fails closed if the Control Panel runtime config refresh fails. Request-supplied guild or voice channel IDs do not bypass the saved stream Discord config. Stream auto-start candidates are distributed only when the selected Discord Bot Config points to this service ID.
 
 Inbound Control Panel dispatch uses `SERVICE_CONTROL_TOKEN` or `SERVICE_CONTROL_TOKEN_SHA256`. `CONTROL_PANEL_TOKEN` is outbound-only; in production or runtime-config-required mode it must not authorize `/jobs/start`, `/jobs/{id}/stop`, or status mutation endpoints.
 
@@ -44,7 +44,7 @@ Control Panel の Discord Bot Config に `bot_token`、`guild_id`、`voice_chann
 
 起動時に service token で `/services/register` を呼び、その後 `/services/runtime-config?service_id=<SERVICE_ID>` を取得します。runtime config には raw secret は含まれず、`bot_token_secret_name` のような参照だけが含まれます。
 
-`/jobs/start` を受けた時も Control Panel の runtime config を再取得し、対象 stream の `stream_discord_configs` から `guild_id`、`voice_channel_id`、`text_channel_id`、`caption_audio_url` を補完します。補完に使うのは `assignment_role=primary` の設定だけです。standby service は failover 候補として登録できますが、primary に昇格するまで start 用の stream config としては使いません。
+`/jobs/start` を受けた時も Control Panel の runtime config を再取得し、対象 stream の `stream_discord_configs` から `guild_id`、`voice_channel_id`、`text_channel_id`、`caption_audio_url` を補完します。Streams で選ばれた Discord Bot Config の `service_id` がこの Bot service と一致する待機streamが候補になります。Control Panel は VC参加による開始要求を受けた時、保存済みconfig、`streams.start` scope、auto-start trigger、待機状態を確認し、開始直前に対象streamへ primary Discord Bot assignment を作成します。明示的に別Botが primary assigned されているstreamは勝手に上書きしません。
 
 voice disconnect 後の再参加 policy は bootstrap env を既定値にし、Control Panel の Discord Bot Config に `reconnect_enabled`、`reconnect_max_attempts`、`reconnect_base_delay`、`reconnect_max_delay` がある場合は runtime config を優先します。Gateway disconnect は Discord gateway resume に任せ、Bot 自身の VC 離脱や Opus receive close だけを voice rejoin 対象にします。
 

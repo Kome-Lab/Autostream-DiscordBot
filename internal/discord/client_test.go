@@ -16,12 +16,16 @@ type fakeEventSink struct {
 	activeStreamID string
 	activeUserID   string
 	voiceJoin      VoiceJoinEvent
+	chatMessage    ChatMessageEvent
 }
 
 func (f *fakeEventSink) VoiceUserJoined(event VoiceJoinEvent) {
 	f.voiceJoin = event
 }
 func (f *fakeEventSink) ParticipantChanged(ParticipantEvent) {}
+func (f *fakeEventSink) ChatMessageReceived(event ChatMessageEvent) {
+	f.chatMessage = event
+}
 func (f *fakeEventSink) ActiveSpeakerDetected(streamID, userID string) {
 	f.activeStreamID = streamID
 	f.activeUserID = userID
@@ -262,5 +266,53 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	})
 	if sink.voiceJoin.VoiceChannelID != "voice-01" {
 		t.Fatalf("bot's own voice join should not trigger auto-start event: %#v", sink.voiceJoin)
+	}
+}
+
+func TestMessageCreatePublishesOnlyActiveTextChannelMessages(t *testing.T) {
+	sink := &fakeEventSink{}
+	client := &RealClient{
+		sink: sink,
+		job: VoiceJob{
+			StreamID:       "stream-01",
+			GuildID:        "guild-01",
+			VoiceChannelID: "voice-01",
+			TextChannelID:  "text-01",
+		},
+	}
+	session := &discordgo.Session{State: discordgo.NewState()}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+
+	client.onMessageCreate(session, &discordgo.MessageCreate{Message: &discordgo.Message{
+		ID:        "msg-ignored",
+		GuildID:   "guild-01",
+		ChannelID: "text-other",
+		Author:    &discordgo.User{ID: "user-01", Username: "alice"},
+		Content:   "wrong channel",
+	}})
+	if sink.chatMessage.MessageID != "" {
+		t.Fatalf("message from another channel should be ignored: %#v", sink.chatMessage)
+	}
+
+	client.onMessageCreate(session, &discordgo.MessageCreate{Message: &discordgo.Message{
+		ID:        "msg-01",
+		GuildID:   "guild-01",
+		ChannelID: "text-01",
+		Author:    &discordgo.User{ID: "user-01", Username: "alice"},
+		Content:   " 本番開始します ",
+	}})
+	if sink.chatMessage.StreamID != "stream-01" || sink.chatMessage.TextChannelID != "text-01" || sink.chatMessage.UserID != "user-01" || sink.chatMessage.Username != "alice" || sink.chatMessage.Content != "本番開始します" {
+		t.Fatalf("active text channel message was not published: %#v", sink.chatMessage)
+	}
+
+	client.onMessageCreate(session, &discordgo.MessageCreate{Message: &discordgo.Message{
+		ID:        "msg-bot",
+		GuildID:   "guild-01",
+		ChannelID: "text-01",
+		Author:    &discordgo.User{ID: "bot-01", Username: "bot", Bot: true},
+		Content:   "bot message",
+	}})
+	if sink.chatMessage.MessageID != "msg-01" {
+		t.Fatalf("bot's own message should be ignored: %#v", sink.chatMessage)
 	}
 }

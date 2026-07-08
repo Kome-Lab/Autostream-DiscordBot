@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -65,6 +66,9 @@ type Registration struct {
 	PublicURL    string         `json:"public_url"`
 	Version      string         `json:"version"`
 	Capabilities map[string]any `json:"capabilities"`
+	Hostname     string         `json:"hostname,omitempty"`
+	OS           string         `json:"os,omitempty"`
+	Arch         string         `json:"arch,omitempty"`
 }
 
 type Heartbeat struct {
@@ -72,6 +76,10 @@ type Heartbeat struct {
 	Status          string             `json:"status"`
 	CurrentStreamID string             `json:"current_stream_id,omitempty"`
 	Version         string             `json:"version,omitempty"`
+	Capabilities    map[string]any     `json:"capabilities,omitempty"`
+	Hostname        string             `json:"hostname,omitempty"`
+	OS              string             `json:"os,omitempty"`
+	Arch            string             `json:"arch,omitempty"`
 	Metrics         map[string]float64 `json:"metrics,omitempty"`
 }
 
@@ -112,13 +120,14 @@ type RuntimeProfile struct {
 }
 
 type StreamDiscordConfig struct {
-	StreamID        string `json:"stream_id"`
-	AssignmentRole  string `json:"assignment_role"`
-	DiscordConfigID string `json:"discord_config_id"`
-	GuildID         string `json:"guild_id"`
-	VoiceChannelID  string `json:"voice_channel_id"`
-	TextChannelID   string `json:"text_channel_id,omitempty"`
-	CaptionAudioURL string `json:"caption_audio_url,omitempty"`
+	StreamID         string `json:"stream_id"`
+	AssignmentRole   string `json:"assignment_role"`
+	DiscordConfigID  string `json:"discord_config_id"`
+	GuildID          string `json:"guild_id"`
+	VoiceChannelID   string `json:"voice_channel_id"`
+	TextChannelID    string `json:"text_channel_id,omitempty"`
+	CaptionAudioURL  string `json:"caption_audio_url,omitempty"`
+	AutoStartTrigger string `json:"auto_start_trigger,omitempty"`
 }
 
 func (cfg RuntimeConfig) DiscordConfigForStream(streamID string) (StreamDiscordConfig, bool) {
@@ -211,27 +220,43 @@ func isLocalDevHost(host string) bool {
 	return normalized == "localhost" || normalized == "127.0.0.1" || normalized == "host.docker.internal"
 }
 
+func serviceCapabilities() map[string]any {
+	return map[string]any{
+		"discord_gateway":                    true,
+		"voice_connect":                      true,
+		"participant_events":                 true,
+		"active_speaker_state":               true,
+		"audio_capture":                      true,
+		"audio_capture_runtime_secret":       true,
+		"audio_stream_forward":               true,
+		"audio_stream_forward_runtime_token": true,
+		"audio_forward_retry":                true,
+		"chat_overlay_events":                true,
+		"caption_audio_forward":              false,
+		"health_endpoint":                    true,
+		"job_endpoint":                       true,
+	}
+}
+
+func reportHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(hostname)
+}
+
 func (c Client) Register(ctx context.Context) error {
 	body := Registration{
-		ServiceID:   c.Config.ServiceID,
-		ServiceType: ServiceType,
-		ServiceName: c.Config.ServiceName,
-		PublicURL:   c.Config.ServicePublicURL,
-		Version:     c.Config.Version,
-		Capabilities: map[string]any{
-			"discord_gateway":                    true,
-			"voice_connect":                      true,
-			"participant_events":                 true,
-			"active_speaker_state":               true,
-			"audio_capture":                      true,
-			"audio_capture_runtime_secret":       true,
-			"audio_stream_forward":               true,
-			"audio_stream_forward_runtime_token": true,
-			"audio_forward_retry":                true,
-			"caption_audio_forward":              false,
-			"health_endpoint":                    true,
-			"job_endpoint":                       true,
-		},
+		ServiceID:    c.Config.ServiceID,
+		ServiceType:  ServiceType,
+		ServiceName:  c.Config.ServiceName,
+		PublicURL:    c.Config.ServicePublicURL,
+		Version:      c.Config.Version,
+		Capabilities: serviceCapabilities(),
+		Hostname:     reportHostname(),
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
 	}
 	return c.post(ctx, "/services/register", body)
 }
@@ -244,7 +269,17 @@ func (c Client) HeartbeatWithMetrics(ctx context.Context, status, currentStreamI
 	if status == "" {
 		status = "online"
 	}
-	body := Heartbeat{ServiceID: c.Config.ServiceID, Status: status, CurrentStreamID: currentStreamID, Version: c.Config.Version, Metrics: metrics}
+	body := Heartbeat{
+		ServiceID:       c.Config.ServiceID,
+		Status:          status,
+		CurrentStreamID: currentStreamID,
+		Version:         c.Config.Version,
+		Capabilities:    serviceCapabilities(),
+		Hostname:        reportHostname(),
+		OS:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		Metrics:         metrics,
+	}
 	return c.post(ctx, "/services/heartbeat", body)
 }
 

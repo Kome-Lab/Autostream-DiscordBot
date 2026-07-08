@@ -79,6 +79,21 @@ func (r Reporter) ActiveSpeakerChanged(streamID, userID, displayName string) err
 	return r.post(context.Background(), "/streams/"+url.PathEscape(streamID)+"/events/active-speaker", payload)
 }
 
+func (r Reporter) ChatMessageReceived(streamID string, message jobs.ChatMessage) error {
+	payload := map[string]any{
+		"type": "overlay.discord_chat",
+		"payload": map[string]any{
+			"message_id":      message.MessageID,
+			"user_id":         message.UserID,
+			"display_name":    message.Username,
+			"text":            message.Content,
+			"text_channel_id": message.TextChannelID,
+			"created_at":      message.CreatedAt.UTC().Format(time.RFC3339Nano),
+		},
+	}
+	return r.post(context.Background(), "/streams/"+url.PathEscape(streamID)+"/events/overlay", payload)
+}
+
 func (r Reporter) post(ctx context.Context, endpoint string, payload any) error {
 	if err := r.Config.Validate(); err != nil {
 		return err

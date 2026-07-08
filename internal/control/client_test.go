@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	}
 	if got.ServiceType != ServiceType || got.ServiceID != "bot-01" || got.Capabilities["voice_connect"] != true {
 		t.Fatalf("unexpected registration: %#v", got)
+	}
+	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH {
+		t.Fatalf("registration did not include runtime platform: %#v", got)
 	}
 	if got.Capabilities["active_speaker_state"] != true || got.Capabilities["audio_capture"] != true || got.Capabilities["audio_stream_forward"] != true {
 		t.Fatalf("capabilities must advertise runtime-config audio support explicitly: %#v", got.Capabilities)
@@ -68,6 +72,9 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	if got.Status != "online" || got.CurrentStreamID != "stream-01" || got.Metrics["discord.audio_receiving"] != 1 {
 		t.Fatalf("unexpected heartbeat: %#v", got)
 	}
+	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH || got.Capabilities["job_endpoint"] != true {
+		t.Fatalf("heartbeat did not include platform/capabilities: %#v", got)
+	}
 }
 
 func TestRuntimeConfigFetchesScopedServiceConfig(t *testing.T) {
@@ -84,7 +91,7 @@ func TestRuntimeConfigFetchesScopedServiceConfig(t *testing.T) {
 			"service":{"service_id":"bot-01","service_type":"discord_bot","service_name":"Discord 01","status":"assigned"},
 			"assignments":[{"stream_id":"stream-01","service_id":"bot-01","service_type":"discord_bot","assignment_role":"primary","assigned_at":"2026-06-10T00:00:00Z"}],
 			"profiles":{"discord_config":[{"id":"profile-01","kind":"discord_config","name":"Main VC","config":{"service_id":"bot-01","guild_id":"guild-01","voice_channel_id":"voice-01","bot_token_secret_name":"discord-bot-main"},"created_at":"2026-06-10T00:00:00Z","updated_at":"2026-06-10T00:00:00Z"}]},
-			"stream_discord_configs":[{"stream_id":"stream-01","assignment_role":"primary","discord_config_id":"profile-01","guild_id":"guild-stream","voice_channel_id":"voice-stream","text_channel_id":"text-stream","caption_audio_url":"https://caption.example.com/audio"}]
+			"stream_discord_configs":[{"stream_id":"stream-01","assignment_role":"primary","discord_config_id":"profile-01","guild_id":"guild-stream","voice_channel_id":"voice-stream","text_channel_id":"text-stream","caption_audio_url":"https://caption.example.com/audio","auto_start_trigger":"discord_voice_join"}]
 		}`))
 	}))
 	defer server.Close()
@@ -104,14 +111,14 @@ func TestRuntimeConfigFetchesScopedServiceConfig(t *testing.T) {
 	if len(profiles) != 1 || profiles[0].Config["guild_id"] != "guild-01" || profiles[0].Config["bot_token_secret_name"] != "discord-bot-main" {
 		t.Fatalf("unexpected runtime profiles: %#v", profiles)
 	}
-	if len(cfg.StreamDiscordConfigs) != 1 || cfg.StreamDiscordConfigs[0].StreamID != "stream-01" || cfg.StreamDiscordConfigs[0].GuildID != "guild-stream" || cfg.StreamDiscordConfigs[0].VoiceChannelID != "voice-stream" {
+	if len(cfg.StreamDiscordConfigs) != 1 || cfg.StreamDiscordConfigs[0].StreamID != "stream-01" || cfg.StreamDiscordConfigs[0].GuildID != "guild-stream" || cfg.StreamDiscordConfigs[0].VoiceChannelID != "voice-stream" || cfg.StreamDiscordConfigs[0].AutoStartTrigger != "discord_voice_join" {
 		t.Fatalf("unexpected stream discord configs: %#v", cfg.StreamDiscordConfigs)
 	}
 	streamConfig, ok := cfg.DiscordConfigForStream("stream-01")
 	if !ok {
 		t.Fatalf("expected stream discord config lookup to succeed: %#v", cfg.StreamDiscordConfigs)
 	}
-	if streamConfig.GuildID != "guild-stream" || streamConfig.VoiceChannelID != "voice-stream" || streamConfig.TextChannelID != "text-stream" {
+	if streamConfig.GuildID != "guild-stream" || streamConfig.VoiceChannelID != "voice-stream" || streamConfig.TextChannelID != "text-stream" || streamConfig.AutoStartTrigger != "discord_voice_join" {
 		t.Fatalf("unexpected stream discord config lookup result: %#v", streamConfig)
 	}
 }

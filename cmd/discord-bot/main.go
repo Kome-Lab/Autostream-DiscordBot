@@ -50,6 +50,7 @@ func main() {
 	hasRuntimeConfig := false
 	requireRuntimeConfig := requireControlPanelRuntimeConfig()
 	configPending := control.NodeConfigPendingFromEnv()
+	startPendingRegistrationLoop := false
 	if shouldUseControlPanelRuntimeConfig(controlCfg) {
 		runtimeConfigProvider = controlRuntimeConfigFromEnv
 	}
@@ -68,10 +69,10 @@ func main() {
 				log.Fatal("control panel runtime config is required in this environment")
 			}
 		}
+	} else if configPending {
+		startPendingRegistrationLoop = true
 	} else if requireRuntimeConfig {
-		if configPending {
-			log.Printf("node config pending: waiting for %s", control.NodeConfigPathFromEnv())
-		} else if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
+		if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
 			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
 		} else {
 			log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
@@ -126,16 +127,19 @@ func main() {
 	}
 	reconnectPolicy := reconnectPolicyFromEnv()
 	if hasRuntimeConfig {
-		manager.SetVoiceDefaults(discordDefaultsFromRuntimeConfig(runtimeCfg))
-		manager.SetStreamVoiceDefaults(streamDiscordDefaultsFromRuntimeConfig(runtimeCfg))
-		reconnectPolicy = reconnectPolicyFromRuntimeConfig(runtimeCfg, reconnectPolicy)
+		reconnectPolicy = applyRuntimeConfigToManager(manager, runtimeCfg, reconnectPolicy)
 	}
 	manager.SetReconnectPolicy(reconnectPolicy)
+	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" && runtimeConfigProvider != nil {
+		go runRuntimeConfigRefreshLoop(ctx, controlClient, manager, reconnectPolicyFromEnv(), envDurationDefault("CONTROL_PANEL_RUNTIME_CONFIG_REFRESH_INTERVAL", 30*time.Second))
+	}
 
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		go controlClient.RunHeartbeatLoopWithMetrics(ctx, manager.CurrentStreamID, manager.Metrics, func(err error) {
 			log.Printf("control panel heartbeat failed: %v", err)
 		})
+	} else if startPendingRegistrationLoop {
+		go runPendingControlPanelRegistrationLoop(ctx, manager, reconnectPolicyFromEnv(), requireRuntimeConfig)
 	}
 
 	server := &http.Server{
@@ -183,6 +187,81 @@ func controlRuntimeConfigFromEnv(ctx context.Context) (control.RuntimeConfig, er
 	return control.Client{Config: control.ConfigFromEnv()}.RuntimeConfig(ctx)
 }
 
+func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.Manager, fallbackReconnectPolicy jobs.ReconnectPolicy, requireRuntimeConfig bool) {
+	lastState := ""
+	registeredServiceID := ""
+	for {
+		cfg := control.ConfigFromEnv()
+		client := control.Client{Config: cfg}
+		wait := controlPanelRegistrationInterval(cfg)
+		state := ""
+		switch {
+		case strings.TrimSpace(cfg.ConfigError) != "":
+			state = "invalid:" + cfg.ConfigError
+			if requireRuntimeConfig {
+				log.Fatalf("node config invalid: %v", cfg.ConfigError)
+			}
+			logRegistrationStateChange(&lastState, state, "node config invalid: %v", cfg.ConfigError)
+			registeredServiceID = ""
+		case strings.TrimSpace(cfg.ControlPanelURL) == "" || strings.TrimSpace(cfg.Token) == "":
+			state = "pending:" + control.NodeConfigPathFromEnv()
+			logRegistrationStateChange(&lastState, state, "node config pending: waiting for %s", control.NodeConfigPathFromEnv())
+			registeredServiceID = ""
+		default:
+			if registeredServiceID != cfg.ServiceID {
+				if err := client.Register(ctx); err != nil {
+					state = "register-failed:" + err.Error()
+					if requireRuntimeConfig {
+						log.Fatalf("control panel registration is required in this environment: %v", err)
+					}
+					logRegistrationStateChange(&lastState, state, "control panel registration failed: %v", err)
+					registeredServiceID = ""
+					break
+				}
+				registeredServiceID = cfg.ServiceID
+				state = "registered:" + cfg.ServiceID
+				logRegistrationStateChange(&lastState, state, "registered with control panel as %s", cfg.ServiceID)
+				manager.SetStreamStarter(controlStreamStarter{client: client})
+				if runtimeCfg, ok := logRuntimeConfig(ctx, client); ok {
+					applyRuntimeConfigToManager(manager, runtimeCfg, fallbackReconnectPolicy)
+				} else if requireRuntimeConfig {
+					log.Fatal("control panel runtime config is required in this environment")
+				}
+			}
+			if registeredServiceID == cfg.ServiceID {
+				if err := client.HeartbeatWithMetrics(ctx, "online", manager.CurrentStreamID(), manager.Metrics()); err != nil {
+					state = "heartbeat-failed:" + err.Error()
+					logRegistrationStateChange(&lastState, state, "control panel heartbeat failed: %v", err)
+				} else {
+					lastState = "online:" + cfg.ServiceID
+				}
+			}
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func controlPanelRegistrationInterval(cfg control.Config) time.Duration {
+	if strings.TrimSpace(cfg.ControlPanelURL) != "" && strings.TrimSpace(cfg.Token) != "" && cfg.HeartbeatEvery > 0 {
+		return cfg.HeartbeatEvery
+	}
+	return 10 * time.Second
+}
+
+func logRegistrationStateChange(lastState *string, state, format string, args ...any) {
+	if state == *lastState {
+		return
+	}
+	log.Printf(format, args...)
+	*lastState = state
+}
+
 type controlStreamStarter struct {
 	client control.Client
 }
@@ -211,12 +290,42 @@ func logRuntimeConfig(ctx context.Context, client control.Client) (control.Runti
 	return cfg, true
 }
 
+func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, manager *jobs.Manager, baseReconnectPolicy jobs.ReconnectPolicy, interval time.Duration) {
+	if manager == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		cfg, err := client.RuntimeConfig(ctx)
+		if err != nil {
+			log.Printf("control panel runtime config refresh failed: %v", err)
+			continue
+		}
+		applyRuntimeConfigToManager(manager, cfg, baseReconnectPolicy)
+		log.Printf("refreshed control panel runtime config for %s: stream_discord_configs=%d", cfg.Service.ServiceID, len(cfg.StreamDiscordConfigs))
+	}
+}
+
+func applyRuntimeConfigToManager(manager *jobs.Manager, cfg control.RuntimeConfig, baseReconnectPolicy jobs.ReconnectPolicy) jobs.ReconnectPolicy {
+	manager.SetVoiceDefaults(discordDefaultsFromRuntimeConfig(cfg))
+	manager.SetStreamVoiceDefaults(streamDiscordDefaultsFromRuntimeConfig(cfg))
+	reconnectPolicy := reconnectPolicyFromRuntimeConfig(cfg, baseReconnectPolicy)
+	manager.SetReconnectPolicy(reconnectPolicy)
+	return reconnectPolicy
+}
+
 func discordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) jobs.VoiceDefaults {
 	if profile, ok := firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID); ok {
 		return jobs.VoiceDefaults{
-			GuildID:         stringConfig(profile.Config, "guild_id"),
-			VoiceChannelID:  stringConfig(profile.Config, "voice_channel_id"),
-			TextChannelID:   stringConfig(profile.Config, "text_channel_id"),
 			CaptionAudioURL: stringConfig(profile.Config, "caption_audio_url"),
 		}
 	}
@@ -260,10 +369,11 @@ func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[strin
 			continue
 		}
 		defaults[item.StreamID] = jobs.VoiceDefaults{
-			GuildID:         item.GuildID,
-			VoiceChannelID:  item.VoiceChannelID,
-			TextChannelID:   item.TextChannelID,
-			CaptionAudioURL: item.CaptionAudioURL,
+			GuildID:          item.GuildID,
+			VoiceChannelID:   item.VoiceChannelID,
+			TextChannelID:    item.TextChannelID,
+			CaptionAudioURL:  item.CaptionAudioURL,
+			AutoStartEnabled: strings.TrimSpace(item.AutoStartTrigger) == "discord_voice_join",
 		}
 	}
 	return defaults
