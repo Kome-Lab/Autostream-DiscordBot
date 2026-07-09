@@ -46,9 +46,9 @@ type ReconnectPolicy struct {
 }
 
 type EventReporter interface {
-	ParticipantsChanged(streamID string, participants []Participant) error
-	ActiveSpeakerChanged(streamID, userID, displayName string) error
-	ChatMessageReceived(streamID string, message ChatMessage) error
+	ParticipantsChanged(job discord.VoiceJob, participants []Participant) error
+	ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName string) error
+	ChatMessageReceived(job discord.VoiceJob, message ChatMessage) error
 }
 
 type StreamStarter interface {
@@ -272,6 +272,8 @@ func (m *Manager) Status() Status {
 		job.EncoderAudioURL = ""
 		job.CaptionAudioURL = ""
 		job.StreamIngestToken = ""
+		job.WorkerEventsURL = ""
+		job.WorkerEventsToken = ""
 		status.CurrentJob = &job
 		status.CurrentStreamID = job.StreamID
 		startedAt := m.startedAt
@@ -334,12 +336,12 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 		}
 	}
 	m.lastEventAt = now
-	streamID := m.current.StreamID
+	job := m.current
 	participants := m.participantsSnapshotLocked()
 	reporter := m.reporter
 	m.mu.Unlock()
 	if reporter != nil {
-		if err := reporter.ParticipantsChanged(streamID, participants); err != nil {
+		if err := reporter.ParticipantsChanged(job, participants); err != nil {
 			m.recordWorkerPublishFailure()
 		}
 	}
@@ -384,7 +386,7 @@ func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 		m.mu.Unlock()
 		return
 	}
-	streamID := m.current.StreamID
+	job := m.current
 	reporter := m.reporter
 	m.lastEventAt = time.Now().UTC()
 	message := ChatMessage{
@@ -400,7 +402,7 @@ func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 	}
 	m.mu.Unlock()
 	if reporter != nil {
-		if err := reporter.ChatMessageReceived(streamID, message); err != nil {
+		if err := reporter.ChatMessageReceived(job, message); err != nil {
 			m.recordWorkerPublishFailure()
 		}
 	}
@@ -482,7 +484,7 @@ func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
 	}
 	m.activeSpeaker = userID
 	m.lastEventAt = time.Now().UTC()
-	currentStreamID := m.current.StreamID
+	job := m.current
 	displayName := ""
 	if participant, ok := m.participants[userID]; ok {
 		displayName = participant.Username
@@ -490,7 +492,7 @@ func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
 	reporter := m.reporter
 	m.mu.Unlock()
 	if reporter != nil {
-		if err := reporter.ActiveSpeakerChanged(currentStreamID, userID, displayName); err != nil {
+		if err := reporter.ActiveSpeakerChanged(job, userID, displayName); err != nil {
 			m.recordWorkerPublishFailure()
 		}
 	}

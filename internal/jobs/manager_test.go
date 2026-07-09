@@ -73,22 +73,22 @@ func (f *fakeVoice) Status() discord.Status {
 	return f.status
 }
 
-func (f *fakeReporter) ParticipantsChanged(streamID string, participants []Participant) error {
-	f.participantStreamID = streamID
+func (f *fakeReporter) ParticipantsChanged(job discord.VoiceJob, participants []Participant) error {
+	f.participantStreamID = job.StreamID
 	f.participants = participants
 	return f.err
 }
 
-func (f *fakeReporter) ActiveSpeakerChanged(streamID, userID, displayName string) error {
-	f.speakerStreamID = streamID
+func (f *fakeReporter) ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName string) error {
+	f.speakerStreamID = job.StreamID
 	f.speakerUserID = userID
 	f.speakerDisplayName = displayName
 	f.speakerCallCount++
 	return f.err
 }
 
-func (f *fakeReporter) ChatMessageReceived(streamID string, message ChatMessage) error {
-	f.chatStreamID = streamID
+func (f *fakeReporter) ChatMessageReceived(job discord.VoiceJob, message ChatMessage) error {
+	f.chatStreamID = job.StreamID
 	f.chatMessage = message
 	return f.err
 }
@@ -109,7 +109,7 @@ func (f *fakeStreamStarter) StartStream(streamID string) error {
 func TestManagerStartsAndStopsVoiceJob(t *testing.T) {
 	voice := &fakeVoice{}
 	manager := NewManager(voice)
-	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", EncoderAudioURL: "https://encoder.example.com", StreamIngestToken: "job-token"}
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", EncoderAudioURL: "https://encoder.example.com", StreamIngestToken: "job-token", WorkerEventsURL: "https://worker.example.com", WorkerEventsToken: "worker-events-token"}
 	if err := manager.Start(job); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestManagerStartsAndStopsVoiceJob(t *testing.T) {
 	if voice.joined.EncoderAudioURL != "https://encoder.example.com" {
 		t.Fatalf("encoder audio URL was not passed to voice client: %#v", voice.joined)
 	}
-	if status := manager.Status(); status.CurrentJob == nil || status.CurrentJob.EncoderAudioURL != "" || status.CurrentJob.StreamIngestToken != "" {
+	if status := manager.Status(); status.CurrentJob == nil || status.CurrentJob.EncoderAudioURL != "" || status.CurrentJob.StreamIngestToken != "" || status.CurrentJob.WorkerEventsURL != "" || status.CurrentJob.WorkerEventsToken != "" {
 		t.Fatalf("status leaked job secrets: %#v", status.CurrentJob)
 	}
 	if err := manager.Stop("stream-01"); err != nil {

@@ -53,7 +53,7 @@ func TestStartJobRequiresValidTokenAndUpdatesStatus(t *testing.T) {
 	server := httptest.NewServer(NewServer("discord_bot", jobs.NewManager(&discord.NoopClient{}), TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
-	body := []byte(`{"stream_id":"stream-01","guild_id":"guild-01","voice_channel_id":"voice-01","text_channel_id":"text-01","encoder_audio_url":"` + "https://" + "user:" + "secret" + "@encoder.example.com" + `","stream_ingest_token":"ingest-secret"}`)
+	body := []byte(`{"stream_id":"stream-01","guild_id":"guild-01","voice_channel_id":"voice-01","text_channel_id":"text-01","encoder_audio_url":"` + "https://" + "user:" + "secret" + "@encoder.example.com" + `","stream_ingest_token":"ingest-secret","worker_events_url":"https://worker.example.com","worker_events_token":"worker-events-secret"}`)
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestStartJobRequiresValidTokenAndUpdatesStatus(t *testing.T) {
 	if !strings.Contains(buf.String(), "stream-01") {
 		t.Fatalf("status should include current stream id: %s", buf.String())
 	}
-	for _, raw := range []string{"secret", "encoder_audio_url", "guild-01", "voice-01", "text-01", "stream_ingest_token"} {
+	for _, raw := range []string{"secret", "encoder_audio_url", "guild-01", "voice-01", "text-01", "stream_ingest_token", "worker.example.com", "worker_events_url", "worker_events_token"} {
 		if strings.Contains(buf.String(), raw) {
 			t.Fatalf("status leaked sensitive job field %q: %s", raw, buf.String())
 		}

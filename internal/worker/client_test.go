@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/autostream-discord-bot/internal/discord"
 	"github.com/example/autostream-discord-bot/internal/jobs"
 )
 
@@ -28,8 +29,9 @@ func TestReporterPublishesParticipants(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reporter := Reporter{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second}}
-	if err := reporter.ParticipantsChanged("stream-01", []jobs.Participant{{UserID: "user-01", Username: "alice"}}); err != nil {
+	reporter := Reporter{Config: Config{Timeout: time.Second}}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	if err := reporter.ParticipantsChanged(job, []jobs.Participant{{UserID: "user-01", Username: "alice"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -51,8 +53,9 @@ func TestReporterPublishesActiveSpeaker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reporter := Reporter{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second}}
-	if err := reporter.ActiveSpeakerChanged("stream-01", "user-01", "alice"); err != nil {
+	reporter := Reporter{Config: Config{Timeout: time.Second}}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	if err := reporter.ActiveSpeakerChanged(job, "user-01", "alice"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -77,8 +80,9 @@ func TestReporterPublishesDiscordChatOverlay(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reporter := Reporter{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second}}
-	err := reporter.ChatMessageReceived("stream-01", jobs.ChatMessage{
+	reporter := Reporter{Config: Config{Timeout: time.Second}}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	err := reporter.ChatMessageReceived(job, jobs.ChatMessage{
 		MessageID:     "msg-01",
 		UserID:        "user-01",
 		Username:      "alice",
@@ -101,12 +105,20 @@ func TestReporterErrorDoesNotLeakToken(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reporter := Reporter{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second}}
-	err := reporter.post(t.Context(), "/streams/stream-01/events/participants", map[string]any{})
+	reporter := Reporter{Config: Config{Timeout: time.Second}}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	err := reporter.post(t.Context(), job, "/streams/stream-01/events/participants", map[string]any{})
 	if err == nil {
 		t.Fatal("expected publish error")
 	}
 	if strings.Contains(err.Error(), "secret-token") {
 		t.Fatalf("token leaked in error: %v", err)
+	}
+}
+
+func TestReporterNoopsWithoutJobWorkerEventsEndpoint(t *testing.T) {
+	reporter := Reporter{Config: Config{Timeout: time.Second}}
+	if err := reporter.ParticipantsChanged(discord.VoiceJob{StreamID: "stream-01"}, []jobs.Participant{{UserID: "user-01"}}); err != nil {
+		t.Fatal(err)
 	}
 }

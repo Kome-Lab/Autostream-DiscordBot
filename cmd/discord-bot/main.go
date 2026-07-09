@@ -514,12 +514,7 @@ func requireControlPanelRuntimeConfig() bool {
 }
 
 func buildWorkerReporter() jobs.EventReporter {
-	cfg := worker.ConfigFromEnv()
-	if !cfg.Enabled() {
-		log.Printf("WORKER_URL or WORKER_TOKEN is not configured; Discord participant events will stay local")
-		return nil
-	}
-	return worker.Reporter{Config: cfg}
+	return worker.Reporter{Config: worker.ConfigFromEnv()}
 }
 
 func buildDiscordClient(cfg discordclient.Config, tokenSource string, allowDryRun bool) (discordclient.Client, error) {
