@@ -316,20 +316,10 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 }
 
 func applyRuntimeConfigToManager(manager *jobs.Manager, cfg control.RuntimeConfig, baseReconnectPolicy jobs.ReconnectPolicy) jobs.ReconnectPolicy {
-	manager.SetVoiceDefaults(discordDefaultsFromRuntimeConfig(cfg))
 	manager.SetStreamVoiceDefaults(streamDiscordDefaultsFromRuntimeConfig(cfg))
 	reconnectPolicy := reconnectPolicyFromRuntimeConfig(cfg, baseReconnectPolicy)
 	manager.SetReconnectPolicy(reconnectPolicy)
 	return reconnectPolicy
-}
-
-func discordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) jobs.VoiceDefaults {
-	if profile, ok := firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID); ok {
-		return jobs.VoiceDefaults{
-			CaptionAudioURL: stringConfig(profile.Config, "caption_audio_url"),
-		}
-	}
-	return jobs.VoiceDefaults{}
 }
 
 func reconnectPolicyFromEnv() jobs.ReconnectPolicy {
@@ -372,7 +362,6 @@ func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[strin
 			GuildID:          item.GuildID,
 			VoiceChannelID:   item.VoiceChannelID,
 			TextChannelID:    item.TextChannelID,
-			CaptionAudioURL:  item.CaptionAudioURL,
 			AutoStartEnabled: strings.TrimSpace(item.AutoStartTrigger) == "discord_voice_join",
 		}
 	}

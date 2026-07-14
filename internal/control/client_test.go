@@ -50,6 +50,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	if got.Capabilities["audio_capture_runtime_secret"] != true || got.Capabilities["audio_stream_forward_runtime_token"] != true {
 		t.Fatalf("capabilities must advertise Control Panel managed audio auth support: %#v", got.Capabilities)
 	}
+	if got.Capabilities["caption_audio_forward"] != true {
+		t.Fatalf("capabilities must advertise caption audio forwarding: %#v", got.Capabilities)
+	}
 	for name, value := range got.Capabilities {
 		if value == "placeholder" || value == "todo" {
 			t.Fatalf("capability %s has non-contract value %q", name, value)
@@ -102,7 +105,7 @@ func TestRuntimeConfigFetchesScopedServiceConfig(t *testing.T) {
 			"service":{"service_id":"bot-01","service_type":"discord_bot","service_name":"Discord 01","status":"assigned"},
 			"assignments":[{"stream_id":"stream-01","service_id":"bot-01","service_type":"discord_bot","assignment_role":"primary","assigned_at":"2026-06-10T00:00:00Z"}],
 			"profiles":{"discord_config":[{"id":"profile-01","kind":"discord_config","name":"Main VC","config":{"service_id":"bot-01","guild_id":"guild-01","voice_channel_id":"voice-01","bot_token_secret_name":"discord-bot-main"},"created_at":"2026-06-10T00:00:00Z","updated_at":"2026-06-10T00:00:00Z"}]},
-			"stream_discord_configs":[{"stream_id":"stream-01","assignment_role":"primary","discord_config_id":"profile-01","guild_id":"guild-stream","voice_channel_id":"voice-stream","text_channel_id":"text-stream","caption_audio_url":"https://caption.example.com/audio","auto_start_trigger":"discord_voice_join"}]
+			"stream_discord_configs":[{"stream_id":"stream-01","assignment_role":"primary","discord_config_id":"profile-01","guild_id":"guild-stream","voice_channel_id":"voice-stream","text_channel_id":"text-stream","auto_start_trigger":"discord_voice_join"}]
 		}`))
 	}))
 	defer server.Close()

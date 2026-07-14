@@ -20,6 +20,7 @@ type VoiceJob struct {
 	StreamID          string `json:"stream_id"`
 	EncoderAudioURL   string `json:"encoder_audio_url,omitempty"`
 	CaptionAudioURL   string `json:"caption_audio_url,omitempty"`
+	CaptionAudioToken string `json:"caption_audio_token,omitempty"`
 	StreamIngestToken string `json:"stream_ingest_token,omitempty"`
 	WorkerEventsURL   string `json:"worker_events_url,omitempty"`
 	WorkerEventsToken string `json:"worker_events_token,omitempty"`
@@ -81,24 +82,28 @@ type Client interface {
 }
 
 type Status struct {
-	Connected             bool    `json:"connected"`
-	VoiceConnected        bool    `json:"voice_connected"`
-	CurrentGuildID        string  `json:"current_guild_id,omitempty"`
-	CurrentVoiceID        string  `json:"current_voice_channel_id,omitempty"`
-	AudioForwardEnabled   bool    `json:"audio_forward_enabled"`
-	AudioForwardActive    bool    `json:"audio_forward_active"`
-	AudioReceiving        bool    `json:"audio_receiving"`
-	LastAudioAt           string  `json:"last_audio_at,omitempty"`
-	LastAudioAgeSec       float64 `json:"last_audio_age_sec,omitempty"`
-	AudioPacketsReceived  int64   `json:"audio_packets_received"`
-	AudioPacketsForwarded int64   `json:"audio_packets_forwarded"`
-	AudioForwardErrors    int64   `json:"audio_forward_errors"`
-	GatewayReconnectCount int64   `json:"gateway_reconnect_count"`
-	VoiceDisconnectCount  int64   `json:"voice_disconnect_count"`
-	LastForwardAt         string  `json:"last_forward_at,omitempty"`
-	LastForwardAgeSec     float64 `json:"last_forward_age_sec,omitempty"`
-	LastForwardError      string  `json:"last_forward_error,omitempty"`
-	LastError             string  `json:"last_error,omitempty"`
+	Connected                 bool    `json:"connected"`
+	VoiceConnected            bool    `json:"voice_connected"`
+	CurrentGuildID            string  `json:"current_guild_id,omitempty"`
+	CurrentVoiceID            string  `json:"current_voice_channel_id,omitempty"`
+	AudioForwardEnabled       bool    `json:"audio_forward_enabled"`
+	AudioForwardActive        bool    `json:"audio_forward_active"`
+	CaptionAudioForwardActive bool    `json:"caption_audio_forward_active"`
+	AudioReceiving            bool    `json:"audio_receiving"`
+	LastAudioAt               string  `json:"last_audio_at,omitempty"`
+	LastAudioAgeSec           float64 `json:"last_audio_age_sec,omitempty"`
+	AudioPacketsReceived      int64   `json:"audio_packets_received"`
+	AudioPacketsForwarded     int64   `json:"audio_packets_forwarded"`
+	AudioForwardErrors        int64   `json:"audio_forward_errors"`
+	CaptionPacketsForwarded   int64   `json:"caption_packets_forwarded"`
+	CaptionForwardErrors      int64   `json:"caption_forward_errors"`
+	GatewayReconnectCount     int64   `json:"gateway_reconnect_count"`
+	VoiceDisconnectCount      int64   `json:"voice_disconnect_count"`
+	LastForwardAt             string  `json:"last_forward_at,omitempty"`
+	LastForwardAgeSec         float64 `json:"last_forward_age_sec,omitempty"`
+	LastForwardError          string  `json:"last_forward_error,omitempty"`
+	LastCaptionForwardError   string  `json:"last_caption_forward_error,omitempty"`
+	LastError                 string  `json:"last_error,omitempty"`
 }
 
 type Config struct {
@@ -216,10 +221,13 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	c.status.VoiceConnected = true
 	c.status.CurrentGuildID = job.GuildID
 	c.status.CurrentVoiceID = job.VoiceChannelID
-	c.status.AudioForwardActive = forwarder != nil && job.EncoderAudioURL != "" && voice.OpusRecv != nil
+	encoderForwardActive := forwarder != nil && strings.TrimSpace(job.EncoderAudioURL) != "" && voice.OpusRecv != nil
+	captionForwardActive := forwarder != nil && strings.TrimSpace(job.CaptionAudioURL) != "" && voice.OpusRecv != nil
+	c.status.AudioForwardActive = encoderForwardActive
+	c.status.CaptionAudioForwardActive = captionForwardActive
 	c.status.LastError = ""
 	c.mu.Unlock()
-	if forwarder != nil && job.EncoderAudioURL != "" && voice.OpusRecv != nil {
+	if encoderForwardActive || captionForwardActive {
 		go c.forwardOpus(job, voice.OpusRecv, audioStop, forwarder, source)
 	}
 	return nil
@@ -242,6 +250,7 @@ func (c *RealClient) LeaveVoice(streamID string) error {
 	c.status.VoiceConnected = false
 	c.status.AudioReceiving = false
 	c.status.AudioForwardActive = false
+	c.status.CaptionAudioForwardActive = false
 	c.status.CurrentGuildID = ""
 	c.status.CurrentVoiceID = ""
 	c.mu.Unlock()
@@ -277,6 +286,22 @@ func (c *RealClient) onVoiceSpeakingUpdate(_ *discordgo.VoiceConnection, event *
 
 func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet, stop <-chan struct{}, forwarder AudioForwarder, source string) {
 	const maxBatch = 20
+	type forwardTarget struct {
+		url       string
+		token     string
+		isCaption bool
+	}
+	type forwardResult struct {
+		isCaption bool
+		err       error
+	}
+	targets := make([]forwardTarget, 0, 2)
+	if strings.TrimSpace(job.EncoderAudioURL) != "" {
+		targets = append(targets, forwardTarget{url: job.EncoderAudioURL, token: job.StreamIngestToken})
+	}
+	if strings.TrimSpace(job.CaptionAudioURL) != "" {
+		targets = append(targets, forwardTarget{url: job.CaptionAudioURL, token: job.CaptionAudioToken, isCaption: true})
+	}
 	flushEvery := time.NewTicker(500 * time.Millisecond)
 	defer flushEvery.Stop()
 	batch := make([]audioforward.OpusPacket, 0, maxBatch)
@@ -284,18 +309,41 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 		if len(batch) == 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		count := len(batch)
-		err := forwarder.ForwardOpus(ctx, job.EncoderAudioURL, job.StreamID, source, job.StreamIngestToken, batch)
-		cancel()
-		now := time.Now().UTC()
-		if err != nil {
-			c.setForwardError(err.Error())
-		} else {
+		results := make(chan forwardResult, len(targets))
+		for _, target := range targets {
+			target := target
+			go func() {
+				if target.isCaption && strings.TrimSpace(target.token) == "" {
+					results <- forwardResult{isCaption: true, err: errors.New("caption_audio_token is required")}
+					return
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err := forwarder.ForwardOpus(ctx, target.url, job.StreamID, source, target.token, batch)
+				cancel()
+				results <- forwardResult{isCaption: target.isCaption, err: err}
+			}()
+		}
+		for range targets {
+			result := <-results
+			if result.err != nil {
+				if result.isCaption {
+					c.setCaptionForwardError(result.err.Error())
+				} else {
+					c.setForwardError(result.err.Error())
+				}
+				continue
+			}
+			now := time.Now().UTC()
 			c.mu.Lock()
-			c.status.AudioPacketsForwarded += int64(count)
-			c.status.LastForwardAt = now.Format(time.RFC3339Nano)
-			c.status.LastForwardError = ""
+			if result.isCaption {
+				c.status.CaptionPacketsForwarded += int64(count)
+				c.status.LastCaptionForwardError = ""
+			} else {
+				c.status.AudioPacketsForwarded += int64(count)
+				c.status.LastForwardAt = now.Format(time.RFC3339Nano)
+				c.status.LastForwardError = ""
+			}
 			c.mu.Unlock()
 		}
 		batch = batch[:0]
@@ -475,6 +523,7 @@ func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {
 	c.status.VoiceConnected = false
 	c.status.AudioReceiving = false
 	c.status.AudioForwardActive = false
+	c.status.CaptionAudioForwardActive = false
 	c.status.CurrentGuildID = ""
 	c.status.CurrentVoiceID = ""
 	if wasConnected {
@@ -499,6 +548,15 @@ func (c *RealClient) setForwardError(value string) {
 	c.status.AudioForwardErrors++
 	safeValue := secrets.SanitizeOperationalError(value, "discord audio forward failed")
 	c.status.LastForwardError = safeValue
+	c.status.LastError = safeValue
+}
+
+func (c *RealClient) setCaptionForwardError(value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status.CaptionForwardErrors++
+	safeValue := secrets.SanitizeOperationalError(value, "discord caption audio forward failed")
+	c.status.LastCaptionForwardError = safeValue
 	c.status.LastError = safeValue
 }
 

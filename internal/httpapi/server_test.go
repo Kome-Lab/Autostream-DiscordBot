@@ -53,7 +53,7 @@ func TestStartJobRequiresValidTokenAndUpdatesStatus(t *testing.T) {
 	server := httptest.NewServer(NewServer("discord_bot", jobs.NewManager(&discord.NoopClient{}), TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
-	body := []byte(`{"stream_id":"stream-01","guild_id":"guild-01","voice_channel_id":"voice-01","text_channel_id":"text-01","encoder_audio_url":"` + "https://" + "user:" + "secret" + "@encoder.example.com" + `","stream_ingest_token":"ingest-secret","worker_events_url":"https://worker.example.com","worker_events_token":"worker-events-secret"}`)
+	body := []byte(`{"stream_id":"stream-01","guild_id":"guild-01","voice_channel_id":"voice-01","text_channel_id":"text-01","encoder_audio_url":"` + "https://" + "user:" + "secret" + "@encoder.example.com" + `","caption_audio_url":"https://caption.example.com","stream_ingest_token":"ingest-secret","caption_audio_token":"caption-job-token","worker_events_url":"https://worker.example.com","worker_events_token":"worker-events-secret"}`)
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestStartJobRequiresValidTokenAndUpdatesStatus(t *testing.T) {
 	if !strings.Contains(buf.String(), "stream-01") {
 		t.Fatalf("status should include current stream id: %s", buf.String())
 	}
-	for _, raw := range []string{"secret", "encoder_audio_url", "guild-01", "voice-01", "text-01", "stream_ingest_token", "worker.example.com", "worker_events_url", "worker_events_token"} {
+	for _, raw := range []string{"secret", "encoder_audio_url", "caption_audio_url", "caption.example.com", "caption_audio_token", "caption-job-token", "guild-01", "voice-01", "text-01", "stream_ingest_token", "worker.example.com", "worker_events_url", "worker_events_token"} {
 		if strings.Contains(buf.String(), raw) {
 			t.Fatalf("status leaked sensitive job field %q: %s", raw, buf.String())
 		}
@@ -109,12 +109,11 @@ func TestStartJobAppliesRuntimeStreamDiscordConfig(t *testing.T) {
 				GuildID:         "guild-stream",
 				VoiceChannelID:  "voice-stream",
 				TextChannelID:   "text-stream",
-				CaptionAudioURL: "https://caption.example.com/stream",
 			}},
 		}, nil
 	})
 
-	body := []byte(`{"stream_id":"stream-01"}`)
+	body := []byte(`{"stream_id":"stream-01","caption_audio_url":"https://worker.example.com/streams/stream-01/audio/opus","caption_audio_token":"caption-job-token"}`)
 	req := httptest.NewRequest(http.MethodPost, "/jobs/start", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer expected")
 	req.Header.Set("Content-Type", "application/json")
@@ -123,10 +122,10 @@ func TestStartJobAppliesRuntimeStreamDiscordConfig(t *testing.T) {
 	if res.Code != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d body=%s", res.Code, res.Body.String())
 	}
-	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "https://caption.example.com/stream" {
+	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "https://worker.example.com/streams/stream-01/audio/opus" || voice.joined.CaptionAudioToken != "caption-job-token" {
 		t.Fatalf("runtime stream discord config was not applied: %#v", voice.joined)
 	}
-	if strings.Contains(res.Body.String(), "guild-stream") || strings.Contains(res.Body.String(), "voice-stream") || strings.Contains(res.Body.String(), "text-stream") || strings.Contains(res.Body.String(), "caption.example.com") {
+	if strings.Contains(res.Body.String(), "guild-stream") || strings.Contains(res.Body.String(), "voice-stream") || strings.Contains(res.Body.String(), "text-stream") || strings.Contains(res.Body.String(), "caption.example.com") || strings.Contains(res.Body.String(), "caption-job-token") || strings.Contains(res.Body.String(), "caption_audio_token") {
 		t.Fatalf("start response leaked stream channel config: %s", res.Body.String())
 	}
 }

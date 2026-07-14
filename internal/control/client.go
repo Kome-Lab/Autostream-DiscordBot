@@ -130,7 +130,6 @@ type StreamDiscordConfig struct {
 	GuildID          string `json:"guild_id"`
 	VoiceChannelID   string `json:"voice_channel_id"`
 	TextChannelID    string `json:"text_channel_id,omitempty"`
-	CaptionAudioURL  string `json:"caption_audio_url,omitempty"`
 	AutoStartTrigger string `json:"auto_start_trigger,omitempty"`
 }
 
@@ -236,7 +235,7 @@ func serviceCapabilities() map[string]any {
 		"audio_stream_forward_runtime_token": true,
 		"audio_forward_retry":                true,
 		"chat_overlay_events":                true,
-		"caption_audio_forward":              false,
+		"caption_audio_forward":              true,
 		"health_endpoint":                    true,
 		"job_endpoint":                       true,
 	}

@@ -192,9 +192,6 @@ func (s Server) applyRuntimeDiscordConfig(ctx context.Context, job *discord.Voic
 	if strings.TrimSpace(job.TextChannelID) == "" {
 		job.TextChannelID = streamConfig.TextChannelID
 	}
-	if strings.TrimSpace(job.CaptionAudioURL) == "" {
-		job.CaptionAudioURL = streamConfig.CaptionAudioURL
-	}
 	return nil
 }
 

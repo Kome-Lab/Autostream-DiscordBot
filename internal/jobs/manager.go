@@ -34,7 +34,6 @@ type VoiceDefaults struct {
 	GuildID          string
 	VoiceChannelID   string
 	TextChannelID    string
-	CaptionAudioURL  string
 	AutoStartEnabled bool
 }
 
@@ -155,7 +154,6 @@ func (m *Manager) SetVoiceDefaults(defaults VoiceDefaults) {
 		GuildID:          strings.TrimSpace(defaults.GuildID),
 		VoiceChannelID:   strings.TrimSpace(defaults.VoiceChannelID),
 		TextChannelID:    strings.TrimSpace(defaults.TextChannelID),
-		CaptionAudioURL:  strings.TrimSpace(defaults.CaptionAudioURL),
 		AutoStartEnabled: defaults.AutoStartEnabled,
 	}
 }
@@ -173,7 +171,6 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 			GuildID:          strings.TrimSpace(item.GuildID),
 			VoiceChannelID:   strings.TrimSpace(item.VoiceChannelID),
 			TextChannelID:    strings.TrimSpace(item.TextChannelID),
-			CaptionAudioURL:  strings.TrimSpace(item.CaptionAudioURL),
 			AutoStartEnabled: item.AutoStartEnabled,
 		}
 	}
@@ -195,9 +192,6 @@ func (m *Manager) ApplyVoiceDefaults(job discord.VoiceJob) discord.VoiceJob {
 	if strings.TrimSpace(job.TextChannelID) == "" {
 		job.TextChannelID = defaults.TextChannelID
 	}
-	if strings.TrimSpace(job.CaptionAudioURL) == "" {
-		job.CaptionAudioURL = defaults.CaptionAudioURL
-	}
 	return job
 }
 
@@ -210,9 +204,6 @@ func mergeVoiceDefaults(base, override VoiceDefaults) VoiceDefaults {
 	}
 	if override.TextChannelID != "" {
 		base.TextChannelID = override.TextChannelID
-	}
-	if override.CaptionAudioURL != "" {
-		base.CaptionAudioURL = override.CaptionAudioURL
 	}
 	if override.AutoStartEnabled {
 		base.AutoStartEnabled = true
@@ -271,6 +262,7 @@ func (m *Manager) Status() Status {
 		job := m.current
 		job.EncoderAudioURL = ""
 		job.CaptionAudioURL = ""
+		job.CaptionAudioToken = ""
 		job.StreamIngestToken = ""
 		job.WorkerEventsURL = ""
 		job.WorkerEventsToken = ""
@@ -509,17 +501,20 @@ func (m *Manager) participantsSnapshotLocked() []Participant {
 
 func metricsFromStatus(status discord.Status, participantCount int) map[string]float64 {
 	metrics := map[string]float64{
-		"discord.gateway_connected":          boolMetric(status.Connected),
-		"discord.voice_connected":            boolMetric(status.VoiceConnected),
-		"discord.audio_forward_enabled":      boolMetric(status.AudioForwardEnabled),
-		"discord.audio_forward_active":       boolMetric(status.AudioForwardActive),
-		"discord.audio_receiving":            boolMetric(status.AudioReceiving),
-		"discord.participant_count":          float64(participantCount),
-		"discord.audio_packets_total":        float64(status.AudioPacketsReceived),
-		"discord.audio_forwarded_total":      float64(status.AudioPacketsForwarded),
-		"discord.audio_forward_errors_total": float64(status.AudioForwardErrors),
-		"discord.reconnect_count":            float64(status.GatewayReconnectCount),
-		"discord.voice_disconnect_count":     float64(status.VoiceDisconnectCount),
+		"discord.gateway_connected":               boolMetric(status.Connected),
+		"discord.voice_connected":                 boolMetric(status.VoiceConnected),
+		"discord.audio_forward_enabled":           boolMetric(status.AudioForwardEnabled),
+		"discord.audio_forward_active":            boolMetric(status.AudioForwardActive),
+		"discord.caption_audio_forward_active":    boolMetric(status.CaptionAudioForwardActive),
+		"discord.audio_receiving":                 boolMetric(status.AudioReceiving),
+		"discord.participant_count":               float64(participantCount),
+		"discord.audio_packets_total":             float64(status.AudioPacketsReceived),
+		"discord.audio_forwarded_total":           float64(status.AudioPacketsForwarded),
+		"discord.audio_forward_errors_total":      float64(status.AudioForwardErrors),
+		"discord.caption_packets_forwarded_total": float64(status.CaptionPacketsForwarded),
+		"discord.caption_forward_errors_total":    float64(status.CaptionForwardErrors),
+		"discord.reconnect_count":                 float64(status.GatewayReconnectCount),
+		"discord.voice_disconnect_count":          float64(status.VoiceDisconnectCount),
 	}
 	if status.LastAudioAgeSec > 0 {
 		metrics["discord.audio_last_packet_age_sec"] = status.LastAudioAgeSec

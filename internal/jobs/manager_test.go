@@ -109,7 +109,7 @@ func (f *fakeStreamStarter) StartStream(streamID string) error {
 func TestManagerStartsAndStopsVoiceJob(t *testing.T) {
 	voice := &fakeVoice{}
 	manager := NewManager(voice)
-	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", EncoderAudioURL: "https://encoder.example.com", StreamIngestToken: "job-token", WorkerEventsURL: "https://worker.example.com", WorkerEventsToken: "worker-events-token"}
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", EncoderAudioURL: "https://encoder.example.com", CaptionAudioURL: "https://caption.example.com", StreamIngestToken: "job-token", CaptionAudioToken: "caption-token", WorkerEventsURL: "https://worker.example.com", WorkerEventsToken: "worker-events-token"}
 	if err := manager.Start(job); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestManagerStartsAndStopsVoiceJob(t *testing.T) {
 	if voice.joined.EncoderAudioURL != "https://encoder.example.com" {
 		t.Fatalf("encoder audio URL was not passed to voice client: %#v", voice.joined)
 	}
-	if status := manager.Status(); status.CurrentJob == nil || status.CurrentJob.EncoderAudioURL != "" || status.CurrentJob.StreamIngestToken != "" || status.CurrentJob.WorkerEventsURL != "" || status.CurrentJob.WorkerEventsToken != "" {
+	if status := manager.Status(); status.CurrentJob == nil || status.CurrentJob.EncoderAudioURL != "" || status.CurrentJob.CaptionAudioURL != "" || status.CurrentJob.StreamIngestToken != "" || status.CurrentJob.CaptionAudioToken != "" || status.CurrentJob.WorkerEventsURL != "" || status.CurrentJob.WorkerEventsToken != "" {
 		t.Fatalf("status leaked job secrets: %#v", status.CurrentJob)
 	}
 	if err := manager.Stop("stream-01"); err != nil {
@@ -133,11 +133,11 @@ func TestManagerStartsAndStopsVoiceJob(t *testing.T) {
 func TestManagerStartAppliesVoiceDefaults(t *testing.T) {
 	voice := &fakeVoice{}
 	manager := NewManager(voice)
-	manager.SetVoiceDefaults(VoiceDefaults{GuildID: "guild-default", VoiceChannelID: "voice-default", TextChannelID: "text-default", CaptionAudioURL: "https://caption.example.com/audio"})
+	manager.SetVoiceDefaults(VoiceDefaults{GuildID: "guild-default", VoiceChannelID: "voice-default", TextChannelID: "text-default"})
 	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01"}); err != nil {
 		t.Fatal(err)
 	}
-	if voice.joined.GuildID != "guild-default" || voice.joined.VoiceChannelID != "voice-default" || voice.joined.TextChannelID != "text-default" || voice.joined.CaptionAudioURL != "https://caption.example.com/audio" {
+	if voice.joined.GuildID != "guild-default" || voice.joined.VoiceChannelID != "voice-default" || voice.joined.TextChannelID != "text-default" || voice.joined.CaptionAudioURL != "" {
 		t.Fatalf("voice defaults were not applied: %#v", voice.joined)
 	}
 }
@@ -145,19 +145,18 @@ func TestManagerStartAppliesVoiceDefaults(t *testing.T) {
 func TestManagerStartAppliesStreamVoiceDefaults(t *testing.T) {
 	voice := &fakeVoice{}
 	manager := NewManager(voice)
-	manager.SetVoiceDefaults(VoiceDefaults{GuildID: "guild-default", VoiceChannelID: "voice-default", TextChannelID: "text-default", CaptionAudioURL: "https://caption.example.com/default"})
+	manager.SetVoiceDefaults(VoiceDefaults{GuildID: "guild-default", VoiceChannelID: "voice-default", TextChannelID: "text-default"})
 	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
 		"stream-01": {
-			GuildID:         "guild-stream",
-			VoiceChannelID:  "voice-stream",
-			TextChannelID:   "text-stream",
-			CaptionAudioURL: "https://caption.example.com/stream",
+			GuildID:        "guild-stream",
+			VoiceChannelID: "voice-stream",
+			TextChannelID:  "text-stream",
 		},
 	})
 	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01"}); err != nil {
 		t.Fatal(err)
 	}
-	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "https://caption.example.com/stream" {
+	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "" {
 		t.Fatalf("stream voice defaults were not applied: %#v", voice.joined)
 	}
 }
@@ -248,7 +247,7 @@ func TestManagerRejectsSecondActiveJob(t *testing.T) {
 
 func TestParticipantAndActiveSpeakerState(t *testing.T) {
 	reporter := &fakeReporter{}
-	voice := &fakeVoice{status: discord.Status{Connected: true, VoiceConnected: true, AudioForwardEnabled: true, AudioForwardActive: true, AudioReceiving: true, AudioPacketsReceived: 12, AudioPacketsForwarded: 10, AudioForwardErrors: 1, GatewayReconnectCount: 2, VoiceDisconnectCount: 1}}
+	voice := &fakeVoice{status: discord.Status{Connected: true, VoiceConnected: true, AudioForwardEnabled: true, AudioForwardActive: true, CaptionAudioForwardActive: true, AudioReceiving: true, AudioPacketsReceived: 12, AudioPacketsForwarded: 10, AudioForwardErrors: 1, CaptionPacketsForwarded: 9, CaptionForwardErrors: 2, GatewayReconnectCount: 2, VoiceDisconnectCount: 1}}
 	manager := NewManagerWithReporter(voice, reporter)
 	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
 		t.Fatal(err)
@@ -270,8 +269,11 @@ func TestParticipantAndActiveSpeakerState(t *testing.T) {
 	if status.Metrics["discord.gateway_connected"] != 1 ||
 		status.Metrics["discord.audio_forward_enabled"] != 1 ||
 		status.Metrics["discord.audio_forward_active"] != 1 ||
+		status.Metrics["discord.caption_audio_forward_active"] != 1 ||
 		status.Metrics["discord.audio_packets_total"] != 12 ||
 		status.Metrics["discord.audio_forward_errors_total"] != 1 ||
+		status.Metrics["discord.caption_packets_forwarded_total"] != 9 ||
+		status.Metrics["discord.caption_forward_errors_total"] != 2 ||
 		status.Metrics["discord.worker_event_publish_failures_total"] != 0 ||
 		status.Metrics["discord.reconnect_count"] != 2 ||
 		status.Metrics["discord.voice_disconnect_count"] != 1 {

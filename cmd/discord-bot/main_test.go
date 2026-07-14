@@ -18,7 +18,7 @@ func (f fakeStreamStarter) StartStream(streamID string) error {
 	return nil
 }
 
-func TestDiscordDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfile(t *testing.T) {
+func TestDiscordBotTokenSecretNameUsesOnlyOwnServiceProfile(t *testing.T) {
 	cfg := control.RuntimeConfig{
 		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
 		Profiles: map[string][]control.RuntimeProfile{
@@ -31,7 +31,6 @@ func TestDiscordDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfile(t *testing.T)
 						"guild_id":              "guild-other",
 						"voice_channel_id":      "voice-other",
 						"bot_token_secret_name": "discord-bot-other",
-						"caption_audio_url":     "https://caption.example.com/other",
 						"text_channel_id":       "text-other",
 					},
 					CreatedAt: testProfileTime(),
@@ -45,7 +44,6 @@ func TestDiscordDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfile(t *testing.T)
 						"guild_id":              "guild-own",
 						"voice_channel_id":      "voice-own",
 						"bot_token_secret_name": "discord-bot-own",
-						"caption_audio_url":     "https://caption.example.com/own",
 						"text_channel_id":       "text-own",
 					},
 					CreatedAt: testProfileTime(),
@@ -55,16 +53,12 @@ func TestDiscordDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfile(t *testing.T)
 		},
 	}
 
-	defaults := discordDefaultsFromRuntimeConfig(cfg)
-	if defaults.GuildID != "" || defaults.VoiceChannelID != "" || defaults.TextChannelID != "" || defaults.CaptionAudioURL != "https://caption.example.com/own" {
-		t.Fatalf("expected own discord defaults, got %#v", defaults)
-	}
 	if got := discordBotTokenSecretNameFromRuntimeConfig(cfg); got != "discord-bot-own" {
 		t.Fatalf("expected own bot token secret name, got %q", got)
 	}
 }
 
-func TestDiscordDefaultsFromRuntimeConfigAllowsUnscopedFallback(t *testing.T) {
+func TestDiscordBotTokenSecretNameAllowsUnscopedFallback(t *testing.T) {
 	cfg := control.RuntimeConfig{
 		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
 		Profiles: map[string][]control.RuntimeProfile{
@@ -96,16 +90,12 @@ func TestDiscordDefaultsFromRuntimeConfigAllowsUnscopedFallback(t *testing.T) {
 		},
 	}
 
-	defaults := discordDefaultsFromRuntimeConfig(cfg)
-	if defaults.GuildID != "" || defaults.VoiceChannelID != "" || defaults.TextChannelID != "" {
-		t.Fatalf("expected unscoped discord fallback profile, got %#v", defaults)
-	}
 	if got := discordBotTokenSecretNameFromRuntimeConfig(cfg); got != "discord-bot-global" {
 		t.Fatalf("expected unscoped bot token secret fallback, got %q", got)
 	}
 }
 
-func TestDiscordDefaultsFromRuntimeConfigRejectsMalformedServiceID(t *testing.T) {
+func TestDiscordBotTokenSecretNameRejectsMalformedServiceID(t *testing.T) {
 	cfg := control.RuntimeConfig{
 		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
 		Profiles: map[string][]control.RuntimeProfile{
@@ -126,10 +116,6 @@ func TestDiscordDefaultsFromRuntimeConfigRejectsMalformedServiceID(t *testing.T)
 		},
 	}
 
-	defaults := discordDefaultsFromRuntimeConfig(cfg)
-	if defaults.GuildID != "" || defaults.VoiceChannelID != "" || defaults.TextChannelID != "" || defaults.CaptionAudioURL != "" {
-		t.Fatalf("malformed service-scoped profile should not be applied: %#v", defaults)
-	}
 	if got := discordBotTokenSecretNameFromRuntimeConfig(cfg); got != "" {
 		t.Fatalf("malformed service-scoped profile should not provide a bot token secret: %q", got)
 	}
@@ -149,7 +135,6 @@ func TestApplyRuntimeConfigToManagerRefreshesAutoStartDefaults(t *testing.T) {
 				GuildID:          "guild-new",
 				VoiceChannelID:   "voice-new",
 				TextChannelID:    "text-new",
-				CaptionAudioURL:  "https://caption.example.com/new",
 				AutoStartTrigger: "discord_voice_join",
 			},
 		},
