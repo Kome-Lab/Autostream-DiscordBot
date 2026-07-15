@@ -10,24 +10,25 @@ import (
 )
 
 type Manager struct {
-	voice               discord.Client
-	reporter            EventReporter
-	streamStarter       StreamStarter
-	mu                  sync.Mutex
-	current             discord.VoiceJob
-	defaults            VoiceDefaults
-	streamDefaults      map[string]VoiceDefaults
-	autoStartPending    map[string]time.Time
-	autoStartCooldown   time.Duration
-	reconnectPolicy     ReconnectPolicy
-	reconnectGeneration int64
-	startedAt           time.Time
-	participants        map[string]Participant
-	activeSpeaker       string
-	lastEventAt         time.Time
-	workerFailures      int64
-	voiceRejoinAttempts int64
-	voiceRejoinFailures int64
+	voice                discord.Client
+	reporter             EventReporter
+	streamStarter        StreamStarter
+	mu                   sync.Mutex
+	current              discord.VoiceJob
+	defaults             VoiceDefaults
+	streamDefaults       map[string]VoiceDefaults
+	autoStartPending     map[string]time.Time
+	autoStartCooldown    time.Duration
+	reconnectPolicy      ReconnectPolicy
+	reconnectGeneration  int64
+	startedAt            time.Time
+	participants         map[string]Participant
+	activeSpeaker        string
+	lastEventAt          time.Time
+	workerFailures       int64
+	voiceRejoinAttempts  int64
+	voiceRejoinFailures  int64
+	notificationReceipts map[notificationEventKey]*notificationReceipt
 }
 
 type VoiceDefaults struct {
@@ -88,7 +89,15 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 	if voice == nil {
 		voice = &discord.NoopClient{}
 	}
-	return &Manager{voice: voice, reporter: reporter, participants: map[string]Participant{}, streamDefaults: map[string]VoiceDefaults{}, autoStartPending: map[string]time.Time{}, autoStartCooldown: 30 * time.Second}
+	return &Manager{
+		voice:                voice,
+		reporter:             reporter,
+		participants:         map[string]Participant{},
+		streamDefaults:       map[string]VoiceDefaults{},
+		autoStartPending:     map[string]time.Time{},
+		autoStartCooldown:    30 * time.Second,
+		notificationReceipts: map[notificationEventKey]*notificationReceipt{},
+	}
 }
 
 func (m *Manager) Start(job discord.VoiceJob) error {

@@ -78,6 +78,7 @@ type Client interface {
 	Connect() error
 	JoinVoice(job VoiceJob) error
 	LeaveVoice(streamID string) error
+	SendMessage(ctx context.Context, message OutboundMessage) (SentMessage, error)
 	Status() Status
 }
 

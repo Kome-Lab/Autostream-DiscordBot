@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -10,13 +11,18 @@ import (
 )
 
 type fakeVoice struct {
-	mu        sync.Mutex
-	status    discord.Status
-	joined    discord.VoiceJob
-	leftFor   string
-	err       error
-	joinCount int
-	joinCh    chan discord.VoiceJob
+	mu            sync.Mutex
+	status        discord.Status
+	joined        discord.VoiceJob
+	leftFor       string
+	err           error
+	joinCount     int
+	joinCh        chan discord.VoiceJob
+	sentMessages  []discord.OutboundMessage
+	sendErr       error
+	sendMessageID string
+	sendStarted   chan struct{}
+	sendRelease   chan struct{}
 }
 
 type fakeReporter struct {
@@ -66,6 +72,35 @@ func (f *fakeVoice) LeaveVoice(streamID string) error {
 	f.leftFor = streamID
 	f.status.VoiceConnected = false
 	return nil
+}
+func (f *fakeVoice) SendMessage(ctx context.Context, message discord.OutboundMessage) (discord.SentMessage, error) {
+	f.mu.Lock()
+	f.sentMessages = append(f.sentMessages, message)
+	err := f.sendErr
+	messageID := f.sendMessageID
+	started := f.sendStarted
+	release := f.sendRelease
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return discord.SentMessage{}, ctx.Err()
+		}
+	}
+	if err != nil {
+		return discord.SentMessage{}, err
+	}
+	if messageID == "" {
+		messageID = "message-01"
+	}
+	return discord.SentMessage{MessageID: messageID}, nil
 }
 func (f *fakeVoice) Status() discord.Status {
 	f.mu.Lock()

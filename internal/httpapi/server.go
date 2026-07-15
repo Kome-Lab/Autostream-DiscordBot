@@ -124,6 +124,7 @@ func NewServerWithRuntimeConfig(serviceType string, manager *jobs.Manager, verif
 	mux.HandleFunc("POST /jobs/{id}/stop", server.stopJob)
 	mux.HandleFunc("GET /streams/{id}/participants", server.participants)
 	mux.HandleFunc("POST /streams/{id}/active-speaker", server.activeSpeaker)
+	mux.HandleFunc("POST /streams/{id}/notifications/youtube-live", server.youtubeLiveNotification)
 	return securityHeaders(mux)
 }
 

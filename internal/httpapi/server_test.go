@@ -19,7 +19,10 @@ import (
 )
 
 type httpFakeVoice struct {
-	joined discord.VoiceJob
+	joined        discord.VoiceJob
+	sentMessages  []discord.OutboundMessage
+	sendErr       error
+	sendMessageID string
 }
 
 func (f *httpFakeVoice) Connect() error { return nil }
@@ -30,6 +33,18 @@ func (f *httpFakeVoice) JoinVoice(job discord.VoiceJob) error {
 }
 
 func (f *httpFakeVoice) LeaveVoice(streamID string) error { return nil }
+
+func (f *httpFakeVoice) SendMessage(ctx context.Context, message discord.OutboundMessage) (discord.SentMessage, error) {
+	f.sentMessages = append(f.sentMessages, message)
+	if f.sendErr != nil {
+		return discord.SentMessage{}, f.sendErr
+	}
+	messageID := f.sendMessageID
+	if messageID == "" {
+		messageID = "message-01"
+	}
+	return discord.SentMessage{MessageID: messageID}, nil
+}
 
 func (f *httpFakeVoice) Status() discord.Status {
 	return discord.Status{Connected: f.joined.StreamID != "", VoiceConnected: f.joined.StreamID != ""}

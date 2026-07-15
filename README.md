@@ -13,6 +13,7 @@ AutoStream の Discord Bot service です。Discord Gateway / Voice に接続し
 - stream job に含まれる guild / voice channel へ参加する。
 - Discord VC の Opus packet を Encoder/Recorder の audio ingest endpoint へ forward する。
 - participant / active speaker / chat 状態を、stream job で指定された Worker へ送る。
+- Control Panel が YouTube live を確定した後、runtime config で指定された stream の Discord text channel へ視聴 URL を冪等に投稿する。
 
 ## Bootstrap Env
 
@@ -57,6 +58,21 @@ Control Panel に登録する capability の `audio_capture`、`audio_stream_for
 Worker event の送信先と token は配信枠で primary assigned された Worker から Control Panel が解決し、`/jobs/start` の `worker_events_url` / `worker_events_token` として渡します。Discord Bot の env に固定の `WORKER_URL` や `WORKER_TOKEN` は置きません。
 
 字幕音声の送信先は、配信枠で選択された primary WorkerからControl Panelが解決し、`/jobs/start` の `caption_audio_url` として渡します。認証には同じジョブで渡される短命な `caption_audio_token` だけを使い、送信先やtokenをDiscordプロファイル、runtime config、status、logには保存しません。
+
+## YouTube Live Notification API
+
+`POST /streams/{id}/notifications/youtube-live` は inbound service token を必須とし、次の JSON だけを受け付けます。channel ID は request から受け取らず、毎回 Control Panel runtime config の primary assignment と `text_channel_id` を再検証します。
+
+```json
+{
+  "event_id": "youtube-live-stream-01-20260715T120000Z",
+  "watch_url": "https://www.youtube.com/watch?v=example"
+}
+```
+
+送信前に同じ stream の live job が稼働中であり、その job の text channel が runtime config と一致することを確認します。`watch_url` は HTTPS の `youtube.com`、`www.youtube.com`、`m.youtube.com`、`youtu.be` だけを許可し、userinfo、port、fragment を拒否します。Discord message は固定文面と URL のみで、allowed mentions はすべて無効です。
+
+成功時は `200 OK` で `status`、`message_id`、`already_sent` を返します。同一 process 内で同じ `event_id` の成功 receipt を保持するため、再送では Discord へ再投稿せず `already_sent: true` を返します。Discord rate limit は `429` と `Retry-After`、一時障害は retryable な `502`、権限不足は `403` と `discord_missing_permissions` を返します。
 
 ## 開発
 
