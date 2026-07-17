@@ -331,6 +331,44 @@ func TestValidateRejectsRemoteHTTPServicePublicURL(t *testing.T) {
 	}
 }
 
+func TestValidateAllowsComposeDiscordBotHTTPServicePublicURL(t *testing.T) {
+	cfg := Config{ControlPanelURL: "https://control.example.com", Token: "<SERVICE_TOKEN>", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "http://discord-bot:8080"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected exact Compose service hostname to be allowed for SERVICE_PUBLIC_URL: %v", err)
+	}
+}
+
+func TestValidateRejectsComposeDiscordBotHTTPControlPanelURL(t *testing.T) {
+	cfg := Config{ControlPanelURL: "http://discord-bot:8080", Token: "<SERVICE_TOKEN>", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected CONTROL_PANEL_URL to reject the Compose service hostname over HTTP")
+	}
+	if !strings.Contains(err.Error(), "CONTROL_PANEL_URL") || !strings.Contains(err.Error(), "https for remote hosts") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateRejectsOtherHTTPServicePublicHostnames(t *testing.T) {
+	for _, raw := range []string{
+		"http://worker:8080",
+		"http://discord:8080",
+		"http://discord-bot.internal:8080",
+		"http://discord-bot.:8080",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			cfg := Config{ControlPanelURL: "https://control.example.com", Token: "<SERVICE_TOKEN>", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: raw}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected SERVICE_PUBLIC_URL to reject HTTP host %q", raw)
+			}
+			if !strings.Contains(err.Error(), "SERVICE_PUBLIC_URL") || !strings.Contains(err.Error(), "https for remote hosts") {
+				t.Fatalf("unexpected error for %q: %v", raw, err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsControlPanelURLQueryOrFragment(t *testing.T) {
 	cfg := Config{ControlPanelURL: "https://control.example.com#bearer", Token: "<SERVICE_TOKEN>", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}
 	err := cfg.Validate()

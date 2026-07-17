@@ -65,7 +65,7 @@ func RunConfigureCommand(args []string, expectedType string, stdout io.Writer) e
 	if *timeout <= 0 {
 		return errors.New("--timeout must be positive")
 	}
-	if err := validateHTTPURL(*panelURL, "--panel-url"); err != nil {
+	if err := validateHTTPURL(*panelURL, "--panel-url", ""); err != nil {
 		return err
 	}
 	configYML, err := fetchNodeConfig(context.Background(), strings.TrimSpace(*panelURL), strings.TrimSpace(*nodeID), strings.TrimSpace(*configureToken), *timeout)
