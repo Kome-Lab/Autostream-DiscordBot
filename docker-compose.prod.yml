@@ -1,6 +1,6 @@
 services:
   discord-bot:
-    image: discord-bot:latest
+    image: ${AUTOSTREAM_IMAGE_REGISTRY:-ghcr.io/kome-lab/autostream-docker}/discord-bot:${AUTOSTREAM_DOCKER_VERSION:-latest}
     restart: unless-stopped
     env_file: .env
     environment:
