@@ -16,6 +16,7 @@ import (
 	"github.com/example/autostream-discord-bot/internal/control"
 	"github.com/example/autostream-discord-bot/internal/discord"
 	"github.com/example/autostream-discord-bot/internal/jobs"
+	"github.com/example/autostream-discord-bot/internal/version"
 )
 
 type Status struct {
@@ -118,6 +119,7 @@ func NewServerWithRuntimeConfig(serviceType string, manager *jobs.Manager, verif
 	server := Server{serviceType: serviceType, manager: manager, verifier: verifier, runtimeConfig: runtimeConfig}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", server.health)
+	mux.HandleFunc("GET /updater/version", updaterVersion)
 	mux.HandleFunc("GET /status", server.status)
 	mux.HandleFunc("POST /heartbeat", server.heartbeat)
 	mux.HandleFunc("POST /jobs/start", server.startJob)
@@ -130,6 +132,10 @@ func NewServerWithRuntimeConfig(serviceType string, manager *jobs.Manager, verif
 
 func (s Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func updaterVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"version": version.Current()})
 }
 
 func (s Server) status(w http.ResponseWriter, r *http.Request) {

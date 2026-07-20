@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/example/autostream-discord-bot/internal/control"
 	"github.com/example/autostream-discord-bot/internal/discord"
 	"github.com/example/autostream-discord-bot/internal/jobs"
+	"github.com/example/autostream-discord-bot/internal/version"
 )
 
 type httpFakeVoice struct {
@@ -48,6 +50,32 @@ func (f *httpFakeVoice) SendMessage(ctx context.Context, message discord.Outboun
 
 func (f *httpFakeVoice) Status() discord.Status {
 	return discord.Status{Connected: f.joined.StreamID != "", VoiceConnected: f.joined.StreamID != ""}
+}
+
+func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
+	previousVersion := version.Version
+	version.Version = "v1.1.1"
+	t.Setenv("SERVICE_VERSION", "v9.9.9")
+	t.Cleanup(func() {
+		version.Version = previousVersion
+	})
+
+	handler := NewServer("discord_bot", jobs.NewManager(&discord.NoopClient{}), TokenVerifier{PlainToken: "expected"})
+	req := httptest.NewRequest(http.MethodGet, "/updater/version", nil)
+	res := httptest.NewRecorder()
+
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected unauthenticated updater version request to return 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode updater version response: %v", err)
+	}
+	if len(payload) != 1 || payload["version"] != version.Current() {
+		t.Fatalf("expected only embedded version %q, got %#v", version.Current(), payload)
+	}
 }
 
 func TestProtectedEndpointsRejectMissingToken(t *testing.T) {
