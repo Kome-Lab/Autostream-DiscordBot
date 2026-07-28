@@ -72,26 +72,50 @@ else
 fi
 ```
 
-Edit `/etc/autostream/discord-bot.env` with real environment-specific values, then run:
+Edit `/etc/autostream/discord-bot.env` with real environment-specific values.
+`AUTOSTREAM_BIND_ADDR` accepts an arbitrary unprivileged port from `1024`
+through `65535`; the shipped systemd env uses the standard IPv4 loopback value
+`127.0.0.1:8083`. The binary retains the legacy `127.0.0.1:8080` fallback only
+when the variable is absent, so upgrading an older installation does not move
+its port. The systemd unit does not hard-code a port. An invalid address or an
+out-of-range port makes the Discord Bot fail closed during startup. Keep
+`AUTOSTREAM_CONFIG_REVISION=1`
+for an existing installation until the Control Panel applies a newer service
+configuration. The value is reported by `/updater/version` and must be an
+integer greater than or equal to `1`; an invalid value stops the service before
+it starts listening. Keep this environment file root-owned and mode `0640`.
+
+Set `DISCORD_BOT_PORT` below to the port component of `AUTOSTREAM_BIND_ADDR`,
+then run:
 
 ```bash
 set -euo pipefail
 VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
+DISCORD_BOT_PORT="${DISCORD_BOT_PORT:-8083}"
+PROBE_HOST="${PROBE_HOST:-127.0.0.1}"
+[[ "$DISCORD_BOT_PORT" =~ ^[0-9]+$ ]]
+(( DISCORD_BOT_PORT >= 1024 && DISCORD_BOT_PORT <= 65535 ))
 sudo systemctl daemon-reload
 sudo systemctl enable autostream-discord-bot
 sudo systemctl restart autostream-discord-bot
 PID="$(sudo systemctl show --property=MainPID --value autostream-discord-bot)"
 EXPECTED="$(sudo readlink -f /opt/autostream/discord-bot/current/bin/autostream-discord-bot)"
 test "$(sudo readlink -f "/proc/$PID/exe")" = "$EXPECTED"
-curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8083/health >/dev/null
+curl --fail --silent --show-error --max-time 10 \
+  "http://${PROBE_HOST}:${DISCORD_BOT_PORT}/health" >/dev/null
 test "$(curl --fail --silent --show-error --max-time 10 \
-  http://127.0.0.1:8083/updater/version | jq -r '.version')" = "$VERSION"
+  "http://${PROBE_HOST}:${DISCORD_BOT_PORT}/updater/version" | jq -r '.version')" = "$VERSION"
 ```
 
-Use the host's configured loopback port if it differs from `8083`.
+The standard systemd/local-executor profile uses IPv4 loopback. For an explicit
+IPv6 loopback bind such as `AUTOSTREAM_BIND_ADDR=[::1]:18083`, run the smoke
+check with `PROBE_HOST='[::1]' DISCORD_BOT_PORT=18083`; the brackets are
+required in the URL.
+
 `/updater/version` is the unauthenticated, minimal endpoint used only to prove
-the running binary's embedded release version to the update helper. Block this
-exact path at any public reverse proxy.
+the running binary and local service identity to the update helper. Its exact
+response fields are version, service_id, service_type, and config_revision.
+Block this exact path at any public reverse proxy.
 
 Do not fabricate `.artifact-sha256` or `.version` from an unverified local
 binary. Releases without `release-manifest.json` remain manual-only; publish a

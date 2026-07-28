@@ -55,7 +55,12 @@ func (f *httpFakeVoice) Status() discord.Status {
 func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
 	previousVersion := version.Version
 	version.Version = "v1.1.1"
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	writeNodeConfigForVerifierTest(t, configPath, control.ServiceType)
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
+	t.Setenv("SERVICE_ID", "legacy-env-service-id")
 	t.Setenv("SERVICE_VERSION", "v9.9.9")
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "11")
 	t.Cleanup(func() {
 		version.Version = previousVersion
 	})
@@ -69,12 +74,60 @@ func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("expected unauthenticated updater version request to return 200, got %d body=%s", res.Code, res.Body.String())
 	}
-	var payload map[string]string
+	var payload map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
 		t.Fatalf("decode updater version response: %v", err)
 	}
-	if len(payload) != 1 || payload["version"] != version.Current() {
-		t.Fatalf("expected only embedded version %q, got %#v", version.Current(), payload)
+	if len(payload) != 4 ||
+		payload["version"] != version.Current() ||
+		payload["service_id"] != "discord-bot-01" ||
+		payload["service_type"] != control.ServiceType ||
+		payload["config_revision"] != float64(11) {
+		t.Fatalf("expected embedded version and configured service identity, got %#v", payload)
+	}
+}
+
+func TestNewServerFailsClosedForInvalidConfigRevision(t *testing.T) {
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewServer must reject an invalid AUTOSTREAM_CONFIG_REVISION")
+		}
+	}()
+	_ = NewServer(control.ServiceType, jobs.NewManager(&discord.NoopClient{}), TokenVerifier{})
+}
+
+func TestNewServerFailsClosedForInvalidNodeIdentity(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	writeNodeConfigForVerifierTest(t, configPath, "worker")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewServer must reject a node config for a different service type")
+		}
+	}()
+	_ = NewServer(control.ServiceType, jobs.NewManager(&discord.NoopClient{}), TokenVerifier{})
+}
+
+func TestUpdaterVersionFailsClosedWhenIdentityDriftsAfterConstruction(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	writeNodeConfigForVerifierTest(t, configPath, control.ServiceType)
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "11")
+	handler := NewServer(control.ServiceType, jobs.NewManager(&discord.NoopClient{}), TokenVerifier{})
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
+	t.Setenv("SERVICE_ID", "changed-after-start")
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "12")
+
+	req := httptest.NewRequest(http.MethodGet, "/updater/version", nil)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s, want 503", res.Code, res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), "service_id") {
+		t.Fatalf("drift response leaked service identity: %s", res.Body.String())
 	}
 }
 

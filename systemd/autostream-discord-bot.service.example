@@ -6,7 +6,11 @@ Wants=network-online.target
 [Service]
 User=autostream
 Group=autostream
+# AUTOSTREAM_CONFIG_REVISION is read from this root-owned file and must be an integer >= 1.
 EnvironmentFile=/etc/autostream/discord-bot.env
+# Optional root-owned Control Panel managed bind/revision override. It is loaded
+# after discord-bot.env so AUTOSTREAM_BIND_ADDR and AUTOSTREAM_CONFIG_REVISION win.
+EnvironmentFile=-/opt/autostream/local-executor/ports/discord-bot.env
 ExecStart=/opt/autostream/discord-bot/current/bin/autostream-discord-bot
 Restart=on-failure
 NoNewPrivileges=true

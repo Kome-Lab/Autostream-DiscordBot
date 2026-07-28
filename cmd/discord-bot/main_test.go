@@ -1,13 +1,99 @@
 package main
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/example/autostream-discord-bot/internal/control"
 	discordclient "github.com/example/autostream-discord-bot/internal/discord"
+	"github.com/example/autostream-discord-bot/internal/httpapi"
 	"github.com/example/autostream-discord-bot/internal/jobs"
 )
+
+func TestDiscordBotBindAddrFromEnvPreservesLegacyFallbackPort8080(t *testing.T) {
+	t.Setenv("AUTOSTREAM_BIND_ADDR", "")
+
+	got, err := discordBotBindAddrFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "127.0.0.1:8080" {
+		t.Fatalf("default bind address = %q, want bridge-compatible 127.0.0.1:8080", got)
+	}
+}
+
+func TestDiscordBotBindAddrFromEnvAcceptsConfigurableUnprivilegedPort(t *testing.T) {
+	for _, value := range []string{
+		"127.0.0.1:1024",
+		"127.0.0.1:18083",
+		"127.0.0.1:65535",
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
+			got, err := discordBotBindAddrFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != value {
+				t.Fatalf("bind address = %q, want %q", got, value)
+			}
+		})
+	}
+}
+
+func TestDiscordBotBindAddrFromEnvAcceptsIPv6(t *testing.T) {
+	t.Setenv("AUTOSTREAM_BIND_ADDR", "[::1]:18083")
+
+	got, err := discordBotBindAddrFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "[::1]:18083" {
+		t.Fatalf("bind address = %q, want [::1]:18083", got)
+	}
+}
+
+func TestDiscordBotBindAddrFromEnvRejectsInvalidOrPrivilegedPort(t *testing.T) {
+	for _, value := range []string{
+		"127.0.0.1",
+		"127.0.0.1:0",
+		"127.0.0.1:1023",
+		"127.0.0.1:65536",
+		"127.0.0.1:not-a-port",
+	} {
+		t.Run(strings.ReplaceAll(value, ":", "_"), func(t *testing.T) {
+			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
+			if _, err := discordBotBindAddrFromEnv(); err == nil {
+				t.Fatalf("discordBotBindAddrFromEnv() accepted %q", value)
+			}
+		})
+	}
+}
+
+func TestDiscordBotStartupAddrFromEnvRejectsInvalidConfigRevision(t *testing.T) {
+	t.Setenv("AUTOSTREAM_BIND_ADDR", "127.0.0.1:18083")
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
+
+	if _, err := discordBotStartupAddrFromEnv(); err == nil ||
+		!strings.Contains(err.Error(), "AUTOSTREAM_CONFIG_REVISION") {
+		t.Fatalf("discordBotStartupAddrFromEnv() error = %v, want invalid config revision", err)
+	}
+}
+
+func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) {
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
+	t.Setenv("SERVICE_ID", "discord-authoritative")
+	latch := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
+
+	if err := requireMatchingUpdaterIdentity(latch, "discord-authoritative"); err != nil {
+		t.Fatalf("matching registration identity failed: %v", err)
+	}
+	if err := requireMatchingUpdaterIdentity(latch, "discord-drifted"); !errors.Is(err, httpapi.ErrUpdaterIdentityDrift) {
+		t.Fatalf("registration identity drift error = %v", err)
+	}
+}
 
 type fakeStreamStarter struct {
 	started chan string

@@ -33,11 +33,17 @@ func TestConfigFromEnvRejectsWrongNodeType(t *testing.T) {
 func TestConfigFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "config.yml")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
-	t.Setenv("CONTROL_PANEL_URL", "")
-	t.Setenv("CONTROL_PANEL_TOKEN", "")
+	t.Setenv("CONTROL_PANEL_URL", "https://legacy-panel.example.jp")
+	t.Setenv("CONTROL_PANEL_TOKEN", "legacy-token")
+	t.Setenv("SERVICE_ID", "legacy-discord")
+	t.Setenv("SERVICE_NAME", "Legacy Discord")
+	t.Setenv("SERVICE_PUBLIC_URL", "https://legacy-discord.example.jp")
 	cfg := ConfigFromEnv()
 	if cfg.ConfigError != "" {
 		t.Fatalf("missing node config should not be fatal: %#v", cfg)
+	}
+	if cfg.ControlPanelURL != "" || cfg.Token != "" || cfg.ServiceID != "" || cfg.ServiceName != "" || cfg.ServicePublicURL != "" {
+		t.Fatalf("configured node path must clear legacy panel identity while pending: %#v", cfg)
 	}
 	if !NodeConfigPendingFromEnv() {
 		t.Fatal("missing node config should be reported as pending")

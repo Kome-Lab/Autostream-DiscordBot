@@ -26,6 +26,11 @@ func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
 	if path == "" {
 		return
 	}
+	cfg.ControlPanelURL = ""
+	cfg.Token = ""
+	cfg.ServiceID = ""
+	cfg.ServiceName = ""
+	cfg.ServicePublicURL = ""
 	nodeCfg, err := loadNodeAgentConfig(path)
 	if err != nil {
 		if os.IsNotExist(err) {
