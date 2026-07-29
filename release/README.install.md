@@ -5,72 +5,69 @@ This archive contains the Linux binary, systemd example, and placeholder environ
 ## Requirements
 
 - Linux amd64 or arm64 matching the archive name.
-- A dedicated `autostream` user and group.
-- Authenticated `gh`, `jq`, `sha256sum`, and `curl` for release verification.
+- `jq`, `sha256sum`, `tar`, `flock`, and systemd. The installer creates the
+  dedicated `autostream` service account when it is absent.
+- `gh` installed and authenticated to GitHub for release-attestation
+  verification.
 - Discord application credentials supplied outside Git.
 - Network access to the Control Panel and Discord.
 
 ## Install a verified managed release
 
-The systemd unit runs the binary through `/opt/autostream/discord-bot/current`.
-Seed that link from the same immutable release manifest and checksum that
-supplied the archive. `autostream-updater` refuses an unseeded target because
-it would have no verified rollback release.
+Download these four release assets to `/tmp`:
+
+- `autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz` (or `arm64`)
+- the matching `.tar.gz.sha256`
+- `release-manifest.json`
+- `release-manifest.json.sha256`
+
+For an amd64 host, copy them into a root-owned staging directory:
 
 ```bash
-set -euo pipefail
-VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
-ARCH="${ARCH:-amd64}"
-ASSET="autostream-discord-bot_${VERSION}_linux_${ARCH}.tar.gz"
-ARTIFACT_ROOT=/opt/autostream/releases
-
-sudo install -d -o root -g root -m 0755 "$ARTIFACT_ROOT"
-sudo install -d -o "$USER" -g "$USER" -m 0755 "$ARTIFACT_ROOT/artifacts"
-gh release download "$VERSION" \
-  --repo Kome-Lab/Autostream-DiscordBot \
-  --pattern "$ASSET" \
-  --pattern "$ASSET.sha256" \
-  --pattern release-manifest.json \
-  --pattern release-manifest.json.sha256 \
-  --dir "$ARTIFACT_ROOT/artifacts" \
-  --clobber
-(cd "$ARTIFACT_ROOT/artifacts" && sha256sum --check --strict "$ASSET.sha256")
-(cd "$ARTIFACT_ROOT/artifacts" && sha256sum --check --strict release-manifest.json.sha256)
-
-DIGEST="$(awk 'NR == 1 { print $1 }' "$ARTIFACT_ROOT/artifacts/$ASSET.sha256")"
-[[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]]
-jq -e --arg version "$VERSION" --arg asset "$ASSET" --arg sha "$DIGEST" \
-  '.schema_version == 1 and .release_id == $version and .channel == "host" and
-   ([.components[] | select(.service == "discord-bot" and .source_version == $version) |
-     .artifacts[] | select(.name == $asset and .sha256 == $sha)] | length == 1)' \
-  "$ARTIFACT_ROOT/artifacts/release-manifest.json"
-
-RELEASE_ROOT=/opt/autostream/discord-bot/releases
-RELEASE_DIR="$RELEASE_ROOT/${VERSION}-${DIGEST:0:12}"
-CURRENT_LINK=/opt/autostream/discord-bot/current
-sudo test ! -e "$RELEASE_DIR"
-sudo install -d -o root -g root -m 0755 "$RELEASE_DIR"
-sudo tar --no-same-owner --strip-components=1 -xzf "$ARTIFACT_ROOT/artifacts/$ASSET" -C "$RELEASE_DIR"
-(cd "$RELEASE_DIR" && sha256sum --check --strict checksums.txt)
-printf '%s\n' "$DIGEST" | sudo tee "$RELEASE_DIR/.artifact-sha256" >/dev/null
-printf '%s\n' "$VERSION" | sudo tee "$RELEASE_DIR/.version" >/dev/null
-sudo chown root:root "$RELEASE_DIR/.artifact-sha256" "$RELEASE_DIR/.version"
-sudo chmod 0444 "$RELEASE_DIR/.artifact-sha256" "$RELEASE_DIR/.version"
-sudo /usr/sbin/runuser -u autostream -- "$RELEASE_DIR/bin/autostream-discord-bot" --version | grep -F -- "$VERSION"
-
-sudo ln -s "$RELEASE_DIR" "${CURRENT_LINK}.next"
-sudo mv -Tf "${CURRENT_LINK}.next" "$CURRENT_LINK"
-sudo ln -sfn "$CURRENT_LINK/bin/autostream-discord-bot" /usr/local/bin/autostream-discord-bot
-sudo ln -sfn /usr/local/bin/autostream-discord-bot /usr/local/bin/discord-bot
-sudo install -d -o autostream -g autostream /var/lib/autostream/discord-bot
-sudo install -d -o root -g root -m 0750 /etc/autostream
-sudo install -o root -g root -m 0644 "$RELEASE_DIR/systemd/autostream-discord-bot.service.example" /etc/systemd/system/autostream-discord-bot.service
-if ! sudo test -e /etc/autostream/discord-bot.env; then
-  sudo install -o root -g root -m 0640 "$RELEASE_DIR/.env.example" /etc/autostream/discord-bot.env
-else
-  echo "preserving existing /etc/autostream/discord-bot.env; review .env.example for new settings"
-fi
+sudo install -d -o root -g root -m 0755 /opt/autostream/releases
+sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts
+sudo install -o root -g root -m 0644 /tmp/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz
+sudo install -o root -g root -m 0644 /tmp/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256 /opt/autostream/releases/artifacts/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256
+sudo install -o root -g root -m 0644 /tmp/release-manifest.json /opt/autostream/releases/artifacts/release-manifest.json
+sudo install -o root -g root -m 0644 /tmp/release-manifest.json.sha256 /opt/autostream/releases/artifacts/release-manifest.json.sha256
+cd /opt/autostream/releases/artifacts
 ```
+
+Still as the ordinary login user, verify both the exact archive that will be
+extracted as root and its manifest:
+
+```bash
+gh attestation verify autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-DiscordBot --signer-workflow Kome-Lab/Autostream-DiscordBot/.github/workflows/release-host.yml --deny-self-hosted-runners
+gh attestation verify release-manifest.json --repo Kome-Lab/Autostream-DiscordBot --signer-workflow Kome-Lab/Autostream-DiscordBot/.github/workflows/release-host.yml --deny-self-hosted-runners
+sha256sum --check --strict autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256
+sha256sum --check --strict release-manifest.json.sha256
+```
+
+Only after every command above succeeds, extract the root-owned archive without
+renaming its top-level directory and run the installer:
+
+```bash
+sudo test ! -e autostream-discord-bot_vX.Y.Z_linux_amd64
+sudo test ! -L autostream-discord-bot_vX.Y.Z_linux_amd64
+sudo tar --no-same-owner --no-same-permissions -xzf autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz
+cd autostream-discord-bot_vX.Y.Z_linux_amd64
+sudo ./install-autostream-discord-bot
+```
+
+For arm64, replace `amd64` with `arm64` in the archive and directory names.
+
+The installer verifies the copied release inputs, exact manifest tuple, archive
+layout, inner checksums, architecture, and binary version before changing the
+host. It seeds the verified rollback release, preserves an existing environment
+file byte for byte, installs the systemd unit, and exposes
+`/usr/local/bin/autostream-discord-bot` plus the `discord-bot` alias. It does
+not install packages, write Node configuration, or start the service.
+Legacy public binaries are backed up only under the root-owned
+`/var/backups/autostream/install-migrations/discord-bot` tree.
+
+`/opt/autostream/discord-bot/releases` and its `current` link are
+installer-owned implementation details used by managed update and rollback.
+Do not create or edit their release directories or marker files manually.
 
 Edit `/etc/autostream/discord-bot.env` with real environment-specific values.
 `AUTOSTREAM_BIND_ADDR` accepts an arbitrary unprivileged port from `1024`
@@ -85,32 +82,31 @@ configuration. The value is reported by `/updater/version` and must be an
 integer greater than or equal to `1`; an invalid value stops the service before
 it starts listening. Keep this environment file root-owned and mode `0640`.
 
-Set `DISCORD_BOT_PORT` below to the port component of `AUTOSTREAM_BIND_ADDR`,
-then run:
+In Control Panel, create a `discord_bot` Node and run the exact one-time Auto
+Configure command generated by the Panel. It writes the Node identity and
+runtime token to `/etc/autostream-discord-bot/config.yml`.
+
+Then start and inspect the service:
 
 ```bash
-set -euo pipefail
-VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
-DISCORD_BOT_PORT="${DISCORD_BOT_PORT:-8083}"
-PROBE_HOST="${PROBE_HOST:-127.0.0.1}"
-[[ "$DISCORD_BOT_PORT" =~ ^[0-9]+$ ]]
-(( DISCORD_BOT_PORT >= 1024 && DISCORD_BOT_PORT <= 65535 ))
-sudo systemctl daemon-reload
-sudo systemctl enable autostream-discord-bot
-sudo systemctl restart autostream-discord-bot
-PID="$(sudo systemctl show --property=MainPID --value autostream-discord-bot)"
-EXPECTED="$(sudo readlink -f /opt/autostream/discord-bot/current/bin/autostream-discord-bot)"
-test "$(sudo readlink -f "/proc/$PID/exe")" = "$EXPECTED"
-curl --fail --silent --show-error --max-time 10 \
-  "http://${PROBE_HOST}:${DISCORD_BOT_PORT}/health" >/dev/null
-test "$(curl --fail --silent --show-error --max-time 10 \
-  "http://${PROBE_HOST}:${DISCORD_BOT_PORT}/updater/version" | jq -r '.version')" = "$VERSION"
+sudo systemctl enable --now autostream-discord-bot
+sudo systemctl status autostream-discord-bot
+autostream-discord-bot --version
 ```
 
-The standard systemd/local-executor profile uses IPv4 loopback. For an explicit
-IPv6 loopback bind such as `AUTOSTREAM_BIND_ADDR=[::1]:18083`, run the smoke
-check with `PROBE_HOST='[::1]' DISCORD_BOT_PORT=18083`; the brackets are
-required in the URL.
+When migrating an installation that is already active, restart it after the
+installer finishes instead of using the first-start command:
+
+```bash
+sudo systemctl restart autostream-discord-bot
+sudo systemctl status autostream-discord-bot
+autostream-discord-bot --version
+```
+
+Use the host and port configured by `AUTOSTREAM_BIND_ADDR` when checking
+`/health` and `/updater/version`. This guide intentionally avoids the older
+variable-heavy probe forms `PROBE_HOST="${PROBE_HOST:-127.0.0.1}"` and
+`PROBE_HOST='[::1]'`; for IPv6, keep the address in brackets in the URL.
 
 `/updater/version` is the unauthenticated, minimal endpoint used only to prove
 the running binary and local service identity to the update helper. Its exact

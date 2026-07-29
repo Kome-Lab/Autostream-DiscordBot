@@ -14,5 +14,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.mod
+      - name: Validate installer syntax
+        shell: bash
+        run: bash -n release/install-autostream-discord-bot
+      - name: Validate installer integration fixture syntax
+        shell: bash
+        run: bash -n release/test-install-autostream-discord-bot-integration.sh
+      - name: Test installer integration scenarios
+        shell: bash
+        run: sudo bash release/test-install-autostream-discord-bot-integration.sh
       - run: go test ./...
       - run: go build ./...
