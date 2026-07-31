@@ -1044,8 +1044,16 @@ set -e
 [[ ${unsafe_backup_status} -ne 0 ]] || \
   die "unsafe legacy backup symlink unexpectedly passed preflight"
 grep -F -- "legacy backup destination conflicts with ${PUBLIC_BINARY}" \
-  "${WORK_DIR}/unsafe-backup-type.out" >/dev/null || \
-  die "unsafe legacy backup did not fail at its type boundary"
+  "${WORK_DIR}/unsafe-backup-type.out" >/dev/null || {
+    printf '%s\n' \
+      "unsafe legacy backup status=${unsafe_backup_status}" \
+      "unsafe legacy backup dir=${unsafe_backup_dir}" \
+      "unsafe legacy backup installer output follows:" >&2
+    while IFS= read -r unsafe_backup_output_line; do
+      printf '  %s\n' "${unsafe_backup_output_line}" >&2
+    done < "${WORK_DIR}/unsafe-backup-type.out"
+    die "unsafe legacy backup did not fail at its type boundary"
+  }
 [[ ! -e ${WORK_DIR}/unsafe-backup-was-read ]] || \
   die "unsafe legacy backup was read before type validation"
 rm -f -- \

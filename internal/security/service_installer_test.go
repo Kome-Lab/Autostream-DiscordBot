@@ -642,7 +642,8 @@ func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
 		`ln -- "${lock_create_stage}" "${path}"`,
 		`ensure_permanent_lock_path_atomically "${TARGET_LOCK}"`,
 		`exec 9<>"${TARGET_LOCK}"`,
-		`$(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/9) == "regular file:root:root:600"`,
+		`-f /proc/self/fd/9`,
+		`$(stat -Lc '%U:%G:%a' -- /proc/self/fd/9) == "root:root:600"`,
 		"updater target lock identity changed",
 		"permanent updater lock",
 		"durable recovery backup",
@@ -656,6 +657,9 @@ func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
 	}
 	if strings.Contains(installer, `rm -f -- "${TARGET_LOCK}"`) {
 		t.Fatal("installer must never unlink the permanent production updater lock")
+	}
+	if strings.Contains(installer, `stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/`) {
+		t.Fatal("installer must not compare locale- and size-dependent stat file-type labels")
 	}
 	sharedLockIndex := strings.Index(installer, "flock -n 8")
 	firstJournaledAnchorIndex := strings.Index(installer, "ensure_root_anchor_directory /usr\n")
@@ -680,7 +684,7 @@ func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
 		t.Fatal("installer managed-directory helper is missing")
 	}
 	managedHelper := installer[managedStart:privateStart]
-	if !strings.Contains(managedHelper, `install -d -o root -g root -m 0755 "${path}"`) ||
+	if !strings.Contains(managedHelper, `install_journaled_directory "${path}" root root 0755`) ||
 		strings.Contains(managedHelper, "\n    return\n") {
 		t.Fatal("installer must normalize safe pre-existing managed directories to mode 0755")
 	}
