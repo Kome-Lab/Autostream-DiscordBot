@@ -628,6 +628,19 @@ func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
 		"restore_legacy_backup_state()",
 		"created_autostream_user=false",
 		"created_autostream_group=false",
+		"preexisting_autostream_group_record",
+		`readonly AUTOSTREAM_USER_ROLLBACK_LOGIN="autostream-install-rollback"`,
+		"prepare_autostream_user_rollback_login()",
+		"local_account_member_fields_are_clear()",
+		"local_account_database_matches_digests()",
+		"restore_created_autostream_user_login()",
+		"remove_created_autostream_user_preserving_group()",
+		`user_record_prefix="${BASH_REMATCH[1]}"`,
+		`user_record_suffix="${BASH_REMATCH[2]}"`,
+		`usermod --login "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" autostream`,
+		`userdel "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`,
+		`usermod --login autostream "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`,
+		`$(getent group autostream 2>/dev/null || true) == "${expected_group_record}"`,
 		"release_created=false",
 		"state_directory_mutation_started=false",
 		"backup_previous_kind",
@@ -660,6 +673,75 @@ func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
 	}
 	if strings.Contains(installer, `stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/`) {
 		t.Fatal("installer must not compare locale- and size-dependent stat file-type labels")
+	}
+	if strings.Contains(installer, "usermod --gid") ||
+		strings.Contains(installer, "usermod --home") {
+		t.Fatal("service-account rollback must not mutate the created user's GID or home")
+	}
+	if strings.Count(
+		installer,
+		`members[index] == service_login || members[index] == rollback_login`,
+	) < 2 ||
+		!strings.Contains(
+			installer,
+			`admins[index] == service_login || admins[index] == rollback_login`,
+		) {
+		t.Fatal("service-account transaction must reject both login names in local group and gshadow member fields")
+	}
+	restoreStart := strings.Index(installer, "restore_created_autostream_user_login() {")
+	restoreEnd := strings.Index(installer[restoreStart:], "\n}\n\nremove_created_autostream_user_preserving_group()")
+	if restoreStart < 0 || restoreEnd < 0 {
+		t.Fatal("could not locate service-account login restoration")
+	}
+	restore := installer[restoreStart : restoreStart+restoreEnd]
+	restoreRename := strings.Index(
+		restore,
+		`usermod --login autostream "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`,
+	)
+	restoreDigestCheck := strings.Index(
+		restore,
+		"local_account_database_matches_digests",
+	)
+	if restoreRename < 0 || restoreDigestCheck <= restoreRename {
+		t.Fatal("service-account restoration must rename the login back before checking group database digests")
+	}
+	removeStart := strings.Index(installer, "remove_created_autostream_user_preserving_group() {")
+	removeEnd := strings.Index(installer[removeStart:], "\n}\n\nrollback_created_autostream_account()")
+	if removeStart < 0 || removeEnd < 0 {
+		t.Fatal("could not locate invocation-created service-account removal")
+	}
+	remove := installer[removeStart : removeStart+removeEnd]
+	groupDigestSnapshot := strings.Index(remove, "sha256sum -- /etc/group")
+	gshadowDigestSnapshot := strings.Index(remove, "sha256sum -- /etc/gshadow")
+	memberFieldCheck := strings.Index(remove, "local_account_member_fields_are_clear || return 1")
+	renameLogin := strings.Index(
+		remove,
+		`usermod --login "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" autostream`,
+	)
+	if groupDigestSnapshot < 0 || gshadowDigestSnapshot < 0 ||
+		memberFieldCheck < 0 || renameLogin < 0 ||
+		groupDigestSnapshot > memberFieldCheck ||
+		gshadowDigestSnapshot > memberFieldCheck ||
+		memberFieldCheck > renameLogin {
+		t.Fatal("service-account removal must snapshot local group databases and reject member references before renaming")
+	}
+	if strings.Count(remove, "local_account_database_matches_digests") < 3 {
+		t.Fatal("service-account removal must verify local group database digests before rename, after rename, and after userdel")
+	}
+	postRenameDigestCheck := strings.Index(
+		remove[renameLogin:],
+		"local_account_database_matches_digests",
+	)
+	userDelete := strings.Index(
+		remove,
+		`userdel "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`,
+	)
+	postDeleteDigestCheck := strings.Index(
+		remove[userDelete:],
+		"local_account_database_matches_digests",
+	)
+	if postRenameDigestCheck < 0 || userDelete <= renameLogin || postDeleteDigestCheck < 0 {
+		t.Fatal("service-account removal must preserve group and gshadow contents across rename and deletion")
 	}
 	sharedLockIndex := strings.Index(installer, "flock -n 8")
 	firstJournaledAnchorIndex := strings.Index(installer, "ensure_root_anchor_directory /usr\n")
@@ -780,6 +862,13 @@ func TestDiscordBotInstallerClosesSignalJournalWindows(t *testing.T) {
 	if groupStart < 0 || groupEnd < 0 {
 		t.Fatal("could not locate autostream group provisioning")
 	}
+	rollbackLoginPreflight := strings.Index(
+		installer,
+		"\nprepare_autostream_user_rollback_login ||",
+	)
+	if rollbackLoginPreflight < 0 || rollbackLoginPreflight > groupStart {
+		t.Fatal("installer must reserve the rollback login before account mutation")
+	}
 	groupProvision := installer[groupStart : groupStart+groupEnd]
 	assertOrdered(
 		"group provisioning",
@@ -800,6 +889,7 @@ func TestDiscordBotInstallerClosesSignalJournalWindows(t *testing.T) {
 	assertOrdered(
 		"user provisioning",
 		userProvision,
+		"local_account_member_fields_are_clear",
 		"begin_installer_signal_transaction",
 		`useradd --system --gid "${autostream_group_gid}"`,
 		"created_autostream_user=true",
@@ -823,6 +913,9 @@ func TestDiscordBotInstallerClosesSignalJournalWindows(t *testing.T) {
 		"useradd signal-window probe did not exit with 143",
 		"groupadd signal-window rollback left the invocation-created service account",
 		"useradd signal-window rollback left the invocation-created service account",
+		"useradd signal-window rollback left the reserved rollback login",
+		"useradd signal-window rollback changed the pre-existing service group",
+		"useradd signal-window rollback changed the pre-existing /etc/gshadow",
 	} {
 		if !strings.Contains(integration, marker) {
 			t.Fatalf("integration fixture is missing signal-window marker %q", marker)

@@ -462,6 +462,9 @@ cleanup() {
     fi
   fi
   rm -rf -- "${WORK_DIR}"
+  if [[ ${fixture_paths_owned} == true ]]; then
+    userdel autostream-install-rollback >/dev/null 2>&1
+  fi
   if [[ ${fixture_paths_owned} == true && ${created_autostream_user} == true ]]; then
     userdel autostream >/dev/null 2>&1
     groupdel autostream >/dev/null 2>&1
@@ -648,6 +651,10 @@ preflight_enabled_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"
   die "runner already has an enabled ${UNIT}"
 if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
   die "runner already has an autostream account"
+fi
+if getent passwd autostream-install-rollback >/dev/null 2>&1 ||
+  getent group autostream-install-rollback >/dev/null 2>&1; then
+  die "runner already has the reserved service-account rollback login"
 fi
 [[ ! -e /unpack && ! -L /unpack ]] || die "runner is not clean at /unpack"
 if [[ ${AUTOSTREAM_DISCORD_BOT_INSTALLER_TEST_PREFLIGHT_PROBE:-} == "1" ]]; then
@@ -1122,6 +1129,10 @@ for path in \
 done
 
 "${WORK_DIR}/real-groupadd" --system autostream
+useradd_signal_group_record_before="$(getent group autostream)"
+[[ -n ${useradd_signal_group_record_before} ]] || \
+  die "useradd signal-window fixture could not capture its pre-existing service group"
+cp -- /etc/gshadow "${WORK_DIR}/useradd-signal-gshadow.before"
 set +e
 unshare --mount --propagation private bash -c \
   "mount --bind '${WORK_DIR}/signal-after-useradd' /usr/sbin/useradd && \
@@ -1136,8 +1147,16 @@ set -e
 if id autostream >/dev/null 2>&1; then
   die "useradd signal-window rollback left the invocation-created service account"
 fi
+if getent passwd autostream-install-rollback >/dev/null 2>&1 ||
+  getent group autostream-install-rollback >/dev/null 2>&1; then
+  die "useradd signal-window rollback left the reserved rollback login"
+fi
 getent group autostream >/dev/null || \
   die "useradd signal-window rollback removed the pre-existing service group"
+[[ $(getent group autostream) == "${useradd_signal_group_record_before}" ]] || \
+  die "useradd signal-window rollback changed the pre-existing service group"
+cmp -s -- /etc/gshadow "${WORK_DIR}/useradd-signal-gshadow.before" || \
+  die "useradd signal-window rollback changed the pre-existing /etc/gshadow"
 for path in \
   /opt/autostream \
   /var/lib/autostream \
