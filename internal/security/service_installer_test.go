@@ -1051,6 +1051,68 @@ func TestDiscordBotInstallerClosesSignalJournalWindows(t *testing.T) {
 	if cleanupIgnore < 0 || cleanupRollback <= cleanupIgnore {
 		t.Fatal("cleanup must ignore a second terminating signal before rollback begins")
 	}
+	enclosingIfConditions := func(marker string) []string {
+		t.Helper()
+		var conditions []string
+		pendingCondition := ""
+		for _, line := range strings.Split(cleanup, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.Contains(trimmed, marker) {
+				return append([]string(nil), conditions...)
+			}
+			if pendingCondition != "" {
+				pendingCondition += " " + trimmed
+				if strings.HasSuffix(trimmed, "then") {
+					conditions = append(conditions, pendingCondition)
+					pendingCondition = ""
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "elif ") {
+				if len(conditions) == 0 {
+					t.Fatalf("cleanup has an unmatched elif before %q", marker)
+				}
+				conditions = conditions[:len(conditions)-1]
+				pendingCondition = trimmed
+				if strings.HasSuffix(trimmed, "then") {
+					conditions = append(conditions, pendingCondition)
+					pendingCondition = ""
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "if ") {
+				pendingCondition = trimmed
+				if strings.HasSuffix(trimmed, "then") {
+					conditions = append(conditions, pendingCondition)
+					pendingCondition = ""
+				}
+				continue
+			}
+			if trimmed == "fi" {
+				if len(conditions) == 0 {
+					t.Fatalf("cleanup has an unmatched fi before %q", marker)
+				}
+				conditions = conditions[:len(conditions)-1]
+			}
+		}
+		t.Fatalf("cleanup operation is missing %q", marker)
+		return nil
+	}
+	directoryRollbackConditions := strings.Join(enclosingIfConditions("rollback_journaled_directories"), "\n")
+	if !strings.Contains(directoryRollbackConditions, "${status} -ne 0") ||
+		!strings.Contains(directoryRollbackConditions, "${installation_complete} != true") ||
+		strings.Contains(directoryRollbackConditions, "setup_rollback_safe") {
+		t.Fatal("cleanup must attempt inode-guarded journaled-directory restoration after every failed incomplete install")
+	}
+	assertSetupRollbackGate := func(operation string) {
+		t.Helper()
+		conditions := strings.Join(enclosingIfConditions(operation), "\n")
+		if !strings.Contains(conditions, "setup_rollback_safe") {
+			t.Fatalf("cleanup operation %q must retain its shared setup-safety gate", operation)
+		}
+	}
+	assertSetupRollbackGate("rollback_created_release")
+	assertSetupRollbackGate("rollback_created_autostream_account")
 
 	assertOrdered := func(name, scope string, markers ...string) {
 		t.Helper()
