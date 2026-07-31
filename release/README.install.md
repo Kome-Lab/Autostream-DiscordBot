@@ -7,44 +7,42 @@ This archive contains the Linux binary, systemd example, and placeholder environ
 - Linux amd64 or arm64 matching the archive name.
 - `jq`, `sha256sum`, `tar`, `flock`, and systemd. The installer creates the
   dedicated `autostream` service account when it is absent.
-- `gh` installed and authenticated to GitHub for release-attestation
-  verification.
+- An operator machine with `gh` authenticated to GitHub for release-attestation
+  verification. The server does not need `gh`, a GitHub token, or outbound
+  GitHub access.
 - Discord application credentials supplied outside Git.
 - Network access to the Control Panel and Discord.
 
-## Install a verified managed release
+## Verify and transfer one archive
 
-Download these four release assets to `/tmp`:
+On the operator machine, download and attest the exact amd64 archive:
 
-- `autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz` (or `arm64`)
-- the matching `.tar.gz.sha256`
-- `release-manifest.json`
-- `release-manifest.json.sha256`
+```bash
+mkdir -p ./autostream-discord-bot-vX.Y.Z
+gh release download vX.Y.Z --repo Kome-Lab/Autostream-DiscordBot --pattern 'autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz' --dir ./autostream-discord-bot-vX.Y.Z
+gh attestation verify ./autostream-discord-bot-vX.Y.Z/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-DiscordBot --signer-workflow Kome-Lab/Autostream-DiscordBot/.github/workflows/release-host.yml --deny-self-hosted-runners
+scp ./autostream-discord-bot-vX.Y.Z/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz user@server:/tmp/
+```
 
-For an amd64 host, copy them into a root-owned staging directory:
+Transfer only `autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz`. Do not
+transfer an archive checksum sidecar, `release-manifest.json`, or its sidecar.
+The automatic updater still uses those separately published compatibility
+assets, but this manual installer never reads them.
+
+## Install on the server
+
+Move the uploaded archive into a root-owned staging directory:
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/autostream/releases
 sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts
 sudo install -o root -g root -m 0644 /tmp/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz
-sudo install -o root -g root -m 0644 /tmp/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256 /opt/autostream/releases/artifacts/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256
-sudo install -o root -g root -m 0644 /tmp/release-manifest.json /opt/autostream/releases/artifacts/release-manifest.json
-sudo install -o root -g root -m 0644 /tmp/release-manifest.json.sha256 /opt/autostream/releases/artifacts/release-manifest.json.sha256
 cd /opt/autostream/releases/artifacts
 ```
 
-Still as the ordinary login user, verify both the exact archive that will be
-extracted as root and its manifest:
-
-```bash
-gh attestation verify autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-DiscordBot --signer-workflow Kome-Lab/Autostream-DiscordBot/.github/workflows/release-host.yml --deny-self-hosted-runners
-gh attestation verify release-manifest.json --repo Kome-Lab/Autostream-DiscordBot --signer-workflow Kome-Lab/Autostream-DiscordBot/.github/workflows/release-host.yml --deny-self-hosted-runners
-sha256sum --check --strict autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256
-sha256sum --check --strict release-manifest.json.sha256
-```
-
-Only after every command above succeeds, extract the root-owned archive without
-renaming its top-level directory and run the installer:
+Extract that root-owned archive without renaming its top-level directory. Keep
+the unchanged archive beside the extracted directory until installation
+finishes:
 
 ```bash
 sudo test ! -e autostream-discord-bot_vX.Y.Z_linux_amd64
@@ -56,10 +54,13 @@ sudo ./install-autostream-discord-bot
 
 For arm64, replace `amd64` with `arm64` in the archive and directory names.
 
-The installer verifies the copied release inputs, exact manifest tuple, archive
-layout, inner checksums, architecture, and binary version before changing the
-host. It seeds the verified rollback release, preserves an existing environment
-file byte for byte, installs the systemd unit, and exposes
+The installer fixes a stable root-owned copy of the adjacent archive, enforces
+the archive size limit, records its calculated SHA-256, and verifies archive
+layout, inner checksums, exact `artifact-manifest.json`, architecture, and the
+binary version, commit, and build date before persistent host mutation. Missing,
+stale, or corrupt external checksum and release-manifest files are ignored. It
+seeds the verified rollback release, preserves an existing environment file
+byte for byte, installs the systemd unit, and exposes
 `/usr/local/bin/autostream-discord-bot` plus the `discord-bot` alias. It does
 not install packages, write Node configuration, or start the service.
 Legacy public binaries are backed up only under the root-owned
@@ -113,8 +114,8 @@ the running binary and local service identity to the update helper. Its exact
 response fields are version, service_id, service_type, and config_revision.
 Block this exact path at any public reverse proxy.
 
-Do not fabricate `.artifact-sha256` or `.version` from an unverified local
-binary. Releases without `release-manifest.json` remain manual-only; publish a
-new release instead of modifying an existing release asset.
+Do not fabricate `.artifact-sha256`, `.version`, `artifact-manifest.json`, or
+`checksums.txt` from a local binary. Publish a new immutable release instead of
+modifying an existing release asset.
 
 Do not commit real `.env` files, provider credentials, tokens, logs, screenshots, or verification record.

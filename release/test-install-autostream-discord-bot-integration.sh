@@ -18,6 +18,7 @@ assert_not_enabled() {
 
 [[ ${EUID} -eq 0 ]] || die "must run as root"
 [[ $(uname -m) == "x86_64" ]] || die "this integration fixture requires an amd64 Linux runner"
+command -v mkfifo >/dev/null 2>&1 || die "mkfifo is required"
 
 if [[ ${AUTOSTREAM_DISCORD_BOT_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
   exec unshare --mount --propagation private bash -c '
@@ -169,6 +170,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 readonly INSTALLER_SOURCE="${SCRIPT_DIR}/install-autostream-discord-bot"
 readonly VERSION="v9.9.9"
+readonly ARTIFACT_COMMIT="0123456789abcdef0123456789abcdef01234567"
+readonly ARTIFACT_BUILD_DATE="2026-01-01T00:00:00Z"
 readonly ARTIFACT_ID="autostream-discord-bot_${VERSION}_linux_amd64"
 WORK_DIR="$(mktemp -d /var/tmp/autostream-discord-bot-installer-test.XXXXXXXX)"
 [[ ${WORK_DIR} == /var/tmp/autostream-discord-bot-installer-test.* &&
@@ -199,6 +202,7 @@ TARGET_LOCK_ID="$(printf '%s' "${UNIT}" | sha256sum | awk 'NR == 1 { print subst
 [[ ${TARGET_LOCK_ID} =~ ^[0-9a-f]{12}$ ]] || die "could not derive the updater target lock ID"
 readonly TARGET_LOCK_ID
 readonly TARGET_LOCK="/run/autostream-updater/.autostream-updater-${TARGET_LOCK_ID}.lock"
+readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"
 readonly LEGACY_UNIT_CONTENT="discord-bot-installer-integration-legacy-unit"
 readonly LEGACY_BINARY_CONTENT="discord-bot-installer-integration-legacy-binary"
 readonly LEGACY_ALIAS_CONTENT="discord-bot-installer-integration-legacy-alias"
@@ -439,7 +443,12 @@ cleanup() {
   fi
   if [[ ${fixture_paths_owned} == true ]]; then
     rm -f -- "${UNIT_PATH}"
-    rm -f -- "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}" "${ENV_PATH}" "${TARGET_LOCK}"
+    rm -f -- \
+      "${PUBLIC_BINARY}" \
+      "${PUBLIC_ALIAS}" \
+      "${ENV_PATH}" \
+      "${TARGET_LOCK}" \
+      "${SHARED_HOST_SETUP_LOCK}"
     rm -rf -- \
       "${CONFIG_DIR}" \
       "${STATE_DIR}" \
@@ -622,7 +631,8 @@ for path in \
   "${STATE_DIR}" \
   "${MANAGED_ROOT}" \
   "${INSTALL_BACKUP_ROOT}" \
-  "${TARGET_LOCK}"; do
+  "${TARGET_LOCK}" \
+  "${SHARED_HOST_SETUP_LOCK}"; do
   [[ ! -e ${path} && ! -L ${path} ]] || die "runner is not clean at ${path}"
 done
 preflight_load_state="$(systemctl show --property LoadState --value "${UNIT}" 2>/dev/null || true)"
@@ -791,8 +801,8 @@ cat > "${EXTRACTED_ROOT}/bin/autostream-discord-bot" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "--version" ]; then
   printf '%s\n' 'autostream-discord-bot v9.9.9'
-  printf '%s\n' 'commit: integration-test'
-  printf '%s\n' 'build_date: integration-test'
+  printf '%s\n' 'commit: 0123456789abcdef0123456789abcdef01234567'
+  printf '%s\n' 'build_date: 2026-01-01T00:00:00Z'
   exit 0
 fi
 exec /usr/bin/sleep infinity
@@ -820,58 +830,170 @@ EOF
 printf '%s\n' 'AUTOSTREAM_BIND_ADDR=127.0.0.1:18083' \
   > "${EXTRACTED_ROOT}/.env.example"
 
-(
-  cd -- "${EXTRACTED_ROOT}"
-  find . -type f ! -path './checksums.txt' -print0 |
-    sort -z |
-    xargs -0 sha256sum > checksums.txt
-)
-tar -C "${ARTIFACTS_DIR}" -czf "${ARCHIVE}" "${ARTIFACT_ID}"
-(
-  cd -- "${ARTIFACTS_DIR}"
-  sha256sum "${ARTIFACT_ID}.tar.gz" > "${ARTIFACT_ID}.tar.gz.sha256"
-)
-archive_sha256="$(sha256sum "${ARCHIVE}" | awk 'NR == 1 { print $1 }')"
-archive_size="$(stat -c %s "${ARCHIVE}")"
 jq -n \
-  --arg version "${VERSION}" \
-  --arg name "${ARTIFACT_ID}.tar.gz" \
-  --arg sha256 "${archive_sha256}" \
-  --argjson size "${archive_size}" \
+  --arg component "discord-bot" \
+  --arg source_version "${VERSION}" \
+  --arg commit "${ARTIFACT_COMMIT}" \
+  --arg build_date "${ARTIFACT_BUILD_DATE}" \
+  --arg archive_name "${ARTIFACT_ID}.tar.gz" \
+  --arg archive_root "${ARTIFACT_ID}" \
   '{
     schema_version: 1,
-    release_id: $version,
-    channel: "host",
-    published_at: "2026-01-01T00:00:00Z",
-    minimum_agent_version: "v1.0.0",
-    components: [{
-      service: "discord-bot",
-      source_version: $version,
-      commit: ("0" * 40),
+    component: $component,
+    source_version: $source_version,
+    commit: $commit,
+    build_date: $build_date,
+    platform: {
+      os: "linux",
+      arch: "amd64"
+    },
+    archive: {
+      name: $archive_name,
+      root: $archive_root
+    },
+    compatibility: {
+      minimum_agent_version: "v1.0.0",
+      minimum_panel_version: null,
       rollback_compatible: true,
-      database_schema: "none",
-      artifacts: [
-        {
-          os: "linux",
-          arch: "amd64",
-          name: $name,
-          sha256: $sha256,
-          size: $size
-        },
-        {
-          os: "linux",
-          arch: "arm64",
-          name: ("autostream-discord-bot_" + $version + "_linux_arm64.tar.gz"),
-          sha256: ("0" * 64),
-          size: 1
-        }
-      ]
-    }]
-  }' > "${ARTIFACTS_DIR}/release-manifest.json"
-(
-  cd -- "${ARTIFACTS_DIR}"
-  sha256sum release-manifest.json > release-manifest.json.sha256
-)
+      database_schema: "none"
+    }
+  }' > "${EXTRACTED_ROOT}/artifact-manifest.json"
+
+package_fixture_archive() {
+  (
+    cd -- "${EXTRACTED_ROOT}"
+    find . -type f ! -path './checksums.txt' -print0 |
+      sort -z |
+      xargs -0 sha256sum > checksums.txt
+  )
+  tar -C "${ARTIFACTS_DIR}" -czf "${ARCHIVE}" "${ARTIFACT_ID}"
+}
+
+package_fixture_archive
+[[ ! -e ${ARCHIVE}.sha256 && ! -L ${ARCHIVE}.sha256 ]] || \
+  die "archive-only fixture unexpectedly contains an archive checksum sidecar"
+[[ ! -e ${ARTIFACTS_DIR}/release-manifest.json &&
+  ! -L ${ARTIFACTS_DIR}/release-manifest.json ]] || \
+  die "archive-only fixture unexpectedly contains an external release manifest"
+[[ ! -e ${ARTIFACTS_DIR}/release-manifest.json.sha256 &&
+  ! -L ${ARTIFACTS_DIR}/release-manifest.json.sha256 ]] || \
+  die "archive-only fixture unexpectedly contains an external manifest checksum sidecar"
+
+readonly VALID_ARTIFACT_MANIFEST="${WORK_DIR}/artifact-manifest.valid.json"
+install -o root -g root -m 0600 \
+  "${EXTRACTED_ROOT}/artifact-manifest.json" \
+  "${VALID_ARTIFACT_MANIFEST}"
+
+assert_preflight_rejection_did_not_mutate_host() {
+  if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+    die "preflight rejection mutated the service account"
+  fi
+  for path in \
+    "${UNIT_PATH}" \
+    "${PUBLIC_BINARY}" \
+    "${PUBLIC_ALIAS}" \
+    "${ENV_PATH}" \
+    "${CONFIG_DIR}" \
+    "${STATE_DIR}" \
+    "${MANAGED_ROOT}" \
+    "${INSTALL_BACKUP_ROOT}" \
+    "${TARGET_LOCK}" \
+    "${SHARED_HOST_SETUP_LOCK}"; do
+    [[ ! -e ${path} && ! -L ${path} ]] || \
+      die "preflight rejection mutated ${path}"
+  done
+}
+
+rm -f -- "${EXTRACTED_ROOT}/artifact-manifest.json"
+package_fixture_archive
+set +e
+"${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+  > "${WORK_DIR}/missing-artifact-manifest.out" 2>&1
+missing_manifest_status=$?
+set -e
+[[ ${missing_manifest_status} -ne 0 ]] || \
+  die "installer accepted an archive without artifact-manifest.json"
+grep -F -- "required release file is missing or unsafe: artifact-manifest.json" \
+  "${WORK_DIR}/missing-artifact-manifest.out" >/dev/null || \
+  die "missing artifact-manifest.json did not fail with the expected message"
+assert_preflight_rejection_did_not_mutate_host
+
+install -o root -g root -m 0644 \
+  "${VALID_ARTIFACT_MANIFEST}" \
+  "${EXTRACTED_ROOT}/artifact-manifest.json"
+jq '.platform.arch = "arm64"' \
+  "${VALID_ARTIFACT_MANIFEST}" > "${EXTRACTED_ROOT}/artifact-manifest.json"
+package_fixture_archive
+set +e
+"${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+  > "${WORK_DIR}/wrong-artifact-arch.out" 2>&1
+wrong_arch_status=$?
+set -e
+[[ ${wrong_arch_status} -ne 0 ]] || \
+  die "installer accepted artifact-manifest.json for the wrong architecture"
+grep -F -- "artifact-manifest.json does not describe this exact artifact" \
+  "${WORK_DIR}/wrong-artifact-arch.out" >/dev/null || \
+  die "wrong artifact architecture did not fail with the expected message"
+assert_preflight_rejection_did_not_mutate_host
+
+jq '.commit = ("f" * 40)' \
+  "${VALID_ARTIFACT_MANIFEST}" > "${EXTRACTED_ROOT}/artifact-manifest.json"
+package_fixture_archive
+set +e
+"${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+  > "${WORK_DIR}/wrong-artifact-commit.out" 2>&1
+wrong_commit_status=$?
+set -e
+[[ ${wrong_commit_status} -ne 0 ]] || \
+  die "installer accepted a binary commit that differs from artifact-manifest.json"
+grep -F -- "Discord Bot binary commit does not match artifact-manifest.json" \
+  "${WORK_DIR}/wrong-artifact-commit.out" >/dev/null || \
+  die "binary commit mismatch did not fail with the expected message"
+assert_preflight_rejection_did_not_mutate_host
+
+jq '.build_date = "2026-01-02T00:00:00Z"' \
+  "${VALID_ARTIFACT_MANIFEST}" > "${EXTRACTED_ROOT}/artifact-manifest.json"
+package_fixture_archive
+set +e
+"${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+  > "${WORK_DIR}/wrong-artifact-build-date.out" 2>&1
+wrong_build_date_status=$?
+set -e
+[[ ${wrong_build_date_status} -ne 0 ]] || \
+  die "installer accepted a binary build date that differs from artifact-manifest.json"
+grep -F -- "Discord Bot binary build date does not match artifact-manifest.json" \
+  "${WORK_DIR}/wrong-artifact-build-date.out" >/dev/null || \
+  die "binary build date mismatch did not fail with the expected message"
+assert_preflight_rejection_did_not_mutate_host
+
+install -o root -g root -m 0644 \
+  "${VALID_ARTIFACT_MANIFEST}" \
+  "${EXTRACTED_ROOT}/artifact-manifest.json"
+package_fixture_archive
+
+printf '%s\n' 'canonical archive alias probe' \
+  > "${ARTIFACTS_DIR}/discord-bot-canonical-alias-file"
+tar -C "${ARTIFACTS_DIR}" -czf "${ARCHIVE}" \
+  "${ARTIFACT_ID}" \
+  --transform="s#^discord-bot-canonical-alias-file\$#${ARTIFACT_ID}#" \
+  discord-bot-canonical-alias-file
+rm -f -- "${ARTIFACTS_DIR}/discord-bot-canonical-alias-file"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+  > "${WORK_DIR}/duplicate-archive-entry.out" 2>&1
+duplicate_archive_status=$?
+set -e
+[[ ${duplicate_archive_status} -ne 0 ]] || \
+  die "installer accepted an archive with a duplicate canonical path"
+grep -F -- "release archive contains duplicate paths" \
+  "${WORK_DIR}/duplicate-archive-entry.out" >/dev/null || \
+  die "duplicate archive path did not fail at the archive layout boundary"
+assert_preflight_rejection_did_not_mutate_host
+package_fixture_archive
+
+archive_sha256="$(sha256sum "${ARCHIVE}" | awk 'NR == 1 { print $1 }')"
+[[ ${archive_sha256} =~ ^[0-9a-f]{64}$ ]] || \
+  die "fixture archive digest is invalid"
 
 printf '%s\n' \
   '#!/bin/sh' \
@@ -892,6 +1014,186 @@ if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; the
   die "mktemp failure mutated the service account"
 fi
 
+unsafe_backup_dir="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:0:12}"
+unsafe_backup_fifo="${WORK_DIR}/unsafe-backup-fifo"
+printf '%s\n' "${LEGACY_BINARY_CONTENT}" > "${PUBLIC_BINARY}"
+chmod 0755 "${PUBLIC_BINARY}"
+install -d -o root -g root -m 0700 "${unsafe_backup_dir}"
+mkfifo -m 0600 "${unsafe_backup_fifo}"
+ln -s -- "${unsafe_backup_fifo}" \
+  "${unsafe_backup_dir}/autostream-discord-bot"
+install -o root -g root -m 0755 /usr/bin/sha256sum \
+  "${WORK_DIR}/real-sha256sum"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'for argument in "$@"; do' \
+  "  if [ \"\${argument}\" = '${unsafe_backup_dir}/autostream-discord-bot' ]; then" \
+  "    : > '${WORK_DIR}/unsafe-backup-was-read'" \
+  '    exit 99' \
+  '  fi' \
+  'done' \
+  "exec '${WORK_DIR}/real-sha256sum' \"\$@\"" \
+  > "${WORK_DIR}/reject-unsafe-backup-read"
+chmod 0755 "${WORK_DIR}/reject-unsafe-backup-read"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${WORK_DIR}/reject-unsafe-backup-read' /usr/bin/sha256sum && '${EXTRACTED_ROOT}/install-autostream-discord-bot'" \
+  > "${WORK_DIR}/unsafe-backup-type.out" 2>&1
+unsafe_backup_status=$?
+set -e
+[[ ${unsafe_backup_status} -ne 0 ]] || \
+  die "unsafe legacy backup symlink unexpectedly passed preflight"
+grep -F -- "legacy backup destination conflicts with ${PUBLIC_BINARY}" \
+  "${WORK_DIR}/unsafe-backup-type.out" >/dev/null || \
+  die "unsafe legacy backup did not fail at its type boundary"
+[[ ! -e ${WORK_DIR}/unsafe-backup-was-read ]] || \
+  die "unsafe legacy backup was read before type validation"
+rm -f -- \
+  "${unsafe_backup_dir}/autostream-discord-bot" \
+  "${unsafe_backup_fifo}" \
+  "${PUBLIC_BINARY}"
+rm -rf -- /var/backups/autostream
+
+install -o root -g root -m 0755 /usr/sbin/groupadd \
+  "${WORK_DIR}/real-groupadd"
+install -o root -g root -m 0755 /usr/sbin/useradd \
+  "${WORK_DIR}/real-useradd"
+printf '%s\n' \
+  '#!/bin/sh' \
+  "'${WORK_DIR}/real-groupadd' \"\$@\"" \
+  'status=$?' \
+  'if [ "${status}" -eq 0 ]; then' \
+  "  : > '${WORK_DIR}/groupadd-signal-window-reached'" \
+  '  kill -TERM "$PPID"' \
+  'fi' \
+  'exit "${status}"' \
+  > "${WORK_DIR}/signal-after-groupadd"
+printf '%s\n' \
+  '#!/bin/sh' \
+  "'${WORK_DIR}/real-useradd' \"\$@\"" \
+  'status=$?' \
+  'if [ "${status}" -eq 0 ]; then' \
+  "  : > '${WORK_DIR}/useradd-signal-window-reached'" \
+  '  kill -TERM "$PPID"' \
+  'fi' \
+  'exit "${status}"' \
+  > "${WORK_DIR}/signal-after-useradd"
+chmod 0755 \
+  "${WORK_DIR}/signal-after-groupadd" \
+  "${WORK_DIR}/signal-after-useradd"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${WORK_DIR}/signal-after-groupadd' /usr/sbin/groupadd && \
+   '${EXTRACTED_ROOT}/install-autostream-discord-bot'" \
+  > "${WORK_DIR}/groupadd-signal-window.out" 2>&1
+groupadd_signal_window_status=$?
+set -e
+[[ ${groupadd_signal_window_status} -eq 143 ]] || \
+  die "groupadd signal-window probe did not exit with 143"
+[[ -f ${WORK_DIR}/groupadd-signal-window-reached ]] || \
+  die "groupadd signal-window probe did not run"
+[[ ! -e ${WORK_DIR}/useradd-signal-window-reached ]] || \
+  die "groupadd signal-window probe unexpectedly reached useradd"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "groupadd signal-window rollback left the invocation-created service account"
+fi
+for path in \
+  /opt/autostream \
+  /var/lib/autostream \
+  /var/backups/autostream \
+  /etc/autostream \
+  "${MANAGED_ROOT}" \
+  "${STATE_DIR}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  "${PUBLIC_BINARY}" \
+  "${PUBLIC_ALIAS}" \
+  "${ENV_PATH}" \
+  "${UNIT_PATH}"; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "groupadd signal-window rollback left persistent mutation ${path}"
+done
+
+"${WORK_DIR}/real-groupadd" --system autostream
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${WORK_DIR}/signal-after-useradd' /usr/sbin/useradd && \
+   '${EXTRACTED_ROOT}/install-autostream-discord-bot'" \
+  > "${WORK_DIR}/useradd-signal-window.out" 2>&1
+useradd_signal_window_status=$?
+set -e
+[[ ${useradd_signal_window_status} -eq 143 ]] || \
+  die "useradd signal-window probe did not exit with 143"
+[[ -f ${WORK_DIR}/useradd-signal-window-reached ]] || \
+  die "useradd signal-window probe did not run"
+if id autostream >/dev/null 2>&1; then
+  die "useradd signal-window rollback left the invocation-created service account"
+fi
+getent group autostream >/dev/null || \
+  die "useradd signal-window rollback removed the pre-existing service group"
+for path in \
+  /opt/autostream \
+  /var/lib/autostream \
+  /var/backups/autostream \
+  /etc/autostream \
+  "${MANAGED_ROOT}" \
+  "${STATE_DIR}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  "${PUBLIC_BINARY}" \
+  "${PUBLIC_ALIAS}" \
+  "${ENV_PATH}" \
+  "${UNIT_PATH}"; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "useradd signal-window rollback left persistent mutation ${path}"
+done
+groupdel autostream
+
+install -o root -g root -m 0755 /usr/bin/systemctl "${WORK_DIR}/real-systemctl"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'if [ "${1:-}" = "daemon-reload" ] && [ ! -e "'"${WORK_DIR}"'/fresh-late-failure-reached" ]; then' \
+  "  : > '${WORK_DIR}/fresh-late-failure-reached'" \
+  '  exit 74' \
+  'fi' \
+  "exec '${WORK_DIR}/real-systemctl' \"\$@\"" \
+  > "${WORK_DIR}/fail-first-daemon-reload"
+chmod 0755 "${WORK_DIR}/fail-first-daemon-reload"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${WORK_DIR}/fail-first-daemon-reload' /usr/bin/systemctl && '${EXTRACTED_ROOT}/install-autostream-discord-bot'" \
+  > "${WORK_DIR}/fresh-late-failure.out" 2>&1
+fresh_late_failure_status=$?
+set -e
+[[ ${fresh_late_failure_status} -eq 74 ]] || \
+  die "fresh late-failure rollback probe returned an unexpected status"
+[[ -f ${WORK_DIR}/fresh-late-failure-reached ]] || \
+  die "fresh late-failure rollback probe did not reach daemon-reload"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "fresh late-failure rollback left the invocation-created service account"
+fi
+for path in \
+  /opt/autostream \
+  /var/lib/autostream \
+  /var/backups/autostream \
+  /etc/autostream \
+  "${MANAGED_ROOT}" \
+  "${STATE_DIR}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  "${PUBLIC_BINARY}" \
+  "${PUBLIC_ALIAS}" \
+  "${ENV_PATH}" \
+  "${UNIT_PATH}"; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "fresh late-failure rollback left persistent mutation ${path}"
+done
+[[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" ]] || \
+  die "fresh late-failure rollback did not retain the safe permanent updater lock"
+[[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" ]] || \
+  die "fresh late-failure rollback did not retain the safe shared host-setup lock"
+[[ $(stat -c '%U:%G:%a' -- /run/autostream-updater) == "root:root:700" ]] || \
+  die "permanent updater lock directory is not root-only after rollback"
+
 created_autostream_user=true
 "${EXTRACTED_ROOT}/install-autostream-discord-bot" > "${WORK_DIR}/fresh.out"
 [[ -L ${MANAGED_ROOT}/current ]] || die "fresh install did not activate current"
@@ -910,6 +1212,57 @@ grep -F -- "sudo systemctl enable --now ${UNIT}" "${WORK_DIR}/fresh.out" >/dev/n
 rm -f -- "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}" "${ENV_PATH}" "${UNIT_PATH}"
 rm -rf -- "${STATE_DIR}" "${MANAGED_ROOT}" "${INSTALL_BACKUP_ROOT}"
 systemctl daemon-reload
+
+install -d -o autostream -g autostream -m 0700 "${STATE_DIR}"
+printf '%s\n' 'discord-bot-state-preflight-sentinel' > "${STATE_DIR}/sentinel.txt"
+chown autostream:autostream "${STATE_DIR}/sentinel.txt"
+chmod 0600 "${STATE_DIR}/sentinel.txt"
+install -d -o root -g root -m 0700 "${ENV_PATH}"
+state_preflight_identity_before="$(stat -c '%d:%i' -- "${STATE_DIR}")"
+state_preflight_metadata_before="$(stat -c '%U:%G:%a' -- "${STATE_DIR}")"
+state_preflight_sentinel_metadata_before="$(
+  stat -c '%d:%i:%U:%G:%a' -- "${STATE_DIR}/sentinel.txt"
+)"
+state_preflight_sentinel_sha_before="$(
+  sha256sum "${STATE_DIR}/sentinel.txt" | awk 'NR == 1 { print $1 }'
+)"
+state_preflight_account_before="$(id -u autostream):$(id -g autostream)"
+[[ ! -e ${MANAGED_ROOT} && ! -L ${MANAGED_ROOT} ]] || \
+  die "state preflight fixture unexpectedly has a managed root"
+[[ ! -e ${INSTALL_BACKUP_ROOT} && ! -L ${INSTALL_BACKUP_ROOT} ]] || \
+  die "state preflight fixture unexpectedly has an install backup root"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+  > "${WORK_DIR}/state-preflight-failure.out" 2>&1
+state_preflight_status=$?
+set -e
+[[ ${state_preflight_status} -ne 0 ]] || \
+  die "installer accepted an unsafe existing environment path"
+grep -F -- "existing environment file is not a regular file" \
+  "${WORK_DIR}/state-preflight-failure.out" >/dev/null || \
+  die "state preservation fixture did not reach the later environment preflight"
+[[ $(stat -c '%d:%i' -- "${STATE_DIR}") == "${state_preflight_identity_before}" ]] || \
+  die "later preflight failure replaced the existing state directory"
+[[ $(stat -c '%U:%G:%a' -- "${STATE_DIR}") == "${state_preflight_metadata_before}" ]] || \
+  die "later preflight failure changed existing state ownership or mode"
+[[ "$(stat -c '%d:%i:%U:%G:%a' -- "${STATE_DIR}/sentinel.txt")" == \
+  "${state_preflight_sentinel_metadata_before}" ]] || \
+  die "later preflight failure changed the state sentinel metadata"
+[[ "$(sha256sum "${STATE_DIR}/sentinel.txt" | awk 'NR == 1 { print $1 }')" == \
+  "${state_preflight_sentinel_sha_before}" ]] || \
+  die "later preflight failure changed the state sentinel content"
+[[ "$(id -u autostream):$(id -g autostream)" == "${state_preflight_account_before}" ]] || \
+  die "later preflight failure changed the preexisting service account"
+for path in \
+  "${MANAGED_ROOT}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  "${PUBLIC_BINARY}" \
+  "${PUBLIC_ALIAS}" \
+  "${UNIT_PATH}"; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "later preflight failure created persistent boundary ${path}"
+done
+rm -rf -- "${ENV_PATH}" "${STATE_DIR}"
 
 install -d -o autostream -g autostream -m 0750 "${STATE_DIR}"
 install -d -o root -g root -m 0750 /etc/autostream
@@ -954,6 +1307,102 @@ legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"
 env_before="$(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }')"
 config_before="$(sha256sum "${CONFIG_PATH}" | awk 'NR == 1 { print $1 }')"
 unit_before="${legacy_unit_sha256}"
+install -d -o root -g root -m 0700 /opt/autostream
+shared_managed_parent_before="$(stat -c '%d:%i:%u:%g:%a' -- /opt/autostream)"
+legacy_public_binary_metadata_before="$(
+  stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_BINARY}"
+)"
+legacy_public_binary_sha_before="$(
+  sha256sum "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }'
+)"
+legacy_public_alias_metadata_before="$(
+  stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_ALIAS}"
+)"
+legacy_public_alias_sha_before="$(
+  sha256sum "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }'
+)"
+
+preexisting_backup_dir="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:0:12}"
+install -d -o root -g root -m 0700 "${preexisting_backup_dir}"
+install -o root -g root -m 0500 "${PUBLIC_BINARY}" \
+  "${preexisting_backup_dir}/autostream-discord-bot"
+install -o root -g root -m 0500 "${PUBLIC_ALIAS}" \
+  "${preexisting_backup_dir}/discord-bot"
+[[ $(stat -c '%u:%g:%a' -- "${preexisting_backup_dir}") == "0:0:700" ]] || \
+  die "pre-existing backup directory fixture is not root-only"
+[[ $(stat -c '%u:%g:%a' -- \
+  "${preexisting_backup_dir}/autostream-discord-bot") == "0:0:500" ]] || \
+  die "pre-existing canonical backup fixture is not root-only"
+[[ $(stat -c '%u:%g:%a' -- \
+  "${preexisting_backup_dir}/discord-bot") == "0:0:500" ]] || \
+  die "pre-existing alias backup fixture is not root-only"
+preexisting_backup_dir_metadata_before="$(
+  stat -c '%d:%i:%u:%g:%a' -- "${preexisting_backup_dir}"
+)"
+preexisting_backup_binary_metadata_before="$(
+  stat -c '%d:%i:%u:%g:%a' -- \
+    "${preexisting_backup_dir}/autostream-discord-bot"
+)"
+preexisting_backup_binary_sha_before="$(
+  sha256sum "${preexisting_backup_dir}/autostream-discord-bot" |
+    awk 'NR == 1 { print $1 }'
+)"
+preexisting_backup_alias_metadata_before="$(
+  stat -c '%d:%i:%u:%g:%a' -- "${preexisting_backup_dir}/discord-bot"
+)"
+preexisting_backup_alias_sha_before="$(
+  sha256sum "${preexisting_backup_dir}/discord-bot" |
+    awk 'NR == 1 { print $1 }'
+)"
+
+assert_preexisting_backups_unchanged() {
+  [[ "$(stat -c '%d:%i:%u:%g:%a' -- "${preexisting_backup_dir}")" == \
+    "${preexisting_backup_dir_metadata_before}" ]] || \
+    die "pre-existing backup directory metadata changed"
+  [[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${preexisting_backup_dir}/autostream-discord-bot")" == \
+    "${preexisting_backup_binary_metadata_before}" ]] || \
+    die "pre-existing canonical backup inode or metadata changed"
+  [[ "$(sha256sum "${preexisting_backup_dir}/autostream-discord-bot" |
+    awk 'NR == 1 { print $1 }')" == \
+    "${preexisting_backup_binary_sha_before}" ]] || \
+    die "pre-existing canonical backup content changed"
+  [[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${preexisting_backup_dir}/discord-bot")" == \
+    "${preexisting_backup_alias_metadata_before}" ]] || \
+    die "pre-existing alias backup inode or metadata changed"
+  [[ "$(sha256sum "${preexisting_backup_dir}/discord-bot" |
+    awk 'NR == 1 { print $1 }')" == \
+    "${preexisting_backup_alias_sha_before}" ]] || \
+    die "pre-existing alias backup content changed"
+}
+
+assert_legacy_public_paths_unchanged() {
+  [[ "$(stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_BINARY}")" == \
+    "${legacy_public_binary_metadata_before}" ]] || \
+    die "failed migration changed the legacy canonical binary inode or metadata"
+  [[ "$(sha256sum "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }')" == \
+    "${legacy_public_binary_sha_before}" ]] || \
+    die "failed migration changed the legacy canonical binary content"
+  [[ "$(stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_ALIAS}")" == \
+    "${legacy_public_alias_metadata_before}" ]] || \
+    die "failed migration changed the legacy alias inode or metadata"
+  [[ "$(sha256sum "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }')" == \
+    "${legacy_public_alias_sha_before}" ]] || \
+    die "failed migration changed the legacy alias content"
+  [[ "${legacy_public_binary_sha_before}" == \
+    "${preexisting_backup_binary_sha_before}" ]] || \
+    die "pre-existing canonical backup was not bound to the live legacy binary"
+  [[ "${legacy_public_alias_sha_before}" == \
+    "${preexisting_backup_alias_sha_before}" ]] || \
+    die "pre-existing alias backup was not bound to the live legacy binary"
+}
+
+assert_shared_managed_parent_unchanged() {
+  [[ "$(stat -c '%d:%i:%u:%g:%a' -- /opt/autostream)" == \
+    "${shared_managed_parent_before}" ]] || \
+    die "failed migration did not restore the shared managed parent exactly"
+}
 
 install -o root -g root -m 0755 /usr/bin/sync "${WORK_DIR}/real-sync"
 printf '%s\n' \
@@ -987,6 +1436,9 @@ grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
   die "public-link sync failure changed config.yml"
 [[ $(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }') == "${unit_before}" ]] || \
   die "public-link sync failure did not restore the systemd unit"
+assert_legacy_public_paths_unchanged
+assert_preexisting_backups_unchanged
+assert_shared_managed_parent_unchanged
 assert_loaded_legacy_runtime_unit
 assert_not_enabled
 
@@ -1013,6 +1465,9 @@ grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
   die "failed migration changed config.yml"
 [[ $(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }') == "${unit_before}" ]] || \
   die "failed migration did not restore the systemd unit"
+assert_legacy_public_paths_unchanged
+assert_preexisting_backups_unchanged
+assert_shared_managed_parent_unchanged
 assert_loaded_legacy_runtime_unit
 assert_not_enabled
 
@@ -1032,14 +1487,12 @@ recovery_path="$(
   die "recovery evidence does not retain the previous unit and baseline metadata"
 rm -rf -- "${recovery_path}"
 
-retry_backup_dir="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:0:12}"
-install -d -o root -g root -m 0700 "${retry_backup_dir}"
-install -o root -g root -m 0500 "${PUBLIC_BINARY}" \
-  "${retry_backup_dir}/autostream-discord-bot"
-install -o root -g root -m 0500 "${PUBLIC_ALIAS}" \
-  "${retry_backup_dir}/discord-bot"
+retry_backup_dir="${preexisting_backup_dir}"
+assert_preexisting_backups_unchanged
 
 "${EXTRACTED_ROOT}/install-autostream-discord-bot" > "${WORK_DIR}/migration.out"
+[[ $(stat -c '%U:%G:%a' -- /opt/autostream) == "root:root:755" ]] || \
+  die "successful migration did not normalize the shared managed parent"
 runtime_race_fragment_before="$(systemctl show --property FragmentPath --value "${UNIT}")"
 runtime_race_exec_start_before="$(systemctl show --property ExecStart --value "${UNIT}")"
 runtime_race_user_before="$(systemctl show --property User --value "${UNIT}")"
@@ -1110,6 +1563,14 @@ grep -F -- "sudo systemctl restart ${UNIT}" "${WORK_DIR}/migration.out" >/dev/nu
 kill -0 "${old_pid}" || die "successful migration stopped the legacy process"
 assert_not_enabled
 
+printf '%s\n' 'intentionally corrupt archive sidecar' > "${ARCHIVE}.sha256"
+printf '%s\n' '{"intentionally":"stale"}' > "${ARTIFACTS_DIR}/release-manifest.json"
+printf '%s\n' 'intentionally corrupt manifest sidecar' \
+  > "${ARTIFACTS_DIR}/release-manifest.json.sha256"
+chmod 0644 \
+  "${ARCHIVE}.sha256" \
+  "${ARTIFACTS_DIR}/release-manifest.json" \
+  "${ARTIFACTS_DIR}/release-manifest.json.sha256"
 "${EXTRACTED_ROOT}/install-autostream-discord-bot" > "${WORK_DIR}/idempotent.out"
 assert_loaded_managed_runtime_unit
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
@@ -1134,6 +1595,23 @@ grep -F -- "managed current link must be owned by root:root" \
 chown -h root:root "${MANAGED_ROOT}/current"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "malformed current validation changed the running legacy process"
+
+(
+  exec 7<>"${SHARED_HOST_SETUP_LOCK}"
+  flock -n 7 || die "test could not acquire the shared host-setup lock"
+  set +e
+  "${EXTRACTED_ROOT}/install-autostream-discord-bot" \
+    > "${WORK_DIR}/shared-contention.out" 2>&1
+  shared_contention_status=$?
+  set -e
+  [[ ${shared_contention_status} -ne 0 ]] || \
+    die "installer ignored shared host-setup lock contention"
+)
+grep -F -- "another AutoStream installer is provisioning shared host state" \
+  "${WORK_DIR}/shared-contention.out" >/dev/null || \
+  die "shared host-setup lock contention did not fail with the expected message"
+[[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
+  die "shared host-setup lock contention changed the running legacy process"
 
 (
   exec 8>"${TARGET_LOCK}"

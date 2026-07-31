@@ -26,20 +26,62 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 		`readonly UNIT_DEST="/etc/systemd/system/autostream-discord-bot.service"`,
 		`readonly BACKUP_ROOT="${BACKUP_BASE}/install-migrations"`,
 		`readonly BACKUP_DIR="${BACKUP_ROOT}/discord-bot"`,
+		`readonly MAX_ARCHIVE_SIZE=268435456`,
 		"sha256sum --check --strict",
-		"release-manifest.json",
+		"artifact-manifest.json",
+		`["archive", "build_date", "commit", "compatibility", "component", "platform", "schema_version", "source_version"]`,
+		`["database_schema", "minimum_agent_version", "minimum_panel_version", "rollback_compatible"]`,
 		".artifact-sha256",
 		".version",
 		`flock -n 9`,
 		"root anchor directory has unsafe write or special mode bits",
 		`[[ ${version_first_line} == "autostream-discord-bot ${VERSION}" ]]`,
+		`[[ ${commit_line} == "commit: ${MANIFEST_COMMIT}" ]]`,
+		`[[ ${build_date_line} == "build_date: ${MANIFEST_BUILD_DATE}" ]]`,
+		`${entry} != *"//"*`,
+		`awk '{ sub(/\/$/, ""); print }' "${INPUT_STAGE}/archive.list"`,
+		`uniq -d`,
+		`release archive contains duplicate paths`,
+		`[[ ${checked_path} == ./* ]]`,
+		`${normalized_checked_path} != *"//"*`,
 		`[[ ${managed_version_first_line} == "autostream-discord-bot ${VERSION}" ]]`,
+		`[[ ${mode} == "700" || ${mode} == "750" ]]`,
+		`if [[ ${state_dir_preexisting} == true ]]; then`,
+		`die "existing state directory changed after preflight"`,
+		`state_directory_created_identity`,
 		"root-only recovery evidence preserved at",
 		"systemctl daemon-reload",
 	} {
 		if !strings.Contains(installer, marker) {
 			t.Fatalf("service installer is missing %q", marker)
 		}
+	}
+	for _, forbidden := range []string{
+		"ARCHIVE_CHECKSUM_SOURCE",
+		"MANIFEST_SOURCE",
+		"MANIFEST_CHECKSUM_SOURCE",
+	} {
+		if strings.Contains(installer, forbidden) {
+			t.Fatalf("manual installer still depends on external release metadata marker %q", forbidden)
+		}
+	}
+	hostPreflight := strings.Index(installer, "\npreflight_existing_host_paths\n")
+	accountCreation := strings.Index(installer, "\nif ! getent group autostream")
+	managedRootCreation := strings.Index(installer, "\nensure_managed_directory /opt/autostream")
+	if hostPreflight < 0 || accountCreation < 0 || managedRootCreation < 0 ||
+		hostPreflight > accountCreation || hostPreflight > managedRootCreation {
+		t.Fatal("existing host paths must be preflighted before account or managed-root creation")
+	}
+	stateEnsureStart := strings.Index(installer, "ensure_state_directory() {")
+	stateEnsureEnd := strings.Index(installer, "\n}\n\npreflight_existing_host_paths() {")
+	if stateEnsureStart < 0 || stateEnsureEnd < stateEnsureStart {
+		t.Fatal("could not locate the state-directory preservation function")
+	}
+	stateEnsure := installer[stateEnsureStart:stateEnsureEnd]
+	stateReturn := strings.Index(stateEnsure, "\n    return\n")
+	freshStateCreation := strings.Index(stateEnsure, "state_directory_created_identity")
+	if stateReturn < 0 || freshStateCreation < 0 || stateReturn > freshStateCreation {
+		t.Fatal("a preexisting state directory must return without normalization before fresh-state creation")
 	}
 
 	workflowBytes, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release-host.yml"))
@@ -52,6 +94,10 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 		`run: sudo bash release/test-install-autostream-discord-bot-integration.sh`,
 		`cp release/install-autostream-discord-bot "${root}/install-autostream-discord-bot"`,
 		`chmod 0755 "${root}/install-autostream-discord-bot"`,
+		`sed -i "s/vX\\.Y\\.Z/${version}/g" "${root}/README.install.md"`,
+		`}' > "${root}/artifact-manifest.json"`,
+		`tar -xOf "${path}" "${archive_root}/artifact-manifest.json" > "${embedded_manifest}"`,
+		`grep -Fx -- "${embedded_manifest_sha}  ./artifact-manifest.json"`,
 		`artifacts/autostream-discord-bot_${{ needs.release-host.outputs.version }}_linux_amd64.tar.gz`,
 		`artifacts/autostream-discord-bot_${{ needs.release-host.outputs.version }}_linux_arm64.tar.gz`,
 	} {
@@ -81,6 +127,23 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 		"root-only recovery evidence preserved at",
 		"systemctl show --property MainPID",
 		"config.yml",
+		"archive-only fixture unexpectedly contains an archive checksum sidecar",
+		"installer accepted an archive without artifact-manifest.json",
+		"Discord Bot binary commit does not match artifact-manifest.json",
+		"Discord Bot binary build date does not match artifact-manifest.json",
+		"installer accepted an archive with a duplicate canonical path",
+		"release archive contains duplicate paths",
+		"intentionally corrupt archive sidecar",
+		"state_preflight_identity_before",
+		"later preflight failure changed existing state ownership or mode",
+		"later preflight failure changed the state sentinel content",
+		"later preflight failure created persistent boundary",
+		"unsafe legacy backup was read before type validation",
+		"fresh late-failure rollback left persistent mutation",
+		"assert_preexisting_backups_unchanged",
+		"pre-existing canonical backup was not bound to the live legacy binary",
+		"assert_shared_managed_parent_unchanged",
+		"successful migration did not normalize the shared managed parent",
 		"idempotent reinstall",
 		"managed current link must be owned by root:root",
 		"another privileged update is already active",
@@ -159,7 +222,8 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 		`if [[ ${runtime_unit_owned} == true &&`,
 		`if [[ ${fixture_service_start_attempted} == true &&`,
 		`"${INSTALL_BACKUP_ROOT}" \`,
-		`"${TARGET_LOCK}"; do`,
+		`readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"`,
+		`"${SHARED_HOST_SETUP_LOCK}"; do`,
 		"create_runtime_unit_no_clobber()",
 		`mktemp "/run/systemd/system/.${UNIT}.legacy.XXXXXXXX"`,
 		`ln -- "${runtime_unit_stage}" "${RUNTIME_UNIT_PATH}"`,
@@ -224,6 +288,11 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 		"preflight conflict changed the runtime sentinel FragmentPath",
 		"preflight conflict changed the runtime sentinel ExecStart",
 		"preflight conflict changed the runtime sentinel User",
+		"fresh late-failure rollback did not retain the safe shared host-setup lock",
+		"test could not acquire the shared host-setup lock",
+		"installer ignored shared host-setup lock contention",
+		"another AutoStream installer is provisioning shared host state",
+		"shared host-setup lock contention changed the running legacy process",
 	} {
 		if !strings.Contains(integration, marker) {
 			t.Fatalf("installer integration fixture is missing scenario marker %q", marker)
@@ -372,7 +441,9 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 	serviceFlagIndex := strings.Index(integration, "fixture_service_start_attempted=false")
 	preflightTargetIndex := strings.Index(
 		integration,
-		`"${INSTALL_BACKUP_ROOT}" \`+"\n"+`  "${TARGET_LOCK}"; do`,
+		`"${INSTALL_BACKUP_ROOT}" \`+"\n"+
+			`  "${TARGET_LOCK}" \`+"\n"+
+			`  "${SHARED_HOST_SETUP_LOCK}"; do`,
 	)
 	pathsOwnedIndex := strings.Index(integration, "fixture_paths_owned=true")
 	if cleanupFlagIndex < 0 || runtimeFlagIndex < cleanupFlagIndex ||
@@ -502,13 +573,255 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 	guide := string(guideBytes)
 	for _, marker := range []string{
 		"sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts",
-		"gh attestation verify autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz",
+		"gh release download vX.Y.Z --repo Kome-Lab/Autostream-DiscordBot",
+		"gh attestation verify ./autostream-discord-bot-vX.Y.Z/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz",
+		"Transfer only `autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz`",
 		"sudo tar --no-same-owner --no-same-permissions -xzf autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz",
 		"sudo ./install-autostream-discord-bot",
+		"binary version, commit, and build date",
 		"installer-owned",
 	} {
 		if !strings.Contains(guide, marker) {
 			t.Fatalf("install guide is missing simple installer marker %q", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		"sha256sum --check --strict",
+		"gh attestation verify release-manifest.json",
+		"sudo install -o root -g root -m 0644 /tmp/release-manifest.json",
+		"sudo install -o root -g root -m 0644 /tmp/autostream-discord-bot_vX.Y.Z_linux_amd64.tar.gz.sha256",
+	} {
+		if strings.Contains(guide, forbidden) {
+			t.Fatalf("manual install guide still requires external release metadata command %q", forbidden)
+		}
+	}
+}
+
+func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
+	root := filepath.Join("..", "..")
+	installerBytes, err := os.ReadFile(filepath.Join(root, "release", "install-autostream-discord-bot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(installerBytes)
+
+	groupValidation := strings.Index(installer, `autostream_group_gid="$(getent group autostream | awk -F: 'NR == 1 { print $3 }')"`)
+	userCreation := strings.Index(installer, `useradd --system --gid "${autostream_group_gid}"`)
+	if groupValidation < 0 || userCreation < 0 || groupValidation > userCreation {
+		t.Fatal("installer must validate the named autostream group numeric GID before user creation")
+	}
+	if !strings.Contains(installer, `[[ $(id -g autostream) == "${autostream_group_gid}" ]]`) {
+		t.Fatal("installer must verify the service user's numeric primary GID")
+	}
+
+	for _, marker := range []string{
+		"rollback_created_autostream_account()",
+		"rollback_journaled_directories()",
+		"rollback_created_release()",
+		"restore_existing_state_directory()",
+		"register_temporary_path()",
+		"create_registered_temporary_path()",
+		"create_registered_symlink_path()",
+		"INPUT_STAGE is the single temporary-path journal exception",
+		"input_stage_is_owned()",
+		"INPUT_STAGE_IDENTITY",
+		"restore_legacy_backup_state()",
+		"created_autostream_user=false",
+		"created_autostream_group=false",
+		"release_created=false",
+		"state_directory_mutation_started=false",
+		"backup_previous_kind",
+		"backup_created_identity",
+		"ensure_permanent_lock_path_atomically()",
+		`readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"`,
+		`ensure_permanent_lock_path_atomically "${SHARED_HOST_SETUP_LOCK}"`,
+		`exec 8<>"${SHARED_HOST_SETUP_LOCK}"`,
+		`flock -n 8`,
+		"another AutoStream installer is provisioning shared host state",
+		"shared host-setup lock identity changed after acquisition",
+		`ln -- "${lock_create_stage}" "${path}"`,
+		`ensure_permanent_lock_path_atomically "${TARGET_LOCK}"`,
+		`exec 9<>"${TARGET_LOCK}"`,
+		`$(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/9) == "regular file:root:root:600"`,
+		"updater target lock identity changed",
+		"permanent updater lock",
+		"durable recovery backup",
+	} {
+		if !strings.Contains(installer, marker) {
+			t.Fatalf("installer is missing privileged transaction marker %q", marker)
+		}
+	}
+	if strings.Contains(installer, `exec 9>"${TARGET_LOCK}"`) {
+		t.Fatal("installer must not truncate the production updater lock")
+	}
+	if strings.Contains(installer, `rm -f -- "${TARGET_LOCK}"`) {
+		t.Fatal("installer must never unlink the permanent production updater lock")
+	}
+	sharedLockIndex := strings.Index(installer, "flock -n 8")
+	firstJournaledAnchorIndex := strings.Index(installer, "ensure_root_anchor_directory /usr\n")
+	if sharedLockIndex < 0 || firstJournaledAnchorIndex <= sharedLockIndex {
+		t.Fatal("installer must acquire the shared host-setup lock before journaled host mutations")
+	}
+	backupTypeValidationIndex := strings.Index(
+		installer,
+		`[[ -f ${backup_path} && ! -L ${backup_path} &&`,
+	)
+	backupDigestIndex := strings.Index(
+		installer,
+		`backup_digest="$(sha256sum -- "${backup_path}" | awk 'NR == 1 { print $1 }')"`,
+	)
+	if backupTypeValidationIndex < 0 ||
+		backupDigestIndex <= backupTypeValidationIndex {
+		t.Fatal("installer must validate a pre-existing legacy backup before reading it")
+	}
+	managedStart := strings.Index(installer, "ensure_managed_directory() {")
+	privateStart := strings.Index(installer, "ensure_private_root_directory() {")
+	if managedStart < 0 || privateStart <= managedStart {
+		t.Fatal("installer managed-directory helper is missing")
+	}
+	managedHelper := installer[managedStart:privateStart]
+	if !strings.Contains(managedHelper, `install -d -o root -g root -m 0755 "${path}"`) ||
+		strings.Contains(managedHelper, "\n    return\n") {
+		t.Fatal("installer must normalize safe pre-existing managed directories to mode 0755")
+	}
+}
+
+func TestDiscordBotInstallerClosesSignalJournalWindows(t *testing.T) {
+	root := filepath.Join("..", "..")
+	installerBytes, err := os.ReadFile(filepath.Join(root, "release", "install-autostream-discord-bot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(installerBytes)
+
+	for _, marker := range []string{
+		"cleanup_in_progress=false",
+		"signal_transaction_active=false",
+		"deferred_termination_status=0",
+		"handle_installer_signal()",
+		"begin_installer_signal_transaction()",
+		"finish_installer_signal_transaction()",
+		`if [[ ${cleanup_in_progress} == true ]]; then`,
+		`useradd --system --gid "${autostream_group_gid}"`,
+		`created_autostream_group_record="$(getent group autostream)"`,
+		`created_autostream_user_record="$(getent passwd autostream)"`,
+		`local created_identity_variable="${5-}"`,
+		`printf -v "${created_identity_variable}" '%s'`,
+		`if [[ ${rollback_incomplete} == true && ${status} -eq 0 ]]; then`,
+		`create_registered_symlink_path "${target}" "${public_link_next}"`,
+		`create_registered_symlink_path "${RELEASE_DIR}" "${current_next}"`,
+	} {
+		if !strings.Contains(installer, marker) {
+			t.Fatalf("installer is missing signal-safe journal marker %q", marker)
+		}
+	}
+	if count := strings.Count(installer, `trap '' HUP INT TERM`); count != 3 {
+		t.Fatalf("installer must ignore termination only in the cleanup handler paths; got %d sites", count)
+	}
+	if strings.Count(installer, "begin_installer_signal_transaction") < 12 ||
+		strings.Count(installer, "finish_installer_signal_transaction") < 12 {
+		t.Fatal("installer is missing deferred-signal transactions around privileged mutations")
+	}
+
+	cleanupStart := strings.Index(installer, "cleanup() {")
+	cleanupEnd := strings.Index(installer[cleanupStart:], "\n}\ntrap cleanup EXIT")
+	if cleanupStart < 0 || cleanupEnd < 0 {
+		t.Fatal("could not locate installer cleanup")
+	}
+	cleanup := installer[cleanupStart : cleanupStart+cleanupEnd]
+	cleanupIgnore := strings.Index(cleanup, `trap '' HUP INT TERM`)
+	cleanupRollback := strings.Index(cleanup, "rollback_activation")
+	if cleanupIgnore < 0 || cleanupRollback <= cleanupIgnore {
+		t.Fatal("cleanup must ignore a second terminating signal before rollback begins")
+	}
+
+	assertOrdered := func(name, scope string, markers ...string) {
+		t.Helper()
+		offset := 0
+		for _, marker := range markers {
+			index := strings.Index(scope[offset:], marker)
+			if index < 0 {
+				t.Fatalf("%s is missing ordered marker %q", name, marker)
+			}
+			offset += index + len(marker)
+		}
+	}
+
+	journalStart := strings.Index(installer, "journal_directory_before_mutation() {")
+	journalEnd := strings.Index(installer[journalStart:], "\n}\n\nrecord_journaled_directory_creation()")
+	if journalStart < 0 || journalEnd < 0 {
+		t.Fatal("could not locate directory journal publication")
+	}
+	directoryJournal := installer[journalStart : journalStart+journalEnd]
+	assertOrdered(
+		"directory journal",
+		directoryJournal,
+		`previous_identity="$(stat -c '%d:%i' -- "${path}")"`,
+		`previous_uid="$(stat -c '%u' -- "${path}")"`,
+		`previous_gid="$(stat -c '%g' -- "${path}")"`,
+		`previous_mode="$(stat -c '%a' -- "${path}")"`,
+		"begin_installer_signal_transaction",
+		`journaled_directory_recorded["${path}"]=true`,
+		`journaled_directory_order+=("${path}")`,
+		`journaled_directory_previous_kind["${path}"]="${previous_kind}"`,
+		`journaled_directory_previous_identity["${path}"]="${previous_identity}"`,
+		`journaled_directory_previous_uid["${path}"]="${previous_uid}"`,
+		`journaled_directory_previous_gid["${path}"]="${previous_gid}"`,
+		`journaled_directory_previous_mode["${path}"]="${previous_mode}"`,
+		"finish_installer_signal_transaction",
+	)
+
+	groupStart := strings.Index(installer, "\nif ! getent group autostream")
+	groupEnd := strings.Index(installer[groupStart:], "\nautostream_group_gid=")
+	if groupStart < 0 || groupEnd < 0 {
+		t.Fatal("could not locate autostream group provisioning")
+	}
+	groupProvision := installer[groupStart : groupStart+groupEnd]
+	assertOrdered(
+		"group provisioning",
+		groupProvision,
+		"begin_installer_signal_transaction",
+		"groupadd --system autostream",
+		"created_autostream_group=true",
+		`created_autostream_group_record="$(getent group autostream)"`,
+		"finish_installer_signal_transaction",
+	)
+
+	userStart := strings.Index(installer, "\nif ! id autostream")
+	userEnd := strings.Index(installer[userStart:], "\n[[ $(id -u autostream)")
+	if userStart < 0 || userEnd < 0 {
+		t.Fatal("could not locate autostream user provisioning")
+	}
+	userProvision := installer[userStart : userStart+userEnd]
+	assertOrdered(
+		"user provisioning",
+		userProvision,
+		"begin_installer_signal_transaction",
+		`useradd --system --gid "${autostream_group_gid}"`,
+		"created_autostream_user=true",
+		`created_autostream_user_record="$(getent passwd autostream)"`,
+		"finish_installer_signal_transaction",
+	)
+
+	integrationBytes, err := os.ReadFile(filepath.Join(
+		root,
+		"release",
+		"test-install-autostream-discord-bot-integration.sh",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	integration := string(integrationBytes)
+	for _, marker := range []string{
+		"groupadd signal-window probe did not run",
+		"groupadd signal-window probe did not exit with 143",
+		"useradd signal-window probe did not run",
+		"useradd signal-window probe did not exit with 143",
+		"groupadd signal-window rollback left the invocation-created service account",
+		"useradd signal-window rollback left the invocation-created service account",
+	} {
+		if !strings.Contains(integration, marker) {
+			t.Fatalf("integration fixture is missing signal-window marker %q", marker)
 		}
 	}
 }
