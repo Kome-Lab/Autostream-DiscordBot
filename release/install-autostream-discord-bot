@@ -197,6 +197,11 @@ declare -A previous_public_kind=()
 declare -A previous_public_target=()
 declare -A previous_public_mode=()
 declare -A previous_public_sha256=()
+declare -A previous_public_identity=()
+declare -A previous_public_nlink=()
+declare -A public_rollback_anchor=()
+declare -A published_public_identity=()
+declare -A published_public_target=()
 unit_previous_kind="absent"
 unit_previous_mode=""
 unit_previous_sha256=""
@@ -228,6 +233,8 @@ declare -A journaled_directory_previous_gid=()
 declare -A journaled_directory_previous_mode=()
 declare -A journaled_directory_created_identity=()
 declare -A temporary_path_identity=()
+declare -A temporary_path_sync_parent=()
+declare -A protected_temporary_path=()
 declare -A backup_previous_kind=()
 declare -A backup_previous_identity=()
 declare -A backup_previous_uid=()
@@ -337,16 +344,26 @@ create_registered_symlink_path() {
 forget_temporary_path() {
   local path=$1
   unset 'temporary_path_identity['"${path}"']'
+  unset 'temporary_path_sync_parent['"${path}"']'
+  unset 'protected_temporary_path['"${path}"']'
 }
 
 cleanup_temporary_paths() {
   local path
   local identity
+  local sync_parent
   local cleanup_failed=false
   for path in "${!temporary_path_identity[@]}"; do
     identity="${temporary_path_identity["${path}"]}"
+    sync_parent="${temporary_path_sync_parent["${path}"]-}"
+    if [[ ${protected_temporary_path["${path}"]-false} == true ]]; then
+      cleanup_failed=true
+      continue
+    fi
     if [[ ! -e ${path} && ! -L ${path} ]]; then
       unset 'temporary_path_identity['"${path}"']'
+      unset 'temporary_path_sync_parent['"${path}"']'
+      unset 'protected_temporary_path['"${path}"']'
       continue
     fi
     if [[ ${identity} == "pending" ||
@@ -359,6 +376,11 @@ cleanup_temporary_paths() {
       cleanup_failed=true
     else
       unset 'temporary_path_identity['"${path}"']'
+      unset 'temporary_path_sync_parent['"${path}"']'
+      unset 'protected_temporary_path['"${path}"']'
+      if [[ -n ${sync_parent} ]] && ! sync -f "${sync_parent}"; then
+        cleanup_failed=true
+      fi
     fi
   done
   [[ ${cleanup_failed} == false ]]
@@ -783,53 +805,178 @@ restore_legacy_backup_state() {
   esac
 }
 
+observed_path_identity() {
+  local path=$1
+  if [[ -z ${path} || ( ! -e ${path} && ! -L ${path} ) ]]; then
+    printf '%s' "absent"
+  elif ! stat -c '%d:%i' -- "${path}"; then
+    printf '%s' "unreadable"
+  fi
+}
+
+observed_path_nlink() {
+  local path=$1
+  if [[ -z ${path} || ( ! -e ${path} && ! -L ${path} ) ]]; then
+    printf '%s' "absent"
+  elif ! stat -c '%h' -- "${path}"; then
+    printf '%s' "unreadable"
+  fi
+}
+
+remove_unchanged_public_rollback_anchor() {
+  local path=$1
+  local anchor="${public_rollback_anchor["${path}"]-}"
+  local original_identity="${previous_public_identity["${path}"]-}"
+  local original_nlink="${previous_public_nlink["${path}"]-}"
+  local anchored_nlink
+  local sync_parent
+  [[ -n ${anchor} ]] || return 0
+  [[ ${original_nlink} =~ ^[1-9][0-9]*$ ]] || return 1
+  anchored_nlink=$((original_nlink + 1))
+  sync_parent="$(dirname -- "${path}")" || return 1
+  [[ ${protected_temporary_path["${anchor}"]-false} == true &&
+    ${temporary_path_identity["${anchor}"]-pending} == "${original_identity}" &&
+    -f ${anchor} && ! -L ${anchor} &&
+    $(stat -c '%d:%i' -- "${anchor}") == "${original_identity}" &&
+    $(stat -c '%h' -- "${anchor}") == "${anchored_nlink}" &&
+    $(stat -c '%U:%G:%a' -- "${anchor}") == \
+      "root:root:${previous_public_mode["${path}"]}" &&
+    $(sha256sum -- "${anchor}" | awk 'NR == 1 { print $1 }') == \
+      "${previous_public_sha256["${path}"]}" ]] || return 1
+  rm -f -- "${anchor}" || return 1
+  [[ ! -e ${anchor} && ! -L ${anchor} ]] || return 1
+  sync -f "${sync_parent}" || return 1
+  forget_temporary_path "${anchor}"
+  unset 'public_rollback_anchor['"${path}"']'
+}
+
+completed_public_anchor_is_safe_to_remove() {
+  local path=$1
+  local anchor="${public_rollback_anchor["${path}"]-}"
+  local original_identity="${previous_public_identity["${path}"]-}"
+  local original_nlink="${previous_public_nlink["${path}"]-}"
+  local published_identity="${published_public_identity["${path}"]-}"
+  local published_target="${published_public_target["${path}"]-}"
+  [[ ${previous_public_kind["${path}"]-unknown} == "regular" ]] || return 0
+  [[ -n ${anchor} && -n ${original_identity} && -n ${published_identity} &&
+    -n ${published_target} && ${original_nlink} =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ ${protected_temporary_path["${anchor}"]-false} == true &&
+    ${temporary_path_identity["${anchor}"]-pending} == "${original_identity}" &&
+    -f ${anchor} && ! -L ${anchor} &&
+    $(stat -c '%d:%i' -- "${anchor}") == "${original_identity}" &&
+    $(stat -c '%h' -- "${anchor}") == "${original_nlink}" &&
+    $(stat -c '%U:%G:%a' -- "${anchor}") == \
+      "root:root:${previous_public_mode["${path}"]}" &&
+    $(sha256sum -- "${anchor}" | awk 'NR == 1 { print $1 }') == \
+      "${previous_public_sha256["${path}"]}" &&
+    -L ${path} && $(stat -c '%d:%i' -- "${path}") == "${published_identity}" &&
+    $(readlink -- "${path}") == "${published_target}" ]]
+}
+
+release_completed_public_rollback_anchors() {
+  local path
+  local anchor
+  local sync_parent
+  for path in "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}"; do
+    completed_public_anchor_is_safe_to_remove "${path}" || return 1
+  done
+  for path in "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}"; do
+    if [[ ${previous_public_kind["${path}"]-unknown} == "regular" ]]; then
+      completed_public_anchor_is_safe_to_remove "${path}" || return 1
+      anchor="${public_rollback_anchor["${path}"]}"
+      sync_parent="$(dirname -- "${anchor}")" || return 1
+      rm -f -- "${anchor}" || return 1
+      [[ ! -e ${anchor} && ! -L ${anchor} ]] || return 1
+      sync -f "${sync_parent}" || return 1
+      forget_temporary_path "${anchor}"
+      unset 'public_rollback_anchor['"${path}"']'
+    fi
+  done
+}
+
 restore_public_state() {
   local path=$1
   local kind="${previous_public_kind["${path}"]}"
   local restore_next="${path}.rollback.$$"
-  local backup_path
-  local backup_name
-  [[ ! -e ${restore_next} && ! -L ${restore_next} ]] || return 1
+  local anchor
+  local original_identity="${previous_public_identity["${path}"]-}"
+  local published_identity="${published_public_identity["${path}"]-}"
+  local published_target="${published_public_target["${path}"]-}"
+  local anchor_restored=false
   if [[ -e ${path} && ! -L ${path} && ! -f ${path} ]]; then
     return 1
   fi
   case "${kind}" in
     absent)
-      rm -f -- "${path}" || return 1
+      if [[ -e ${path} || -L ${path} ]]; then
+        [[ -n ${published_identity} && -n ${published_target} && -L ${path} &&
+          $(stat -c '%d:%i' -- "${path}") == "${published_identity}" &&
+          $(readlink -- "${path}") == "${published_target}" ]] || return 1
+        rm -f -- "${path}" || return 1
+      fi
       [[ ! -e ${path} && ! -L ${path} ]] || return 1
       ;;
     symlink)
-      create_registered_symlink_path \
-        "${previous_public_target["${path}"]}" \
-        "${restore_next}" || return 1
-      mv -Tf -- "${restore_next}" "${path}" || return 1
-      forget_temporary_path "${restore_next}"
-      [[ -L ${path} &&
-        $(readlink -- "${path}") == "${previous_public_target["${path}"]}" ]] || return 1
-      ;;
-    regular)
-      backup_name="$(basename -- "${path}")" || return 1
-      [[ -n ${backup_name} && ${backup_name} != */* ]] || return 1
-      backup_path="${LEGACY_BACKUP_DIR}/${backup_name}"
-      if [[ -f ${path} && ! -L ${path} &&
-        $(sha256sum -- "${path}" | awk 'NR == 1 { print $1 }') == "${previous_public_sha256["${path}"]}" ]]; then
-        chmod "${previous_public_mode["${path}"]}" "${path}" || return 1
+      if [[ -L ${path} && -n ${original_identity} &&
+        $(stat -c '%d:%i' -- "${path}") == "${original_identity}" &&
+        $(readlink -- "${path}") == "${previous_public_target["${path}"]}" ]]; then
+        :
       else
-        [[ -f ${backup_path} && ! -L ${backup_path} ]] || return 1
-        register_temporary_path "${restore_next}" || return 1
-        install -o root -g root -m "${previous_public_mode["${path}"]}" \
-          "${backup_path}" "${restore_next}" || return 1
-        claim_temporary_path "${restore_next}" || return 1
-        [[ $(sha256sum -- "${restore_next}" | awk 'NR == 1 { print $1 }') == \
-          "${previous_public_sha256["${path}"]}" ]] || return 1
+        [[ ! -e ${restore_next} && ! -L ${restore_next} ]] || return 1
+        if [[ -e ${path} || -L ${path} ]]; then
+          [[ -n ${published_identity} && -n ${published_target} && -L ${path} &&
+            $(stat -c '%d:%i' -- "${path}") == "${published_identity}" &&
+            $(readlink -- "${path}") == "${published_target}" ]] || return 1
+        fi
+        create_registered_symlink_path \
+          "${previous_public_target["${path}"]}" \
+          "${restore_next}" || return 1
         mv -Tf -- "${restore_next}" "${path}" || return 1
         forget_temporary_path "${restore_next}"
       fi
+      [[ -L ${path} && -n ${original_identity} &&
+        $(readlink -- "${path}") == "${previous_public_target["${path}"]}" ]] || return 1
+      ;;
+    regular)
+      [[ -n ${original_identity} ]] || return 1
+      if [[ -f ${path} && ! -L ${path} &&
+        $(stat -c '%d:%i' -- "${path}") == "${original_identity}" ]]; then
+        :
+      else
+        anchor="${public_rollback_anchor["${path}"]-}"
+        [[ -n ${anchor} && -f ${anchor} && ! -L ${anchor} &&
+          ${temporary_path_identity["${anchor}"]-pending} == "${original_identity}" &&
+          $(stat -c '%d:%i' -- "${anchor}") == "${original_identity}" ]] || return 1
+        # Once the public name no longer identifies the original inode, keep the
+        # proven anchor out of generic temporary cleanup until it is moved back.
+        # If any later ownership check refuses rollback, the original inode stays
+        # available as root-only recovery evidence.
+        if [[ -e ${path} || -L ${path} ]]; then
+          [[ -n ${published_identity} && -n ${published_target} && -L ${path} &&
+            $(stat -c '%d:%i' -- "${path}") == "${published_identity}" &&
+            $(readlink -- "${path}") == "${published_target}" ]] || return 1
+        fi
+        [[ $(stat -c '%U:%G:%a' -- "${anchor}") == \
+          "root:root:${previous_public_mode["${path}"]}" &&
+          $(sha256sum -- "${anchor}" | awk 'NR == 1 { print $1 }') == \
+            "${previous_public_sha256["${path}"]}" ]] || return 1
+        mv -Tf -- "${anchor}" "${path}" || return 1
+        anchor_restored=true
+      fi
+      if [[ ${anchor_restored} == false ]]; then
+        remove_unchanged_public_rollback_anchor "${path}" || return 1
+      fi
       [[ -f ${path} && ! -L ${path} &&
+        $(stat -c '%d:%i' -- "${path}") == "${previous_public_identity["${path}"]}" &&
+        $(stat -c '%h' -- "${path}") == "${previous_public_nlink["${path}"]}" &&
         $(stat -c '%U:%G:%a' -- "${path}") == "root:root:${previous_public_mode["${path}"]}" &&
         $(sha256sum -- "${path}" | awk 'NR == 1 { print $1 }') == \
           "${previous_public_sha256["${path}"]}" ]] || return 1
       sync -f "$(dirname -- "${path}")" || return 1
+      if [[ ${anchor_restored} == true ]]; then
+        forget_temporary_path "${anchor}"
+        unset 'public_rollback_anchor['"${path}"']'
+      fi
       # A backup is removed only after the public binary is proven restored.
       # On incomplete rollback it remains as a durable recovery backup.
       restore_legacy_backup_state "${path}" || return 1
@@ -958,6 +1105,12 @@ cleanup() {
   fi
   managed_candidate=""
   managed_candidate_identity=""
+  if [[ ${installation_complete} == true ]] &&
+    ! release_completed_public_rollback_anchors; then
+    printf '%s\n' "install-autostream-discord-bot: refused to remove an unproven public rollback anchor" >&2
+    rollback_incomplete=true
+    setup_rollback_safe=false
+  fi
   if ! cleanup_temporary_paths; then
     printf '%s\n' "install-autostream-discord-bot: failed to clean an invocation-owned temporary path" >&2
     rollback_incomplete=true
@@ -999,10 +1152,32 @@ cleanup() {
       printf 'public_binary_target=%s\n' "${previous_public_target["${PUBLIC_BINARY}"]-}"
       printf 'public_binary_mode=%s\n' "${previous_public_mode["${PUBLIC_BINARY}"]-}"
       printf 'public_binary_sha256=%s\n' "${previous_public_sha256["${PUBLIC_BINARY}"]-}"
+      printf 'public_binary_previous_identity=%s\n' "${previous_public_identity["${PUBLIC_BINARY}"]-}"
+      printf 'public_binary_previous_nlink=%s\n' "${previous_public_nlink["${PUBLIC_BINARY}"]-}"
+      printf 'public_binary_observed_identity=%s\n' "$(observed_path_identity "${PUBLIC_BINARY}")"
+      printf 'public_binary_anchor_path=%s\n' "${public_rollback_anchor["${PUBLIC_BINARY}"]-}"
+      printf 'public_binary_anchor_expected_identity=%s\n' "${previous_public_identity["${PUBLIC_BINARY}"]-}"
+      printf 'public_binary_anchor_observed_identity=%s\n' \
+        "$(observed_path_identity "${public_rollback_anchor["${PUBLIC_BINARY}"]-}")"
+      printf 'public_binary_anchor_observed_nlink=%s\n' \
+        "$(observed_path_nlink "${public_rollback_anchor["${PUBLIC_BINARY}"]-}")"
+      printf 'public_binary_published_identity=%s\n' "${published_public_identity["${PUBLIC_BINARY}"]-}"
+      printf 'public_binary_published_target=%s\n' "${published_public_target["${PUBLIC_BINARY}"]-}"
       printf 'public_alias_kind=%s\n' "${previous_public_kind["${PUBLIC_ALIAS}"]-unknown}"
       printf 'public_alias_target=%s\n' "${previous_public_target["${PUBLIC_ALIAS}"]-}"
       printf 'public_alias_mode=%s\n' "${previous_public_mode["${PUBLIC_ALIAS}"]-}"
       printf 'public_alias_sha256=%s\n' "${previous_public_sha256["${PUBLIC_ALIAS}"]-}"
+      printf 'public_alias_previous_identity=%s\n' "${previous_public_identity["${PUBLIC_ALIAS}"]-}"
+      printf 'public_alias_previous_nlink=%s\n' "${previous_public_nlink["${PUBLIC_ALIAS}"]-}"
+      printf 'public_alias_observed_identity=%s\n' "$(observed_path_identity "${PUBLIC_ALIAS}")"
+      printf 'public_alias_anchor_path=%s\n' "${public_rollback_anchor["${PUBLIC_ALIAS}"]-}"
+      printf 'public_alias_anchor_expected_identity=%s\n' "${previous_public_identity["${PUBLIC_ALIAS}"]-}"
+      printf 'public_alias_anchor_observed_identity=%s\n' \
+        "$(observed_path_identity "${public_rollback_anchor["${PUBLIC_ALIAS}"]-}")"
+      printf 'public_alias_anchor_observed_nlink=%s\n' \
+        "$(observed_path_nlink "${public_rollback_anchor["${PUBLIC_ALIAS}"]-}")"
+      printf 'public_alias_published_identity=%s\n' "${published_public_identity["${PUBLIC_ALIAS}"]-}"
+      printf 'public_alias_published_target=%s\n' "${published_public_target["${PUBLIC_ALIAS}"]-}"
       printf 'unit_previous_kind=%s\n' "${unit_previous_kind}"
       printf 'unit_previous_mode=%s\n' "${unit_previous_mode}"
       printf 'unit_previous_sha256=%s\n' "${unit_previous_sha256}"
@@ -1863,12 +2038,29 @@ install -o root -g root -m 0644 \
   "${unit_stage}"
 
 ensure_private_root_directory "${LEGACY_BACKUP_DIR}"
+reject_stale_public_rollback_anchors() {
+  local path=$1
+  local restore_nullglob=false
+  local -a stale_anchors=()
+  if ! shopt -q nullglob; then
+    shopt -s nullglob
+    restore_nullglob=true
+  fi
+  stale_anchors=("${path}.rollback-anchor."*)
+  if [[ ${restore_nullglob} == true ]]; then
+    shopt -u nullglob
+  fi
+  ((${#stale_anchors[@]} == 0)) || \
+    die "stale public rollback anchor requires manual recovery: ${path}"
+}
+
 preflight_public_path() {
   local link_path=$1
   local expected_target=$2
   local parent
   local mode
   local source_digest
+  local source_identity
   local backup_name
   local backup_path
   backup_name="$(basename -- "${link_path}")" || die "could not resolve the legacy public binary name"
@@ -1881,6 +2073,7 @@ preflight_public_path() {
       die "existing public symlink has an unexpected target: ${link_path}"
     previous_public_kind["${link_path}"]="symlink"
     previous_public_target["${link_path}"]="$(readlink -- "${link_path}")"
+    previous_public_identity["${link_path}"]="$(stat -c '%d:%i' -- "${link_path}")"
   elif [[ -e ${link_path} ]]; then
     [[ -f ${link_path} ]] || die "existing public path is not a regular file: ${link_path}"
     [[ $(stat -c '%U:%G' -- "${link_path}") == "root:root" ]] || \
@@ -1889,7 +2082,10 @@ preflight_public_path() {
     mode="$(stat -c '%a' -- "${link_path}")"
     (( (8#${mode} & 07022) == 0 )) || \
       die "legacy public binary has unsafe write or special mode bits: ${link_path}"
+    source_identity="$(stat -c '%d:%i' -- "${link_path}")"
     source_digest="$(sha256sum -- "${link_path}" | awk 'NR == 1 { print $1 }')"
+    [[ $(stat -c '%d:%i' -- "${link_path}") == "${source_identity}" ]] || \
+      die "legacy public binary changed during preflight: ${link_path}"
     case "${backup_previous_kind["${link_path}"]-unobserved}" in
       regular)
         [[ -f ${backup_path} && ! -L ${backup_path} &&
@@ -1912,6 +2108,8 @@ preflight_public_path() {
     previous_public_kind["${link_path}"]="regular"
     previous_public_mode["${link_path}"]="${mode}"
     previous_public_sha256["${link_path}"]="${source_digest}"
+    previous_public_identity["${link_path}"]="${source_identity}"
+    previous_public_nlink["${link_path}"]="$(stat -c '%h' -- "${link_path}")"
   else
     previous_public_kind["${link_path}"]="absent"
   fi
@@ -1919,6 +2117,14 @@ preflight_public_path() {
 
 preflight_public_path "${PUBLIC_BINARY}" "${CURRENT_LINK}/bin/autostream-discord-bot"
 preflight_public_path "${PUBLIC_ALIAS}" "${PUBLIC_BINARY}"
+if [[ ${previous_public_kind["${PUBLIC_BINARY}"]} == "regular" &&
+  ${previous_public_kind["${PUBLIC_ALIAS}"]} == "regular" &&
+  ${previous_public_identity["${PUBLIC_BINARY}"]} == \
+    "${previous_public_identity["${PUBLIC_ALIAS}"]}" ]]; then
+  die "legacy canonical public binary and alias must not be hard links to the same inode"
+fi
+reject_stale_public_rollback_anchors "${PUBLIC_BINARY}"
+reject_stale_public_rollback_anchors "${PUBLIC_ALIAS}"
 if [[ ${previous_public_kind["${PUBLIC_BINARY}"]} == "absent" ]] &&
   systemctl is-active --quiet "${UNIT_NAME}"; then
   die "active service has no canonical public binary; stop it before installing"
@@ -1985,20 +2191,90 @@ backup_legacy_binary() {
   sync -f "${LEGACY_BACKUP_DIR}"
 }
 
+prepare_public_rollback_anchor() {
+  local path=$1
+  local anchor="${path}.rollback-anchor.$$"
+  local original_identity="${previous_public_identity["${path}"]-}"
+  local original_nlink="${previous_public_nlink["${path}"]-}"
+  local expected_nlink
+  local transaction_failed=false
+
+  [[ ${previous_public_kind["${path}"]-unknown} == "regular" ]] || return 0
+  [[ -n ${original_identity} && ${original_nlink} =~ ^[1-9][0-9]*$ ]] || return 1
+  expected_nlink=$((original_nlink + 1))
+  [[ -f ${path} && ! -L ${path} &&
+    $(stat -c '%d:%i' -- "${path}") == "${original_identity}" &&
+    $(stat -c '%h' -- "${path}") == "${original_nlink}" &&
+    $(stat -c '%U:%G:%a' -- "${path}") == \
+      "root:root:${previous_public_mode["${path}"]}" &&
+    $(sha256sum -- "${path}" | awk 'NR == 1 { print $1 }') == \
+      "${previous_public_sha256["${path}"]}" ]] || return 1
+  [[ ! -e ${anchor} && ! -L ${anchor} ]] || return 1
+
+  # The registration, hard-link creation, inode claim, and public-path mapping
+  # form one deferred-signal transaction. Cleanup can therefore remove only an
+  # invocation-owned anchor, or deliberately retain it as recovery evidence.
+  begin_installer_signal_transaction
+  if ! register_temporary_path "${anchor}"; then
+    transaction_failed=true
+  fi
+  if [[ ${transaction_failed} == false ]]; then
+    public_rollback_anchor["${path}"]="${anchor}"
+    temporary_path_sync_parent["${anchor}"]="$(dirname -- "${path}")"
+    protected_temporary_path["${anchor}"]=true
+  fi
+  if [[ ${transaction_failed} == false ]] && ! ln -T -- "${path}" "${anchor}"; then
+    if [[ ! -e ${anchor} && ! -L ${anchor} ]]; then
+      forget_temporary_path "${anchor}"
+      unset 'public_rollback_anchor['"${path}"']'
+    fi
+    transaction_failed=true
+  fi
+  if [[ ${transaction_failed} == false ]] && ! claim_temporary_path "${anchor}"; then
+    transaction_failed=true
+  fi
+  if [[ ${transaction_failed} == false &&
+    ${temporary_path_identity["${anchor}"]} != "${original_identity}" ]]; then
+    transaction_failed=true
+  fi
+  finish_installer_signal_transaction
+  [[ ${transaction_failed} == false ]] || return 1
+
+  [[ -f ${anchor} && ! -L ${anchor} &&
+    $(stat -c '%d:%i' -- "${anchor}") == "${original_identity}" &&
+    $(stat -c '%h' -- "${anchor}") == "${expected_nlink}" &&
+    $(stat -c '%d:%i' -- "${path}") == "${original_identity}" &&
+    $(stat -c '%h' -- "${path}") == "${expected_nlink}" &&
+    $(stat -c '%U:%G:%a' -- "${anchor}") == \
+      "root:root:${previous_public_mode["${path}"]}" &&
+    $(sha256sum -- "${anchor}" | awk 'NR == 1 { print $1 }') == \
+      "${previous_public_sha256["${path}"]}" ]] || return 1
+}
+
 backup_legacy_binary "${PUBLIC_BINARY}"
 backup_legacy_binary "${PUBLIC_ALIAS}"
 
 install_public_link() {
   local target=$1
   local link_path=$2
+  local staged_identity
   public_link_next="${link_path}.next.$$"
   [[ ! -e ${public_link_next} && ! -L ${public_link_next} ]] || \
     die "public link staging path already exists: ${public_link_next}"
   create_registered_symlink_path "${target}" "${public_link_next}" || \
     die "could not create and journal public link staging"
+  staged_identity="${temporary_path_identity["${public_link_next}"]-pending}"
+  [[ ${staged_identity} != "pending" ]] || \
+    die "public link staging identity was not journaled: ${link_path}"
   public_link_commit_failed=false
   begin_installer_signal_transaction
+  published_public_identity["${link_path}"]="${staged_identity}"
+  published_public_target["${link_path}"]="${target}"
   if ! mv -Tf -- "${public_link_next}" "${link_path}"; then
+    public_link_commit_failed=true
+  elif [[ ! -L ${link_path} ||
+    $(stat -c '%d:%i' -- "${link_path}") != "${staged_identity}" ||
+    $(readlink -- "${link_path}") != "${target}" ]]; then
     public_link_commit_failed=true
   else
     forget_temporary_path "${public_link_next}"
@@ -2074,6 +2350,12 @@ fi
 
 # The alias is not used by ExecStart, so switch it first and commit the
 # canonical systemd path last.
+prepare_public_rollback_anchor "${PUBLIC_BINARY}" || \
+  die "could not create and journal the canonical public rollback anchor"
+prepare_public_rollback_anchor "${PUBLIC_ALIAS}" || \
+  die "could not create and journal the compatibility public rollback anchor"
+# Make both original-inode anchors durable before either public name changes.
+sync -f /usr/local/bin
 install_public_link "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}"
 [[ $(readlink -- "${PUBLIC_ALIAS}") == "${PUBLIC_BINARY}" ]] || \
   die "public compatibility symlink target is incorrect"

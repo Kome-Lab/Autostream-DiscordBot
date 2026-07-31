@@ -1337,24 +1337,27 @@ unit_before="${legacy_unit_sha256}"
 install -d -o root -g root -m 0700 /opt/autostream
 shared_managed_parent_before="$(stat -c '%d:%i:%u:%g:%a' -- /opt/autostream)"
 legacy_public_binary_metadata_before="$(
-  stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_BINARY}"
+  stat -c '%d:%i:%u:%g:%a:%h' -- "${PUBLIC_BINARY}"
 )"
 legacy_public_binary_sha_before="$(
   sha256sum "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }'
 )"
 legacy_public_alias_metadata_before="$(
-  stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_ALIAS}"
+  stat -c '%d:%i:%u:%g:%a:%h' -- "${PUBLIC_ALIAS}"
 )"
 legacy_public_alias_sha_before="$(
   sha256sum "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }'
 )"
 
 preexisting_backup_dir="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:0:12}"
+install -d -o root -g root -m 0700 "${INSTALL_BACKUP_ROOT}"
 install -d -o root -g root -m 0700 "${preexisting_backup_dir}"
 install -o root -g root -m 0500 "${PUBLIC_BINARY}" \
   "${preexisting_backup_dir}/autostream-discord-bot"
 install -o root -g root -m 0500 "${PUBLIC_ALIAS}" \
   "${preexisting_backup_dir}/discord-bot"
+[[ $(stat -c '%u:%g:%a' -- "${INSTALL_BACKUP_ROOT}") == "0:0:700" ]] || \
+  die "pre-existing backup root fixture is not root-only"
 [[ $(stat -c '%u:%g:%a' -- "${preexisting_backup_dir}") == "0:0:700" ]] || \
   die "pre-existing backup directory fixture is not root-only"
 [[ $(stat -c '%u:%g:%a' -- \
@@ -1405,15 +1408,15 @@ assert_preexisting_backups_unchanged() {
 }
 
 assert_legacy_public_paths_unchanged() {
-  [[ "$(stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_BINARY}")" == \
+  [[ "$(stat -c '%d:%i:%u:%g:%a:%h' -- "${PUBLIC_BINARY}")" == \
     "${legacy_public_binary_metadata_before}" ]] || \
-    die "failed migration changed the legacy canonical binary inode or metadata"
+    die "failed migration changed the legacy canonical binary inode, metadata, or link count"
   [[ "$(sha256sum "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }')" == \
     "${legacy_public_binary_sha_before}" ]] || \
     die "failed migration changed the legacy canonical binary content"
-  [[ "$(stat -c '%d:%i:%u:%g:%a' -- "${PUBLIC_ALIAS}")" == \
+  [[ "$(stat -c '%d:%i:%u:%g:%a:%h' -- "${PUBLIC_ALIAS}")" == \
     "${legacy_public_alias_metadata_before}" ]] || \
-    die "failed migration changed the legacy alias inode or metadata"
+    die "failed migration changed the legacy alias inode, metadata, or link count"
   [[ "$(sha256sum "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }')" == \
     "${legacy_public_alias_sha_before}" ]] || \
     die "failed migration changed the legacy alias content"
@@ -1423,6 +1426,10 @@ assert_legacy_public_paths_unchanged() {
   [[ "${legacy_public_alias_sha_before}" == \
     "${preexisting_backup_alias_sha_before}" ]] || \
     die "pre-existing alias backup was not bound to the live legacy binary"
+  [[ -z $(compgen -G "${PUBLIC_BINARY}.rollback-anchor.*" || true) ]] || \
+    die "failed migration left a canonical public rollback anchor"
+  [[ -z $(compgen -G "${PUBLIC_ALIAS}.rollback-anchor.*" || true) ]] || \
+    die "failed migration left a compatibility public rollback anchor"
 }
 
 assert_shared_managed_parent_unchanged() {
@@ -1434,10 +1441,17 @@ assert_shared_managed_parent_unchanged() {
 install -o root -g root -m 0755 /usr/bin/sync "${WORK_DIR}/real-sync"
 printf '%s\n' \
   '#!/bin/sh' \
+  "printf 'argc=%s' \"\$#\" >> '${WORK_DIR}/public-sync.argv'" \
+  'for argument in "$@"; do' \
+  "  printf '\\t%s' \"\${argument}\" >> '${WORK_DIR}/public-sync.argv'" \
+  'done' \
+  "printf '\\n' >> '${WORK_DIR}/public-sync.argv'" \
   'if [ "${1:-}" = "-f" ] && [ "${2:-}" = "/usr/local/bin" ]; then' \
-  "  if [ ! -e '${WORK_DIR}/public-sync-failed' ]; then" \
-  "    : > '${WORK_DIR}/public-sync-failed'" \
-  '    exit 74' \
+  "  if [ -L '${PUBLIC_ALIAS}' ] && [ \"\$(readlink -- '${PUBLIC_ALIAS}')\" = '${PUBLIC_BINARY}' ]; then" \
+  "    if [ ! -e '${WORK_DIR}/public-sync-failed' ]; then" \
+  "      : > '${WORK_DIR}/public-sync-failed'" \
+  '      exit 74' \
+  '    fi' \
   '  fi' \
   'fi' \
   "exec '${WORK_DIR}/real-sync' \"\$@\"" \
@@ -1449,7 +1463,40 @@ unshare --mount --propagation private bash -c \
   > "${WORK_DIR}/public-sync-failure.out" 2>&1
 public_sync_status=$?
 set -e
-[[ ${public_sync_status} -eq 74 ]] || die "public-link sync failure injection returned an unexpected status"
+if [[ ${public_sync_status} -ne 74 ]]; then
+  public_sync_marker_state=absent
+  if [[ -f ${WORK_DIR}/public-sync-failed &&
+    ! -L ${WORK_DIR}/public-sync-failed ]]; then
+    public_sync_marker_state=present
+  elif [[ -e ${WORK_DIR}/public-sync-failed ||
+    -L ${WORK_DIR}/public-sync-failed ]]; then
+    public_sync_marker_state=unsafe
+  fi
+  printf '%s\n' \
+    "discord-bot installer integration test: public-link sync failure actual status=${public_sync_status}" >&2
+  printf '%s\n' \
+    "discord-bot installer integration test: public-link sync shim marker=${public_sync_marker_state}" >&2
+  printf '%s\n' \
+    'discord-bot installer integration test: public-link sync shim argv follows:' >&2
+  if [[ -f ${WORK_DIR}/public-sync.argv && ! -L ${WORK_DIR}/public-sync.argv ]]; then
+    while IFS= read -r public_sync_argv_line; do
+      printf '  %s\n' "${public_sync_argv_line}" >&2
+    done < "${WORK_DIR}/public-sync.argv"
+  else
+    printf '  %s\n' '<missing or unsafe>' >&2
+  fi
+  printf '%s\n' \
+    'discord-bot installer integration test: public-link sync installer output follows:' >&2
+  if [[ -f ${WORK_DIR}/public-sync-failure.out &&
+    ! -L ${WORK_DIR}/public-sync-failure.out ]]; then
+    while IFS= read -r public_sync_output_line; do
+      printf '  %s\n' "${public_sync_output_line}" >&2
+    done < "${WORK_DIR}/public-sync-failure.out"
+  else
+    printf '  %s\n' '<missing or unsafe>' >&2
+  fi
+  die "public-link sync failure injection returned an unexpected status"
+fi
 [[ -f ${WORK_DIR}/public-sync-failed ]] || die "public-link sync failure injection did not reach its shim"
 [[ ! -e ${MANAGED_ROOT}/current && ! -L ${MANAGED_ROOT}/current ]] || \
   die "public-link sync failure left current activated"
@@ -1571,6 +1618,10 @@ readonly INSTALL_BACKUP_DIR="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:
   die "canonical public link does not resolve to the verified release"
 [[ $(readlink -f -- "${PUBLIC_ALIAS}") == "${RELEASE_DIR}/bin/autostream-discord-bot" ]] || \
   die "public alias does not resolve to the verified release"
+[[ -z $(compgen -G "${PUBLIC_BINARY}.rollback-anchor.*" || true) ]] || \
+  die "successful migration left a canonical public rollback anchor"
+[[ -z $(compgen -G "${PUBLIC_ALIAS}.rollback-anchor.*" || true) ]] || \
+  die "successful migration left a compatibility public rollback anchor"
 [[ $(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }') == "${env_before}" ]] || \
   die "successful migration changed the existing environment"
 [[ $(sha256sum "${CONFIG_PATH}" | awk 'NR == 1 { print $1 }') == "${config_before}" ]] || \
