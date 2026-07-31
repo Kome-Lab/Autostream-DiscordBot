@@ -678,13 +678,16 @@ func TestDiscordBotInstallerTransactionsPrivilegedHostSetup(t *testing.T) {
 		strings.Contains(installer, "usermod --home") {
 		t.Fatal("service-account rollback must not mutate the created user's GID or home")
 	}
+	if strings.Contains(installer, "for (index =") {
+		t.Fatal("installer awk must not use the reserved index function name as a loop variable")
+	}
 	if strings.Count(
 		installer,
-		`members[index] == service_login || members[index] == rollback_login`,
+		`members[member_index] == service_login || members[member_index] == rollback_login`,
 	) < 2 ||
 		!strings.Contains(
 			installer,
-			`admins[index] == service_login || admins[index] == rollback_login`,
+			`admins[admin_index] == service_login || admins[admin_index] == rollback_login`,
 		) {
 		t.Fatal("service-account transaction must reject both login names in local group and gshadow member fields")
 	}

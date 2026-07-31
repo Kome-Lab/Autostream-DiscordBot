@@ -500,8 +500,8 @@ local_account_member_fields_are_clear() {
     -v rollback_login="${AUTOSTREAM_USER_ROLLBACK_LOGIN}" \
     '{
       count = split($4, members, ",")
-      for (index = 1; index <= count; index++) {
-        if (members[index] == service_login || members[index] == rollback_login) {
+      for (member_index = 1; member_index <= count; member_index++) {
+        if (members[member_index] == service_login || members[member_index] == rollback_login) {
           exit 1
         }
       }
@@ -511,14 +511,14 @@ local_account_member_fields_are_clear() {
     -v rollback_login="${AUTOSTREAM_USER_ROLLBACK_LOGIN}" \
     '{
       admin_count = split($3, admins, ",")
-      for (index = 1; index <= admin_count; index++) {
-        if (admins[index] == service_login || admins[index] == rollback_login) {
+      for (admin_index = 1; admin_index <= admin_count; admin_index++) {
+        if (admins[admin_index] == service_login || admins[admin_index] == rollback_login) {
           exit 1
         }
       }
       member_count = split($4, members, ",")
-      for (index = 1; index <= member_count; index++) {
-        if (members[index] == service_login || members[index] == rollback_login) {
+      for (member_index = 1; member_index <= member_count; member_index++) {
+        if (members[member_index] == service_login || members[member_index] == rollback_login) {
           exit 1
         }
       }
