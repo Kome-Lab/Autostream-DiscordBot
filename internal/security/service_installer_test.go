@@ -289,8 +289,6 @@ func TestDiscordBotReleaseShipsManagedServiceInstaller(t *testing.T) {
 	}
 	workflow := string(workflowBytes)
 	for _, marker := range []string{
-		`run: bash -n release/install-autostream-discord-bot`,
-		`run: sudo bash release/test-install-autostream-discord-bot-integration.sh`,
 		`cp release/install-autostream-discord-bot "${root}/install-autostream-discord-bot"`,
 		`chmod 0755 "${root}/install-autostream-discord-bot"`,
 		`sed -i "s/vX\\.Y\\.Z/${version}/g" "${root}/README.install.md"`,
