@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/cartridge-gg/discordgo"
 	"github.com/example/autostream-discord-bot/internal/audioforward"
 )
 

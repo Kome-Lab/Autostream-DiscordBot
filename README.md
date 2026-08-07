@@ -130,6 +130,16 @@ go test ./...
 go build ./...
 ```
 
+## Linux DAVE build
+
+The production voice binary uses the pinned DiscordGo fork in
+`third_party/discordgo` and its nested `libdave` submodule. Clone with
+recursive submodules; Linux CI and release Actions build the native library
+before running Go tests or producing artifacts. A plain checkout without
+recursive submodules cannot build the production voice binary. Local Windows
+validation is not release proof; use the GitHub-hosted Linux CI job for the
+CGO/libdave build.
+
 ## Deployment
 
 - Docker / Compose: `Dockerfile`、`docker-compose.yml`

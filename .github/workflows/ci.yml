@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -23,5 +25,39 @@ jobs:
       - name: Test installer integration scenarios
         shell: bash
         run: sudo bash release/test-install-autostream-discord-bot-integration.sh
-      - run: go test ./...
-      - run: go build ./...
+      - name: Build pinned libdave for DAVE voice tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ make pkg-config autoconf automake libtool \
+            zip unzip tar
+          git -C third_party/discordgo/dave/libdave/cpp/vcpkg \
+            fetch --unshallow || \
+            git -C third_party/discordgo/dave/libdave/cpp/vcpkg fetch --all --tags
+          make -C third_party/discordgo/dave/libdave/cpp BUILD_TYPE=Release
+      - name: Test Go packages with DAVE-linked DiscordGo
+        shell: bash
+        run: |
+          set -euo pipefail
+          libdave_build="$PWD/third_party/discordgo/dave/libdave/cpp/build"
+          vcpkg_libdir="$(find "$libdave_build/vcpkg_installed" -maxdepth 2 -type d -name lib -print -quit)"
+          test -n "$vcpkg_libdir"
+          vcpkg_libs="$(find "$vcpkg_libdir" -maxdepth 1 -type f -name '*.a' -print | sort | tr '\n' ' ')"
+          CGO_ENABLED=1 \
+          CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
+          CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+            go test -p 1 ./...
+      - name: Build Go packages with DAVE-linked DiscordGo
+        shell: bash
+        run: |
+          set -euo pipefail
+          libdave_build="$PWD/third_party/discordgo/dave/libdave/cpp/build"
+          vcpkg_libdir="$(find "$libdave_build/vcpkg_installed" -maxdepth 2 -type d -name lib -print -quit)"
+          test -n "$vcpkg_libdir"
+          vcpkg_libs="$(find "$vcpkg_libdir" -maxdepth 1 -type f -name '*.a' -print | sort | tr '\n' ' ')"
+          CGO_ENABLED=1 \
+          CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
+          CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+            go build ./...

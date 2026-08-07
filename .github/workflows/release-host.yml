@@ -24,6 +24,7 @@ jobs:
     name: Build Linux host artifacts
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -33,6 +34,28 @@ jobs:
       ARTIFACT_PREFIX: autostream-discord-bot
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Require successful CI for exact release commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ci_runs="${RUNNER_TEMP}/release-ci-runs.json"
+          gh api \
+            --header 'Accept: application/vnd.github+json' \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=100" \
+            > "${ci_runs}"
+          if ! jq -e \
+            --arg sha "${GITHUB_SHA}" \
+            'any(.workflow_runs[]?; .head_sha == $sha and .status == "completed" and .conclusion == "success")' \
+            "${ci_runs}" > /dev/null; then
+            echo "No successful ci.yml run exists for release commit ${GITHUB_SHA}. Run CI for this exact ref before retrying the release." >&2
+            exit 1
+          fi
+          echo "Verified successful ci.yml run for ${GITHUB_SHA}."
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -65,21 +88,6 @@ jobs:
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "push_release=${push_release}" >> "${GITHUB_OUTPUT}"
 
-      - name: Test
-        run: go test ./...
-
-      - name: Validate installer syntax
-        shell: bash
-        run: bash -n release/install-autostream-discord-bot
-
-      - name: Validate installer integration fixture syntax
-        shell: bash
-        run: bash -n release/test-install-autostream-discord-bot-integration.sh
-
-      - name: Test installer integration scenarios
-        shell: bash
-        run: sudo bash release/test-install-autostream-discord-bot-integration.sh
-
       - name: Validate release archive verifier syntax
         shell: bash
         run: |
@@ -89,6 +97,46 @@ jobs:
       - name: Test release archive verifier
         shell: bash
         run: bash .github/scripts/test-verify-release-archive.sh .github/scripts/verify-release-archive.sh
+
+      - name: Build pinned libdave for release architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ make pkg-config autoconf automake libtool \
+            zip unzip tar gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+          vcpkg_dir="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
+          git -C "$vcpkg_dir" fetch --unshallow || git -C "$vcpkg_dir" fetch --all --tags
+          "$vcpkg_dir/bootstrap-vcpkg.sh" -disableMetrics
+          dave_cpp="$PWD/third_party/discordgo/dave/libdave/cpp"
+          for arch in amd64 arm64; do
+            if [[ "$arch" == amd64 ]]; then
+              triplet=x64-linux
+              c_compiler=gcc
+              cxx_compiler=g++
+            else
+              triplet=arm64-linux
+              c_compiler=aarch64-linux-gnu-gcc
+              cxx_compiler=aarch64-linux-gnu-g++
+            fi
+            build_dir="$dave_cpp/build-$arch"
+            cmake -S "$dave_cpp" -B "$build_dir" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DVCPKG_MANIFEST_DIR="$dave_cpp/vcpkg-alts/openssl_3" \
+              -DCMAKE_TOOLCHAIN_FILE="$dave_cpp/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+              -DVCPKG_TARGET_TRIPLET="$triplet" \
+              -DVCPKG_OVERLAY_TRIPLETS="$vcpkg_dir/triplets/community" \
+              -DCMAKE_C_COMPILER="$c_compiler" \
+              -DCMAKE_CXX_COMPILER="$cxx_compiler" \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DENABLE_SANITIZERS=OFF \
+              -DPERSISTENT_KEYS=OFF \
+              -DTESTING=OFF \
+              -DINSTALL_VCPKG_LICENSES=OFF
+            cmake --build "$build_dir" --target libdave --parallel 2
+          done
 
       - name: Package linux artifacts
         shell: bash
@@ -103,7 +151,19 @@ jobs:
             mkdir -p "${root}/bin" "${root}/systemd"
             build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             ldflags="-s -w -X github.com/example/autostream-discord-bot/internal/version.Version=${version} -X github.com/example/autostream-discord-bot/internal/version.Commit=${GITHUB_SHA} -X github.com/example/autostream-discord-bot/internal/version.BuildDate=${build_date}"
-            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o "${root}/bin/${ARTIFACT_PREFIX}" ./cmd/discord-bot
+            if [[ "${arch}" == amd64 ]]; then
+              cc=gcc
+            else
+              cc=aarch64-linux-gnu-gcc
+            fi
+            libdave_build="${PWD}/third_party/discordgo/dave/libdave/cpp/build-${arch}"
+            vcpkg_libdir="$(find "${libdave_build}/vcpkg_installed" -maxdepth 2 -type d -name lib -print -quit)"
+            test -n "${vcpkg_libdir}"
+            vcpkg_libs="$(find "${vcpkg_libdir}" -maxdepth 1 -type f -name '*.a' -print | sort | tr '\n' ' ')"
+            GOOS=linux GOARCH="${arch}" CGO_ENABLED=1 CC="${cc}" \
+              CGO_CFLAGS="-I${PWD}/third_party/discordgo/dave/libdave/cpp/includes" \
+              CGO_LDFLAGS="-L${vcpkg_libdir} ${libdave_build}/libdave.a -Wl,--start-group ${vcpkg_libs} -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+              go build -trimpath -ldflags="${ldflags}" -o "${root}/bin/${ARTIFACT_PREFIX}" ./cmd/discord-bot
             cp "${root}/bin/${ARTIFACT_PREFIX}" "${root}/bin/${SERVICE_NAME}"
             cp .env.example "${root}/.env.example"
             cp systemd/*.service.example "${root}/systemd/"

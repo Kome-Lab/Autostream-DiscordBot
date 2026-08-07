@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/cartridge-gg/discordgo"
 )
 
 func TestDiscordMessageSendDisablesAllAllowedMentions(t *testing.T) {
