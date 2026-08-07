@@ -139,6 +139,31 @@ func main() {
 	}
 	manager.SetReconnectPolicy(reconnectPolicy)
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" && runtimeConfigProvider != nil {
+		manager.SetAutoStartRefresher(func() error {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cfg, err := controlClient.RuntimeConfig(refreshCtx)
+			if err != nil {
+				log.Printf("control panel runtime config refresh for VC auto-start failed: %v", err)
+				return err
+			}
+			applyRuntimeConfigToManager(manager, cfg, reconnectPolicy)
+			return nil
+		})
+	}
+	// Auto-start is driven by Discord VoiceStateUpdate events while no stream
+	// job is active.  RealClient used to open the Gateway only from JoinVoice,
+	// which made VC-join auto-start impossible: the event needed to trigger the
+	// start could never arrive before the start itself.  Keep dry-run mode
+	// disconnected, but establish the real Gateway session during startup so
+	// the bot can observe waiting stream channels.
+	if _, dryRun := voiceClient.(*discordclient.NoopClient); !dryRun {
+		if err := voiceClient.Connect(); err != nil {
+			log.Fatalf("Discord Gateway connection failed: %v", err)
+		}
+		log.Printf("Discord Gateway connected; waiting for VC auto-start events")
+	}
+	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" && runtimeConfigProvider != nil {
 		go runRuntimeConfigRefreshLoop(ctx, controlClient, manager, reconnectPolicyFromEnv(), envDurationDefault("CONTROL_PANEL_RUNTIME_CONFIG_REFRESH_INTERVAL", 30*time.Second))
 	}
 
@@ -340,6 +365,8 @@ func (s controlStreamStarter) StartStream(streamID string) error {
 	err := s.client.StartStream(ctx, streamID)
 	if err != nil {
 		log.Printf("control panel auto-start failed for stream %s: %v", streamID, err)
+	} else {
+		log.Printf("control panel auto-start requested for stream %s", streamID)
 	}
 	return err
 }

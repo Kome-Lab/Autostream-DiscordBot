@@ -223,6 +223,28 @@ func TestVoiceUserJoinedStartsMatchingConfiguredStream(t *testing.T) {
 	}
 }
 
+func TestVoiceUserJoinedRefreshesDefaultsBeforeMatching(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	starter := &fakeStreamStarter{ch: make(chan string, 1)}
+	manager.SetStreamStarter(starter)
+	manager.SetAutoStartRefresher(func() error {
+		manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+			"stream-new": {GuildID: "guild-new", VoiceChannelID: "voice-new", AutoStartEnabled: true},
+		})
+		return nil
+	})
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
+	select {
+	case got := <-starter.ch:
+		if got != "stream-new" {
+			t.Fatalf("unexpected auto-start stream after refresh: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refreshed auto-start")
+	}
+}
+
 func TestVoiceUserJoinedRequiresAutoStartEnabled(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{

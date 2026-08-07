@@ -19,6 +19,9 @@ type Manager struct {
 	streamDefaults       map[string]VoiceDefaults
 	autoStartPending     map[string]time.Time
 	autoStartCooldown    time.Duration
+	autoStartRefresher   func() error
+	autoStartRefreshAt   time.Time
+	autoStartRefreshWait time.Duration
 	reconnectPolicy      ReconnectPolicy
 	reconnectGeneration  int64
 	startedAt            time.Time
@@ -96,6 +99,7 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		streamDefaults:       map[string]VoiceDefaults{},
 		autoStartPending:     map[string]time.Time{},
 		autoStartCooldown:    30 * time.Second,
+		autoStartRefreshWait: 5 * time.Second,
 		notificationReceipts: map[notificationEventKey]*notificationReceipt{},
 	}
 }
@@ -139,6 +143,17 @@ func (m *Manager) SetStreamStarter(starter StreamStarter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.streamStarter = starter
+}
+
+// SetAutoStartRefresher supplies a best-effort runtime-config refresh for a
+// VC join that arrives before a newly-created stream is visible in the
+// manager's cached defaults. The refresher is only invoked when no configured
+// auto-start candidate matches, and it is rate limited by the manager.
+func (m *Manager) SetAutoStartRefresher(refresher func() error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.autoStartRefresher = refresher
+	m.autoStartRefreshAt = time.Time{}
 }
 
 func (m *Manager) SetReconnectPolicy(policy ReconnectPolicy) {
@@ -359,6 +374,26 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 		return
 	}
 	streamID := m.matchingAutoStartStreamLocked(event.GuildID, event.VoiceChannelID)
+	refresher := m.autoStartRefresher
+	shouldRefresh := streamID == "" && refresher != nil && (m.autoStartRefreshWait <= 0 || m.autoStartRefreshAt.IsZero() || now.Sub(m.autoStartRefreshAt) >= m.autoStartRefreshWait)
+	if shouldRefresh {
+		m.autoStartRefreshAt = now
+	}
+	m.mu.Unlock()
+
+	if shouldRefresh {
+		if err := refresher(); err != nil {
+			return
+		}
+		m.mu.Lock()
+		if m.current.StreamID != "" {
+			m.mu.Unlock()
+			return
+		}
+		streamID = m.matchingAutoStartStreamLocked(event.GuildID, event.VoiceChannelID)
+	} else {
+		m.mu.Lock()
+	}
 	if streamID == "" || m.streamStarter == nil {
 		m.mu.Unlock()
 		return
