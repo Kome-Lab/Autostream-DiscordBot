@@ -129,6 +129,8 @@ func main() {
 	manager := jobs.NewManagerWithReporter(voiceClient, buildWorkerReporter())
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		manager.SetStreamStarter(controlStreamStarter{client: controlClient})
+	} else {
+		log.Printf("Discord VC auto-start unavailable: Control Panel URL/token is not configured")
 	}
 	if eventSource, ok := voiceClient.(discordclient.EventSource); ok {
 		eventSource.SetEventSink(manager)
@@ -381,7 +383,7 @@ func logRuntimeConfig(ctx context.Context, client control.Client) (control.Runti
 	for _, profiles := range cfg.Profiles {
 		profileCount += len(profiles)
 	}
-	log.Printf("loaded control panel runtime config for %s: assignments=%d profiles=%d", cfg.Service.ServiceID, len(cfg.Assignments), profileCount)
+	log.Printf("loaded control panel runtime config for %s: assignments=%d profiles=%d stream_discord_configs=%d", cfg.Service.ServiceID, len(cfg.Assignments), profileCount, len(cfg.StreamDiscordConfigs))
 	return cfg, true
 }
 

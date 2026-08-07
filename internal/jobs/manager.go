@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"errors"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,8 @@ type Manager struct {
 	autoStartRefresher   func() error
 	autoStartRefreshAt   time.Time
 	autoStartRefreshWait time.Duration
+	lastAutoStartLogAt   time.Time
+	lastAutoStartLogKey  string
 	reconnectPolicy      ReconnectPolicy
 	reconnectGeneration  int64
 	startedAt            time.Time
@@ -364,7 +367,10 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 }
 
 func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
-	if strings.TrimSpace(event.GuildID) == "" || strings.TrimSpace(event.VoiceChannelID) == "" || strings.TrimSpace(event.UserID) == "" {
+	event.GuildID = strings.TrimSpace(event.GuildID)
+	event.VoiceChannelID = strings.TrimSpace(event.VoiceChannelID)
+	event.UserID = strings.TrimSpace(event.UserID)
+	if event.GuildID == "" || event.VoiceChannelID == "" || event.UserID == "" {
 		return
 	}
 	now := time.Now().UTC()
@@ -383,6 +389,7 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 
 	if shouldRefresh {
 		if err := refresher(); err != nil {
+			log.Printf("Discord VC auto-start runtime config refresh failed for guild=%s voice=%s: %v", event.GuildID, event.VoiceChannelID, err)
 			return
 		}
 		m.mu.Lock()
@@ -394,7 +401,17 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	} else {
 		m.mu.Lock()
 	}
-	if streamID == "" || m.streamStarter == nil {
+	if streamID == "" {
+		if m.shouldLogAutoStartLocked("no-candidate", now) {
+			log.Printf("Discord VC auto-start ignored: no matching waiting stream for guild=%s voice=%s configured_streams=%d", event.GuildID, event.VoiceChannelID, len(m.streamDefaults))
+		}
+		m.mu.Unlock()
+		return
+	}
+	if m.streamStarter == nil {
+		if m.shouldLogAutoStartLocked("starter-missing:"+streamID, now) {
+			log.Printf("Discord VC auto-start unavailable: Control Panel stream starter is not configured for stream=%s (check CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN)", streamID)
+		}
 		m.mu.Unlock()
 		return
 	}
@@ -408,8 +425,19 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	m.mu.Unlock()
 
 	go func() {
-		_ = starter.StartStream(streamID)
+		if err := starter.StartStream(streamID); err != nil {
+			log.Printf("Discord VC auto-start request failed for stream=%s: %v", streamID, err)
+		}
 	}()
+}
+
+func (m *Manager) shouldLogAutoStartLocked(key string, now time.Time) bool {
+	if key == m.lastAutoStartLogKey && !m.lastAutoStartLogAt.IsZero() && now.Sub(m.lastAutoStartLogAt) < 10*time.Second {
+		return false
+	}
+	m.lastAutoStartLogKey = key
+	m.lastAutoStartLogAt = now
+	return true
 }
 
 func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
