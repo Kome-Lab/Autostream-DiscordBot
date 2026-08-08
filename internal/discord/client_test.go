@@ -18,13 +18,16 @@ type fakeEventSink struct {
 	activeStreamID string
 	activeUserID   string
 	voiceJoin      VoiceJoinEvent
+	participants   []ParticipantEvent
 	chatMessage    ChatMessageEvent
 }
 
 func (f *fakeEventSink) VoiceUserJoined(event VoiceJoinEvent) {
 	f.voiceJoin = event
 }
-func (f *fakeEventSink) ParticipantChanged(ParticipantEvent) {}
+func (f *fakeEventSink) ParticipantChanged(event ParticipantEvent) {
+	f.participants = append(f.participants, event)
+}
 func (f *fakeEventSink) ChatMessageReceived(event ChatMessageEvent) {
 	f.chatMessage = event
 }
@@ -509,6 +512,30 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	})
 	if sink.voiceJoin.VoiceChannelID != "voice-01" {
 		t.Fatalf("bot's own voice join should not trigger auto-start event: %#v", sink.voiceJoin)
+	}
+}
+
+func TestOwnVoiceStateJoinDoesNotBecomeParticipant(t *testing.T) {
+	sink := &fakeEventSink{}
+	client := &RealClient{
+		sink: sink,
+		job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	}
+	session := &discordgo.Session{State: discordgo.NewState()}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+
+	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
+		VoiceState: &discordgo.VoiceState{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01"},
+	})
+	if len(sink.participants) != 0 {
+		t.Fatalf("bot voice join must not be reported as a participant: %#v", sink.participants)
+	}
+
+	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
+		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+	})
+	if len(sink.participants) != 1 || sink.participants[0].UserID != "user-01" || !sink.participants[0].Present {
+		t.Fatalf("human voice join was not reported: %#v", sink.participants)
 	}
 }
 

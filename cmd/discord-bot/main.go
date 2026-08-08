@@ -128,7 +128,9 @@ func main() {
 	}
 	manager := jobs.NewManagerWithReporter(voiceClient, buildWorkerReporter())
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
-		manager.SetStreamStarter(controlStreamStarter{client: controlClient})
+		streamController := controlStreamStarter{client: controlClient}
+		manager.SetStreamStarter(streamController)
+		manager.SetStreamStopper(streamController)
 	} else {
 		log.Printf("Discord VC auto-start unavailable: Control Panel URL/token is not configured")
 	}
@@ -305,7 +307,9 @@ func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.M
 				registeredServiceID = cfg.ServiceID
 				state = "registered:" + cfg.ServiceID
 				logRegistrationStateChange(&lastState, state, "registered with control panel as %s", cfg.ServiceID)
-				manager.SetStreamStarter(controlStreamStarter{client: client})
+				streamController := controlStreamStarter{client: client}
+				manager.SetStreamStarter(streamController)
+				manager.SetStreamStopper(streamController)
 				if runtimeCfg, ok := logRuntimeConfig(ctx, client); ok {
 					applyRuntimeConfigToManager(manager, runtimeCfg, fallbackReconnectPolicy)
 				} else if requireRuntimeConfig {
@@ -369,6 +373,18 @@ func (s controlStreamStarter) StartStream(streamID string) error {
 		log.Printf("control panel auto-start failed for stream %s: %v", streamID, err)
 	} else {
 		log.Printf("control panel auto-start requested for stream %s", streamID)
+	}
+	return err
+}
+
+func (s controlStreamStarter) StopStream(streamID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	err := s.client.StopStream(ctx, streamID)
+	if err != nil {
+		log.Printf("control panel auto-stop failed for stream %s: %v", streamID, err)
+	} else {
+		log.Printf("control panel auto-stop requested for stream %s", streamID)
 	}
 	return err
 }

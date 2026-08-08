@@ -44,6 +44,13 @@ type fakeStreamStarter struct {
 	err     error
 }
 
+type fakeStreamStopper struct {
+	mu      sync.Mutex
+	stopped []string
+	ch      chan string
+	err     error
+}
+
 func (f *fakeVoice) Connect() error { return f.err }
 func (f *fakeVoice) JoinVoice(job discord.VoiceJob) error {
 	f.mu.Lock()
@@ -131,6 +138,19 @@ func (f *fakeReporter) ChatMessageReceived(job discord.VoiceJob, message ChatMes
 func (f *fakeStreamStarter) StartStream(streamID string) error {
 	f.mu.Lock()
 	f.started = append(f.started, streamID)
+	f.mu.Unlock()
+	if f.ch != nil {
+		select {
+		case f.ch <- streamID:
+		default:
+		}
+	}
+	return f.err
+}
+
+func (f *fakeStreamStopper) StopStream(streamID string) error {
+	f.mu.Lock()
+	f.stopped = append(f.stopped, streamID)
 	f.mu.Unlock()
 	if f.ch != nil {
 		select {
@@ -340,6 +360,53 @@ func TestParticipantAndActiveSpeakerState(t *testing.T) {
 	status = manager.Status()
 	if status.ParticipantCount != 0 || status.ActiveSpeakerID != "" {
 		t.Fatalf("participant removal did not clear state: %#v", status)
+	}
+}
+
+func TestParticipantLeavingEmptyVCRequestsStreamStopOnce(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.autoStopDelay = 10 * time.Millisecond
+	manager.autoStopCooldown = time.Minute
+	stopper := &fakeStreamStopper{ch: make(chan string, 2)}
+	manager.SetStreamStopper(stopper)
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Present: true})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Present: false})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Present: false})
+
+	select {
+	case got := <-stopper.ch:
+		if got != "stream-01" {
+			t.Fatalf("unexpected auto-stop stream: %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for auto-stop")
+	}
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("duplicate participant leave requested another stop: %q", got)
+	case <-time.After(40 * time.Millisecond):
+	}
+}
+
+func TestParticipantReturningBeforeAutoStopCancelsRequest(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.autoStopDelay = 30 * time.Millisecond
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Present: true})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Present: false})
+	time.Sleep(5 * time.Millisecond)
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Present: true})
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("participant return should cancel auto-stop, got %q", got)
+	case <-time.After(70 * time.Millisecond):
 	}
 }
 

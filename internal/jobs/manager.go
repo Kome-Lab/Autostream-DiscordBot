@@ -14,12 +14,17 @@ type Manager struct {
 	voice                discord.Client
 	reporter             EventReporter
 	streamStarter        StreamStarter
+	streamStopper        StreamStopper
 	mu                   sync.Mutex
 	current              discord.VoiceJob
 	defaults             VoiceDefaults
 	streamDefaults       map[string]VoiceDefaults
 	autoStartPending     map[string]time.Time
+	autoStopPending      map[string]bool
+	autoStopLastAttempt  map[string]time.Time
 	autoStartCooldown    time.Duration
+	autoStopDelay        time.Duration
+	autoStopCooldown     time.Duration
 	autoStartRefresher   func() error
 	autoStartRefreshAt   time.Time
 	autoStartRefreshWait time.Duration
@@ -59,6 +64,10 @@ type EventReporter interface {
 
 type StreamStarter interface {
 	StartStream(streamID string) error
+}
+
+type StreamStopper interface {
+	StopStream(streamID string) error
 }
 
 type Participant struct {
@@ -101,7 +110,11 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		participants:         map[string]Participant{},
 		streamDefaults:       map[string]VoiceDefaults{},
 		autoStartPending:     map[string]time.Time{},
+		autoStopPending:      map[string]bool{},
+		autoStopLastAttempt:  map[string]time.Time{},
 		autoStartCooldown:    30 * time.Second,
+		autoStopDelay:        2 * time.Second,
+		autoStopCooldown:     15 * time.Second,
 		autoStartRefreshWait: 5 * time.Second,
 		notificationReceipts: map[notificationEventKey]*notificationReceipt{},
 	}
@@ -139,6 +152,7 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	m.participants = map[string]Participant{}
 	m.activeSpeaker = ""
 	delete(m.autoStartPending, job.StreamID)
+	delete(m.autoStopPending, job.StreamID)
 	return nil
 }
 
@@ -146,6 +160,12 @@ func (m *Manager) SetStreamStarter(starter StreamStarter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.streamStarter = starter
+}
+
+func (m *Manager) SetStreamStopper(stopper StreamStopper) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.streamStopper = stopper
 }
 
 // SetAutoStartRefresher supplies a best-effort runtime-config refresh for a
@@ -262,6 +282,7 @@ func (m *Manager) Stop(streamID string) error {
 	m.startedAt = time.Time{}
 	m.lastEventAt = time.Now().UTC()
 	m.participants = map[string]Participant{}
+	delete(m.autoStopPending, currentStreamID)
 	m.activeSpeaker = ""
 	return nil
 }
@@ -358,12 +379,50 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 	job := m.current
 	participants := m.participantsSnapshotLocked()
 	reporter := m.reporter
+	stopper := m.streamStopper
+	shouldAutoStop := !event.Present && len(m.participants) == 0 && stopper != nil
+	if event.Present {
+		delete(m.autoStopPending, job.StreamID)
+	}
+	if shouldAutoStop {
+		lastAttempt := m.autoStopLastAttempt[job.StreamID]
+		if m.autoStopPending[job.StreamID] || (!lastAttempt.IsZero() && now.Sub(lastAttempt) < m.autoStopCooldown) {
+			shouldAutoStop = false
+		} else {
+			m.autoStopPending[job.StreamID] = true
+		}
+	}
 	m.mu.Unlock()
 	if reporter != nil {
 		if err := reporter.ParticipantsChanged(job, participants); err != nil {
 			m.recordWorkerPublishFailure()
 		}
 	}
+	if shouldAutoStop {
+		go m.autoStopWhenEmpty(job.StreamID, stopper)
+	}
+}
+
+func (m *Manager) autoStopWhenEmpty(streamID string, stopper StreamStopper) {
+	timer := time.NewTimer(m.autoStopDelay)
+	defer timer.Stop()
+	<-timer.C
+
+	m.mu.Lock()
+	if m.current.StreamID != streamID || len(m.participants) != 0 || m.streamStopper == nil {
+		delete(m.autoStopPending, streamID)
+		m.mu.Unlock()
+		return
+	}
+	m.autoStopLastAttempt[streamID] = time.Now().UTC()
+	m.mu.Unlock()
+
+	if err := stopper.StopStream(streamID); err != nil {
+		log.Printf("Discord VC auto-stop request failed for stream=%s: %v", streamID, err)
+	}
+	m.mu.Lock()
+	delete(m.autoStopPending, streamID)
+	m.mu.Unlock()
 }
 
 func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {

@@ -447,6 +447,11 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	if sink == nil {
 		return
 	}
+	// The bot itself is present in its voice channel, but must never count as
+	// a participant. Counting it prevents the empty-channel auto-stop path.
+	if event.UserID == selfUserID {
+		return
+	}
 	if event.ChannelID == job.VoiceChannelID {
 		sink.ParticipantChanged(ParticipantEvent{
 			StreamID:       job.StreamID,
