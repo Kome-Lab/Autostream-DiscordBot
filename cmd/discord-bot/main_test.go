@@ -264,6 +264,26 @@ func TestApplyRuntimeConfigToManagerDoesNotAutoStartWithoutTrigger(t *testing.T)
 	}
 }
 
+func TestStreamDiscordDefaultsFromRuntimeConfigUsesAssignedPrimaryStream(t *testing.T) {
+	cfg := control.RuntimeConfig{
+		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+		Assignments: []control.StreamServiceAssignment{
+			{StreamID: "stream-successor", ServiceID: "discord-bot-01", ServiceType: control.ServiceType, AssignmentRole: "primary"},
+		},
+		StreamDiscordConfigs: []control.StreamDiscordConfig{
+			// The Panel can transiently include the completed source in a legacy
+			// runtime payload. Its implicit primary role must not override the
+			// authoritative assignment that moved to the successor.
+			{StreamID: "stream-source", AssignmentRole: "primary", GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartTrigger: "discord_voice_join"},
+			{StreamID: "stream-successor", AssignmentRole: "primary", GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartTrigger: "discord_voice_join"},
+		},
+	}
+	defaults := streamDiscordDefaultsFromRuntimeConfig(cfg)
+	if len(defaults) != 1 || !defaults["stream-successor"].AutoStartEnabled {
+		t.Fatalf("runtime defaults must retain only assigned successor: %#v", defaults)
+	}
+}
+
 func TestReconnectPolicyFromRuntimeConfigOverridesFallback(t *testing.T) {
 	cfg := control.RuntimeConfig{
 		Service: control.RegisteredService{ServiceID: "discord-bot-01"},

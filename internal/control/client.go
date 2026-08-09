@@ -28,6 +28,44 @@ type ControlPanelError struct {
 	Code       string
 }
 
+// AutoStopTransportError wraps a transport failure from the Control Panel
+// auto-stop request. It lets the job manager distinguish a retryable network
+// failure from a local configuration or request construction failure.
+type AutoStopTransportError struct {
+	Err error
+}
+
+func (e AutoStopTransportError) Error() string {
+	if e.Err == nil {
+		return "control panel auto-stop transport failure"
+	}
+	return e.Err.Error()
+}
+
+func (e AutoStopTransportError) Unwrap() error {
+	return e.Err
+}
+
+func (AutoStopTransportError) RetryableAutoStop() bool {
+	return true
+}
+
+// AutoStopPendingError means the Control Panel accepted a previous stop
+// request but has not durably completed its downstream mutation yet. The bot
+// must keep its bounded retry sequence alive rather than treating this as a
+// terminal success.
+type AutoStopPendingError struct {
+	StreamID string
+}
+
+func (e AutoStopPendingError) Error() string {
+	return fmt.Sprintf("control panel auto-stop is still pending for stream %s", e.StreamID)
+}
+
+func (AutoStopPendingError) RetryableAutoStop() bool {
+	return true
+}
+
 func (e ControlPanelError) Error() string {
 	if e.Code != "" {
 		return fmt.Sprintf("control panel %s failed with status %d code %s", e.Endpoint, e.StatusCode, e.Code)
@@ -41,6 +79,13 @@ func (e ControlPanelError) Is(target error) bool {
 
 func (e ControlPanelError) ControlPanelCode() string {
 	return e.Code
+}
+
+// RetryableAutoStop reports whether an auto-stop request may be retried
+// without treating a rejected stream state or authorization failure as a
+// transient outage. Only rate limiting and server failures are retryable.
+func (e ControlPanelError) RetryableAutoStop() bool {
+	return e.StatusCode == http.StatusTooManyRequests || (e.StatusCode >= http.StatusInternalServerError && e.StatusCode < 600)
 }
 
 type Config struct {
@@ -332,7 +377,40 @@ func (c Client) StopStream(ctx context.Context, streamID string) error {
 	if streamID == "" {
 		return errors.New("stream_id is required")
 	}
-	return c.post(ctx, "/services/streams/"+url.PathEscape(streamID)+"/stop", map[string]any{})
+	if err := c.Config.Validate(); err != nil {
+		return err
+	}
+	var response struct {
+		AlreadyStopping bool `json:"already_stopping"`
+		AlreadyStopped  bool `json:"already_stopped"`
+	}
+	statusCode, err := c.postOptionalDecode(ctx, "/services/streams/"+url.PathEscape(streamID)+"/stop", map[string]any{}, &response)
+	if err == nil {
+		// A 202 without the explicit terminal receipt can have passed through an
+		// older Panel or a proxy that removed its body. Keep the bounded retry
+		// path alive rather than incorrectly declaring the stop complete.
+		if statusCode == http.StatusAccepted {
+			if response.AlreadyStopped {
+				return nil
+			}
+			return AutoStopPendingError{StreamID: streamID}
+		}
+		if response.AlreadyStopping {
+			return AutoStopPendingError{StreamID: streamID}
+		}
+		if statusCode == http.StatusOK || statusCode == http.StatusNoContent {
+			return nil
+		}
+		// The endpoint does not define any other successful terminal receipt.
+		// Treat an unexpected 2xx as pending so an intermediary cannot silently
+		// turn a possibly still-running stop into a terminal outcome.
+		return AutoStopPendingError{StreamID: streamID}
+	}
+	var controlErr ControlPanelError
+	if errors.As(err, &controlErr) {
+		return err
+	}
+	return AutoStopTransportError{Err: err}
 }
 
 func (c Client) RunHeartbeatLoop(ctx context.Context, currentStreamID func() string, onError func(error)) {
@@ -393,16 +471,25 @@ func (c Client) post(ctx context.Context, endpoint string, payload any) error {
 }
 
 func (c Client) postDecode(ctx context.Context, endpoint string, payload any, out any) error {
+	_, err := c.postDecodeWithOptionalBody(ctx, endpoint, payload, out, false)
+	return err
+}
+
+func (c Client) postOptionalDecode(ctx context.Context, endpoint string, payload any, out any) (int, error) {
+	return c.postDecodeWithOptionalBody(ctx, endpoint, payload, out, true)
+}
+
+func (c Client) postDecodeWithOptionalBody(ctx context.Context, endpoint string, payload any, out any, allowEmptyBody bool) (int, error) {
 	if err := c.Config.Validate(); err != nil {
-		return err
+		return 0, err
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(c.Config.ControlPanelURL, endpoint), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Config.Token)
 	req.Header.Set("Content-Type", "application/json")
@@ -412,16 +499,20 @@ func (c Client) postDecode(ctx context.Context, endpoint string, payload any, ou
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return controlPanelErrorFromResponse(endpoint, res)
+		return res.StatusCode, controlPanelErrorFromResponse(endpoint, res)
 	}
 	if out != nil {
-		return json.NewDecoder(res.Body).Decode(out)
+		err := json.NewDecoder(res.Body).Decode(out)
+		if allowEmptyBody && errors.Is(err, io.EOF) {
+			return res.StatusCode, nil
+		}
+		return res.StatusCode, err
 	}
-	return nil
+	return res.StatusCode, nil
 }
 
 func controlPanelErrorFromResponse(endpoint string, res *http.Response) error {

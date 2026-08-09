@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,6 +13,12 @@ import (
 
 	"github.com/example/autostream-discord-bot/internal/version"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func TestRegisterPostsServiceRegistration(t *testing.T) {
 	var gotAuth string
@@ -216,6 +223,92 @@ func TestStartStreamPostsServiceStartRequest(t *testing.T) {
 	}
 }
 
+func TestStopStreamTreatsAlreadyStoppedAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services/streams/stream-01/stop" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"already_stopped":true}`))
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}}
+	if err := client.StopStream(t.Context(), "stream-01"); err != nil {
+		t.Fatalf("already stopped response must be terminal success, got %v", err)
+	}
+}
+
+func TestStopStreamTreatsAlreadyStoppingAsRetryablePending(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services/streams/stream-01/stop" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"already_stopping":true}`))
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}}
+	err := client.StopStream(t.Context(), "stream-01")
+	var pending AutoStopPendingError
+	if !errors.As(err, &pending) || !pending.RetryableAutoStop() {
+		t.Fatalf("already stopping response must be retryable pending, got %T %v", err, err)
+	}
+	if pending.StreamID != "stream-01" {
+		t.Fatalf("pending stream id = %q, want stream-01", pending.StreamID)
+	}
+}
+
+func TestStopStreamTreatsAmbiguousAcceptedResponseAsRetryablePending(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ""},
+		{name: "unknown body", body: `{}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/services/streams/stream-01/stop" {
+					t.Fatalf("unexpected path: %s", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}}
+			err := client.StopStream(t.Context(), "stream-01")
+			var pending AutoStopPendingError
+			if !errors.As(err, &pending) || !pending.RetryableAutoStop() {
+				t.Fatalf("ambiguous accepted response must remain pending, got %T %v", err, err)
+			}
+		})
+	}
+}
+
+func TestStopStreamTreatsUnexpectedSuccessfulReceiptAsRetryablePending(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services/streams/stream-01/stop" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"}}
+	err := client.StopStream(t.Context(), "stream-01")
+	var pending AutoStopPendingError
+	if !errors.As(err, &pending) || !pending.RetryableAutoStop() {
+		t.Fatalf("unexpected successful receipt must remain pending, got %T %v", err, err)
+	}
+}
+
 func TestStopStreamPostsServiceStopRequest(t *testing.T) {
 	var gotAuth string
 	var gotBody map[string]any
@@ -240,6 +333,102 @@ func TestStopStreamPostsServiceStopRequest(t *testing.T) {
 	}
 	if len(gotBody) != 0 {
 		t.Fatalf("auto-stop request should not send stream overrides: %#v", gotBody)
+	}
+}
+
+func TestControlPanelErrorClassifiesAutoStopRetryability(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		want       bool
+	}{
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, want: true},
+		{name: "bad gateway", statusCode: http.StatusBadGateway, want: true},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, want: true},
+		{name: "bad request", statusCode: http.StatusBadRequest, want: false},
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, want: false},
+		{name: "forbidden", statusCode: http.StatusForbidden, want: false},
+		{name: "not found", statusCode: http.StatusNotFound, want: false},
+		{name: "conflict", statusCode: http.StatusConflict, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (ControlPanelError{StatusCode: tt.statusCode}).RetryableAutoStop(); got != tt.want {
+				t.Fatalf("RetryableAutoStop() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStopStreamWrapsTransportFailureForAutoStopRetry(t *testing.T) {
+	transportErr := errors.New("connection reset")
+	client := Client{
+		Config: Config{
+			ControlPanelURL:  "https://panel.example.com",
+			Token:            "secret-token",
+			ServiceID:        "bot-01",
+			ServiceName:      "Discord 01",
+			ServicePublicURL: "https://discord.example.com",
+		},
+		HTTP: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, transportErr
+		})},
+	}
+
+	err := client.StopStream(t.Context(), "stream-01")
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("StopStream() error = %v, want wrapped transport error", err)
+	}
+	var retryable AutoStopTransportError
+	if !errors.As(err, &retryable) || !retryable.RetryableAutoStop() {
+		t.Fatalf("StopStream() error was not marked retryable for auto-stop: %T %v", err, err)
+	}
+}
+
+func TestStopStreamPropagatesContextCancellationToHTTP(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	requestCanceled := make(chan struct{}, 1)
+	client := Client{
+		Config: Config{ControlPanelURL: "https://panel.example.com", Token: "secret-token", ServiceID: "bot-01", ServiceName: "Discord 01", ServicePublicURL: "https://discord.example.com"},
+		HTTP: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+			select {
+			case requestCanceled <- struct{}{}:
+			default:
+			}
+			return nil, r.Context().Err()
+		})},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.StopStream(ctx, "stream-01")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("stop request did not reach the Control Panel")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StopStream() error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StopStream did not return after cancellation")
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Control Panel request context was not canceled")
 	}
 }
 

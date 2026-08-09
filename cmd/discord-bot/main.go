@@ -378,10 +378,17 @@ func (s controlStreamStarter) StartStream(streamID string) error {
 }
 
 func (s controlStreamStarter) StopStream(streamID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	return s.StopStreamContext(context.Background(), streamID)
+}
+
+func (s controlStreamStarter) StopStreamContext(ctx context.Context, streamID string) error {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	err := s.client.StopStream(ctx, streamID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		log.Printf("control panel auto-stop failed for stream %s: %v", streamID, err)
 	} else {
 		log.Printf("control panel auto-stop requested for stream %s", streamID)
@@ -464,11 +471,19 @@ func reconnectPolicyFromRuntimeConfig(cfg control.RuntimeConfig, fallback jobs.R
 
 func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[string]jobs.VoiceDefaults {
 	defaults := map[string]jobs.VoiceDefaults{}
+	assignedPrimaryStreams, hasDiscordAssignment := primaryDiscordAssignmentStreams(cfg)
 	for _, item := range cfg.StreamDiscordConfigs {
 		if item.StreamID == "" {
 			continue
 		}
 		if item.AssignmentRole != "primary" {
+			continue
+		}
+		// Older Panel payloads can include historical streams with an implicit
+		// primary role. Once this Bot has an explicit assignment, accept only
+		// that authoritative primary stream so a completed source cannot mask
+		// its rearmed successor.
+		if hasDiscordAssignment && !assignedPrimaryStreams[item.StreamID] {
 			continue
 		}
 		defaults[item.StreamID] = jobs.VoiceDefaults{
@@ -479,6 +494,28 @@ func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[strin
 		}
 	}
 	return defaults
+}
+
+func primaryDiscordAssignmentStreams(cfg control.RuntimeConfig) (map[string]bool, bool) {
+	streams := map[string]bool{}
+	serviceID := strings.TrimSpace(cfg.Service.ServiceID)
+	if serviceID == "" {
+		return streams, false
+	}
+	hasDiscordAssignment := false
+	for _, assignment := range cfg.Assignments {
+		if strings.TrimSpace(assignment.ServiceID) != serviceID {
+			continue
+		}
+		if serviceType := strings.TrimSpace(assignment.ServiceType); serviceType != "" && serviceType != control.ServiceType {
+			continue
+		}
+		hasDiscordAssignment = true
+		if role := strings.TrimSpace(assignment.AssignmentRole); role == "" || role == "primary" {
+			streams[strings.TrimSpace(assignment.StreamID)] = true
+		}
+	}
+	return streams, hasDiscordAssignment
 }
 
 func discordBotTokenSecretNameFromRuntimeConfig(cfg control.RuntimeConfig) string {

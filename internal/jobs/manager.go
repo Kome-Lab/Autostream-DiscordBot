@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"log"
 	"strings"
@@ -21,9 +22,17 @@ type Manager struct {
 	streamDefaults       map[string]VoiceDefaults
 	autoStartPending     map[string]time.Time
 	autoStopPending      map[string]bool
+	autoStopGeneration   map[string]uint64
+	autoStopAttempts     map[string]int
+	autoStopInFlight     map[string]autoStopInFlight
 	autoStopLastAttempt  map[string]time.Time
+	rejoinIntents        map[string]autoStopRejoinIntent
+	rejoinIntentSequence uint64
+	rejoinReconcileRun   map[string]bool
+	rejoinReconcileDelay []time.Duration
 	autoStartCooldown    time.Duration
 	autoStopDelay        time.Duration
+	autoStopRetryDelays  []time.Duration
 	autoStopCooldown     time.Duration
 	autoStartRefresher   func() error
 	autoStartRefreshAt   time.Time
@@ -70,6 +79,30 @@ type StreamStopper interface {
 	StopStream(streamID string) error
 }
 
+// ContextStreamStopper lets VC-empty auto-stop cancel an in-flight external
+// request when a participant returns. StreamStopper remains supported for
+// callers that do not make a cancelable request.
+type ContextStreamStopper interface {
+	StopStreamContext(ctx context.Context, streamID string) error
+}
+
+type autoStopInFlight struct {
+	generation uint64
+	cancel     context.CancelFunc
+	job        discord.VoiceJob
+}
+
+// autoStopRejoinIntent records a Discord VC join that happened while the
+// empty-channel stop request was pending. A Panel stop can race with its
+// cancellation, so this intent is retained until the freshly rearmed waiting
+// stream can be reconciled or a bounded retry window proves it is not needed.
+type autoStopRejoinIntent struct {
+	GuildID        string
+	VoiceChannelID string
+	SourceStreamID string
+	Sequence       uint64
+}
+
 type Participant struct {
 	UserID   string    `json:"user_id"`
 	Username string    `json:"username,omitempty"`
@@ -105,15 +138,26 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		voice = &discord.NoopClient{}
 	}
 	return &Manager{
-		voice:                voice,
-		reporter:             reporter,
-		participants:         map[string]Participant{},
-		streamDefaults:       map[string]VoiceDefaults{},
-		autoStartPending:     map[string]time.Time{},
-		autoStopPending:      map[string]bool{},
-		autoStopLastAttempt:  map[string]time.Time{},
+		voice:               voice,
+		reporter:            reporter,
+		participants:        map[string]Participant{},
+		streamDefaults:      map[string]VoiceDefaults{},
+		autoStartPending:    map[string]time.Time{},
+		autoStopPending:     map[string]bool{},
+		autoStopGeneration:  map[string]uint64{},
+		autoStopAttempts:    map[string]int{},
+		autoStopInFlight:    map[string]autoStopInFlight{},
+		autoStopLastAttempt: map[string]time.Time{},
+		rejoinIntents:       map[string]autoStopRejoinIntent{},
+		rejoinReconcileRun:  map[string]bool{},
+		// The Panel stops Bot, Encoder, and Worker in sequence (each service
+		// call may take its bounded timeout) before it persists a newly rearmed
+		// waiting stream. Keep a deliberately bounded, but operationally wider,
+		// reconciliation window so a VC rejoin is not lost in that gap.
+		rejoinReconcileDelay: []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second},
 		autoStartCooldown:    30 * time.Second,
 		autoStopDelay:        2 * time.Second,
+		autoStopRetryDelays:  []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second},
 		autoStopCooldown:     15 * time.Second,
 		autoStartRefreshWait: 5 * time.Second,
 		notificationReceipts: map[notificationEventKey]*notificationReceipt{},
@@ -136,6 +180,7 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 		m.mu.Unlock()
 		return errors.New("another stream job is already active")
 	}
+	m.cancelAutoStopLocked(job.StreamID)
 	m.mu.Unlock()
 
 	if err := m.voice.JoinVoice(job); err != nil {
@@ -152,7 +197,6 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	m.participants = map[string]Participant{}
 	m.activeSpeaker = ""
 	delete(m.autoStartPending, job.StreamID)
-	delete(m.autoStopPending, job.StreamID)
 	return nil
 }
 
@@ -170,8 +214,9 @@ func (m *Manager) SetStreamStopper(stopper StreamStopper) {
 
 // SetAutoStartRefresher supplies a best-effort runtime-config refresh for a
 // VC join that arrives before a newly-created stream is visible in the
-// manager's cached defaults. The refresher is only invoked when no configured
-// auto-start candidate matches, and it is rate limited by the manager.
+// manager's cached defaults, including the bounded reconciliation after a
+// canceled auto-stop. Ordinary no-candidate joins rate limit this refresh;
+// rejoin reconciliation intentionally polls within its own bounded window.
 func (m *Manager) SetAutoStartRefresher(refresher func() error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -269,6 +314,12 @@ func (m *Manager) Stop(streamID string) error {
 		m.mu.Unlock()
 		return errors.New("stream_id does not match current job")
 	}
+	// This method is called by the Control Panel while it is servicing the
+	// outbound auto-stop request. Do not cancel that request here: canceling its
+	// client context can cancel the Panel handler before it dispatches the
+	// Encoder/Worker stops and creates the successor waiting stream. Participant
+	// rejoin paths still use cancelAutoStopLocked to abort a stale request.
+	m.invalidateAutoStopLocked(currentStreamID)
 	m.mu.Unlock()
 
 	if err := m.voice.LeaveVoice(currentStreamID); err != nil {
@@ -282,7 +333,6 @@ func (m *Manager) Stop(streamID string) error {
 	m.startedAt = time.Time{}
 	m.lastEventAt = time.Now().UTC()
 	m.participants = map[string]Participant{}
-	delete(m.autoStopPending, currentStreamID)
 	m.activeSpeaker = ""
 	return nil
 }
@@ -381,8 +431,12 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 	reporter := m.reporter
 	stopper := m.streamStopper
 	shouldAutoStop := !event.Present && len(m.participants) == 0 && stopper != nil
+	var autoStopGeneration uint64
 	if event.Present {
-		delete(m.autoStopPending, job.StreamID)
+		if m.hasAutoStopInFlightLocked(job.StreamID) {
+			m.recordAutoStopRejoinIntentLocked(job.StreamID, firstNonEmptyTrimmed(event.GuildID, job.GuildID), firstNonEmptyTrimmed(event.VoiceChannelID, job.VoiceChannelID))
+		}
+		m.cancelAutoStopLocked(job.StreamID)
 	}
 	if shouldAutoStop {
 		lastAttempt := m.autoStopLastAttempt[job.StreamID]
@@ -390,6 +444,9 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 			shouldAutoStop = false
 		} else {
 			m.autoStopPending[job.StreamID] = true
+			m.autoStopGeneration[job.StreamID]++
+			autoStopGeneration = m.autoStopGeneration[job.StreamID]
+			m.autoStopAttempts[job.StreamID] = 0
 		}
 	}
 	m.mu.Unlock()
@@ -399,30 +456,328 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 		}
 	}
 	if shouldAutoStop {
-		go m.autoStopWhenEmpty(job.StreamID, stopper)
+		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
 	}
 }
 
-func (m *Manager) autoStopWhenEmpty(streamID string, stopper StreamStopper) {
-	timer := time.NewTimer(m.autoStopDelay)
+func (m *Manager) autoStopWhenEmpty(streamID string, generation uint64, stopper StreamStopper, delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	<-timer.C
 
 	m.mu.Lock()
-	if m.current.StreamID != streamID || len(m.participants) != 0 || m.streamStopper == nil {
-		delete(m.autoStopPending, streamID)
+	if !m.autoStopStillValidLocked(streamID, generation) {
 		m.mu.Unlock()
 		return
 	}
 	m.autoStopLastAttempt[streamID] = time.Now().UTC()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.autoStopInFlight[streamID] = autoStopInFlight{generation: generation, cancel: cancel, job: m.current}
 	m.mu.Unlock()
 
-	if err := stopper.StopStream(streamID); err != nil {
+	err := stopStreamWithContext(ctx, stopper, streamID)
+	m.mu.Lock()
+	m.clearAutoStopInFlightLocked(streamID, generation)
+	stillValid := m.autoStopStillValidLocked(streamID, generation)
+	reconcileRejoin := !stillValid && m.hasAutoStopRejoinIntentForStreamLocked(streamID)
+	m.mu.Unlock()
+	if reconcileRejoin {
+		m.scheduleAutoStopRejoinReconciliation(streamID)
+	}
+	if err != nil {
+		if !stillValid {
+			return
+		}
 		log.Printf("Discord VC auto-stop request failed for stream=%s: %v", streamID, err)
+		m.scheduleAutoStopRetry(streamID, generation, stopper, err)
+		return
+	}
+	if !stillValid {
+		return
 	}
 	m.mu.Lock()
-	delete(m.autoStopPending, streamID)
+	m.finishAutoStopLocked(streamID, generation)
 	m.mu.Unlock()
+}
+
+func stopStreamWithContext(ctx context.Context, stopper StreamStopper, streamID string) error {
+	if contextual, ok := stopper.(ContextStreamStopper); ok {
+		return contextual.StopStreamContext(ctx, streamID)
+	}
+	return stopper.StopStream(streamID)
+}
+
+func (m *Manager) scheduleAutoStopRetry(streamID string, generation uint64, stopper StreamStopper, err error) {
+	if !shouldRetryAutoStop(err) {
+		m.mu.Lock()
+		m.finishAutoStopLocked(streamID, generation)
+		m.mu.Unlock()
+		return
+	}
+
+	m.mu.Lock()
+	if !m.autoStopStillValidLocked(streamID, generation) {
+		m.mu.Unlock()
+		return
+	}
+	attempt := m.autoStopAttempts[streamID]
+	if attempt >= len(m.autoStopRetryDelays) {
+		m.finishAutoStopLocked(streamID, generation)
+		m.mu.Unlock()
+		log.Printf("Discord VC auto-stop exhausted retries for stream=%s", streamID)
+		return
+	}
+	delay := m.autoStopRetryDelays[attempt]
+	m.autoStopAttempts[streamID] = attempt + 1
+	m.mu.Unlock()
+
+	log.Printf("Discord VC auto-stop retry scheduled for stream=%s attempt=%d delay=%s", streamID, attempt+1, delay)
+	go m.autoStopWhenEmpty(streamID, generation, stopper, delay)
+}
+
+func (m *Manager) autoStopStillValidLocked(streamID string, generation uint64) bool {
+	return m.autoStopGeneration[streamID] == generation &&
+		m.autoStopPending[streamID] &&
+		m.current.StreamID == streamID &&
+		len(m.participants) == 0 &&
+		m.streamStopper != nil
+}
+
+func (m *Manager) finishAutoStopLocked(streamID string, generation uint64) {
+	m.clearAutoStopInFlightLocked(streamID, generation)
+	if m.autoStopGeneration[streamID] != generation {
+		return
+	}
+	delete(m.autoStopPending, streamID)
+	delete(m.autoStopAttempts, streamID)
+}
+
+func (m *Manager) cancelAutoStopLocked(streamID string) {
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return
+	}
+	if request, ok := m.autoStopInFlight[streamID]; ok {
+		request.cancel()
+		delete(m.autoStopInFlight, streamID)
+	}
+	m.invalidateAutoStopLocked(streamID)
+}
+
+// invalidateAutoStopLocked prevents timers and retries from remaining valid
+// without canceling a possibly active Control Panel request. This is used by
+// the inbound Panel stop callback so it cannot tear down its own parent
+// request before the rest of the service stop/rearm transaction completes.
+func (m *Manager) invalidateAutoStopLocked(streamID string) {
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return
+	}
+	m.autoStopGeneration[streamID]++
+	delete(m.autoStopPending, streamID)
+	delete(m.autoStopAttempts, streamID)
+	delete(m.autoStopLastAttempt, streamID)
+}
+
+func (m *Manager) hasPendingAutoStopLocked(streamID string) bool {
+	if m.autoStopPending[streamID] {
+		return true
+	}
+	return m.hasAutoStopInFlightLocked(streamID)
+}
+
+func (m *Manager) hasAutoStopInFlightLocked(streamID string) bool {
+	_, inFlight := m.autoStopInFlight[streamID]
+	return inFlight
+}
+
+// inFlightAutoStopStreamForVoiceLocked finds the still-unanswered outbound
+// auto-stop request that owns a VC. The current job may already be empty
+// because the Panel has called this Bot's /stop endpoint while it continues
+// dispatching Encoder/Worker and rearming the successor. Do not guess when
+// more than one stale request claims the same VC.
+func (m *Manager) inFlightAutoStopStreamForVoiceLocked(guildID, voiceChannelID string) string {
+	guildID = strings.TrimSpace(guildID)
+	voiceChannelID = strings.TrimSpace(voiceChannelID)
+	if guildID == "" || voiceChannelID == "" {
+		return ""
+	}
+	matched := ""
+	for streamID, request := range m.autoStopInFlight {
+		if request.job.GuildID != guildID || request.job.VoiceChannelID != voiceChannelID {
+			continue
+		}
+		if matched != "" && matched != streamID {
+			return ""
+		}
+		matched = streamID
+	}
+	return matched
+}
+
+func (m *Manager) recordAutoStopRejoinIntentLocked(sourceStreamID, guildID, voiceChannelID string) {
+	sourceStreamID = strings.TrimSpace(sourceStreamID)
+	guildID = strings.TrimSpace(guildID)
+	voiceChannelID = strings.TrimSpace(voiceChannelID)
+	if sourceStreamID == "" || guildID == "" || voiceChannelID == "" {
+		return
+	}
+	key := autoStopRejoinIntentKey(guildID, voiceChannelID)
+	if existing, ok := m.rejoinIntents[key]; ok && existing.SourceStreamID == sourceStreamID {
+		return
+	}
+	m.rejoinIntentSequence++
+	m.rejoinIntents[key] = autoStopRejoinIntent{
+		GuildID:        guildID,
+		VoiceChannelID: voiceChannelID,
+		SourceStreamID: sourceStreamID,
+		Sequence:       m.rejoinIntentSequence,
+	}
+}
+
+func autoStopRejoinIntentKey(guildID, voiceChannelID string) string {
+	return strings.TrimSpace(guildID) + "\x00" + strings.TrimSpace(voiceChannelID)
+}
+
+func firstNonEmptyTrimmed(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (m *Manager) autoStopRejoinIntentForStreamLocked(streamID string) (string, autoStopRejoinIntent, bool) {
+	streamID = strings.TrimSpace(streamID)
+	for key, intent := range m.rejoinIntents {
+		if intent.SourceStreamID == streamID {
+			return key, intent, true
+		}
+	}
+	return "", autoStopRejoinIntent{}, false
+}
+
+func (m *Manager) hasAutoStopRejoinIntentForStreamLocked(streamID string) bool {
+	_, _, ok := m.autoStopRejoinIntentForStreamLocked(streamID)
+	return ok
+}
+
+func (m *Manager) scheduleAutoStopRejoinReconciliation(streamID string) {
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return
+	}
+	m.mu.Lock()
+	if !m.hasAutoStopRejoinIntentForStreamLocked(streamID) || m.rejoinReconcileRun[streamID] {
+		m.mu.Unlock()
+		return
+	}
+	m.rejoinReconcileRun[streamID] = true
+	m.mu.Unlock()
+	go m.reconcileAutoStopRejoin(streamID)
+}
+
+func (m *Manager) reconcileAutoStopRejoin(sourceStreamID string) {
+	defer func() {
+		m.mu.Lock()
+		delete(m.rejoinReconcileRun, sourceStreamID)
+		m.mu.Unlock()
+	}()
+
+	m.mu.Lock()
+	delays := append([]time.Duration(nil), m.rejoinReconcileDelay...)
+	m.mu.Unlock()
+	for _, delay := range delays {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			<-timer.C
+		}
+
+		m.mu.Lock()
+		key, intent, ok := m.autoStopRejoinIntentForStreamLocked(sourceStreamID)
+		refresher := m.autoStartRefresher
+		m.mu.Unlock()
+		if !ok {
+			return
+		}
+		if refresher != nil {
+			if err := refresher(); err != nil {
+				log.Printf("Discord VC auto-stop rejoin runtime config refresh failed for stream=%s: %v", sourceStreamID, err)
+				continue
+			}
+		}
+
+		m.mu.Lock()
+		currentKey, currentIntent, stillCurrent := m.autoStopRejoinIntentForStreamLocked(sourceStreamID)
+		if !stillCurrent || currentKey != key || currentIntent.Sequence != intent.Sequence {
+			m.mu.Unlock()
+			return
+		}
+		if m.current.StreamID != "" {
+			if m.current.StreamID != sourceStreamID {
+				delete(m.rejoinIntents, key)
+				m.mu.Unlock()
+				return
+			}
+			m.mu.Unlock()
+			continue
+		}
+		successor := m.matchingAutoStartSuccessorLocked(intent.GuildID, intent.VoiceChannelID, sourceStreamID)
+		if successor == "" || m.streamStarter == nil {
+			m.mu.Unlock()
+			continue
+		}
+		now := time.Now().UTC()
+		if last, pending := m.autoStartPending[successor]; pending && now.Sub(last) < m.autoStartCooldown {
+			delete(m.rejoinIntents, key)
+			m.mu.Unlock()
+			return
+		}
+		m.autoStartPending[successor] = now
+		m.lastEventAt = now
+		starter := m.streamStarter
+		delete(m.rejoinIntents, key)
+		m.mu.Unlock()
+
+		go func() {
+			if err := starter.StartStream(successor); err != nil {
+				log.Printf("Discord VC auto-stop rejoin request failed for stream=%s: %v", successor, err)
+			}
+		}()
+		return
+	}
+
+	m.mu.Lock()
+	if key, intent, ok := m.autoStopRejoinIntentForStreamLocked(sourceStreamID); ok {
+		delete(m.rejoinIntents, key)
+		log.Printf("Discord VC auto-stop rejoin reconciliation exhausted for stream=%s guild=%s voice=%s", sourceStreamID, intent.GuildID, intent.VoiceChannelID)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) clearAutoStopInFlightLocked(streamID string, generation uint64) {
+	request, ok := m.autoStopInFlight[streamID]
+	if !ok || request.generation != generation {
+		return
+	}
+	request.cancel()
+	delete(m.autoStopInFlight, streamID)
+}
+
+type autoStopRetryability interface {
+	RetryableAutoStop() bool
+}
+
+func shouldRetryAutoStop(err error) bool {
+	var classified autoStopRetryability
+	if errors.As(err, &classified) {
+		return classified.RetryableAutoStop()
+	}
+	return false
 }
 
 func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
@@ -435,6 +790,20 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	now := time.Now().UTC()
 	m.mu.Lock()
 	if m.current.StreamID != "" {
+		current := m.current
+		if current.GuildID == event.GuildID && current.VoiceChannelID == event.VoiceChannelID && m.hasAutoStopInFlightLocked(current.StreamID) {
+			m.recordAutoStopRejoinIntentLocked(current.StreamID, event.GuildID, event.VoiceChannelID)
+			m.cancelAutoStopLocked(current.StreamID)
+		}
+		m.mu.Unlock()
+		return
+	}
+	if sourceStreamID := m.inFlightAutoStopStreamForVoiceLocked(event.GuildID, event.VoiceChannelID); sourceStreamID != "" {
+		// The Panel has already called our local /stop endpoint, so canceling
+		// the parent request at this point can interrupt its remaining service
+		// dispatch. Retain the rejoin intent and wait for that request to return
+		// after the successor has been rearmed instead.
+		m.recordAutoStopRejoinIntentLocked(sourceStreamID, event.GuildID, event.VoiceChannelID)
 		m.mu.Unlock()
 		return
 	}
@@ -552,6 +921,29 @@ func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) 
 			continue
 		}
 		if defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {
+			continue
+		}
+		if matched != "" {
+			return ""
+		}
+		matched = streamID
+	}
+	return matched
+}
+
+// matchingAutoStartSuccessorLocked selects only a newly rearmed candidate for
+// a recorded auto-stop source. It deliberately rejects ambiguity instead of
+// guessing between historical stream rows that share a Discord VC.
+func (m *Manager) matchingAutoStartSuccessorLocked(guildID, voiceChannelID, sourceStreamID string) string {
+	guildID = strings.TrimSpace(guildID)
+	voiceChannelID = strings.TrimSpace(voiceChannelID)
+	sourceStreamID = strings.TrimSpace(sourceStreamID)
+	if guildID == "" || voiceChannelID == "" || sourceStreamID == "" {
+		return ""
+	}
+	matched := ""
+	for streamID, defaults := range m.streamDefaults {
+		if streamID == sourceStreamID || !defaults.AutoStartEnabled || defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {
 			continue
 		}
 		if matched != "" {
