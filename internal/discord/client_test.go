@@ -522,6 +522,24 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	if sink.voiceJoin.VoiceChannelID != "voice-01" {
 		t.Fatalf("bot's own voice join should not trigger auto-start event: %#v", sink.voiceJoin)
 	}
+
+	// A real gateway session already knows the guild even when the joining user
+	// is not in its cached VoiceStates yet (and this can also happen briefly
+	// during a guild rebuild). Waiting for the cache to agree would drop the
+	// only event that can trigger the waiting stream.
+	knownGuildSink := &fakeEventSink{}
+	knownGuildClient := &RealClient{sink: knownGuildSink}
+	knownGuildSession := &discordgo.Session{State: discordgo.NewState()}
+	knownGuildSession.State.User = &discordgo.User{ID: "bot-01"}
+	if err := knownGuildSession.State.GuildAdd(&discordgo.Guild{ID: "guild-01"}); err != nil {
+		t.Fatal(err)
+	}
+	knownGuildClient.onVoiceStateUpdate(knownGuildSession, &discordgo.VoiceStateUpdate{
+		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+	})
+	if knownGuildSink.voiceJoin.UserID != "user-01" {
+		t.Fatalf("join in a known guild with a cold VoiceStates cache must trigger auto-start: %#v", knownGuildSink.voiceJoin)
+	}
 }
 
 func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {

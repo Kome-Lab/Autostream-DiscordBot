@@ -489,7 +489,14 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	sink := c.sink
 	c.mu.Unlock()
 	selfUserID := sessionUserID(session)
-	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && (!currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID) {
+	// While no job is active, this event is the auto-start trigger itself. The
+	// DiscordGo state cache can still be one update behind (or briefly omit the
+	// user while a guild is being rebuilt), so do not discard a real join just
+	// because the snapshot is non-authoritative at this point. Once a job is
+	// active, retain the current-state fence so delayed joins cannot resurrect a
+	// participant that has already left.
+	currentStateAcceptsJoin := job.StreamID == "" || !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
+	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && currentStateAcceptsJoin {
 		sink.VoiceUserJoined(VoiceJoinEvent{
 			GuildID:        event.GuildID,
 			VoiceChannelID: event.ChannelID,
