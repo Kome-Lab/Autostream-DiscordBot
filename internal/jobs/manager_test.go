@@ -26,6 +26,12 @@ type fakeVoice struct {
 	sendRelease   chan struct{}
 }
 
+type snapshotVoice struct {
+	fakeVoice
+	snapshot discord.ParticipantSnapshot
+	known    bool
+}
+
 type fakeReporter struct {
 	participantStreamID string
 	participants        []Participant
@@ -142,6 +148,23 @@ func (f *fakeVoice) Status() discord.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.status
+}
+
+func (f *snapshotVoice) SnapshotVoiceParticipants(job discord.VoiceJob) (discord.ParticipantSnapshot, bool) {
+	if !f.known {
+		return discord.ParticipantSnapshot{}, false
+	}
+	snapshot := f.snapshot
+	if snapshot.StreamID == "" {
+		snapshot.StreamID = job.StreamID
+	}
+	if snapshot.GuildID == "" {
+		snapshot.GuildID = job.GuildID
+	}
+	if snapshot.VoiceChannelID == "" {
+		snapshot.VoiceChannelID = job.VoiceChannelID
+	}
+	return snapshot, true
 }
 
 func (f *fakeReporter) ParticipantsChanged(job discord.VoiceJob, participants []Participant) error {
@@ -514,6 +537,159 @@ func TestParticipantLeavingEmptyVCRequestsStreamStopOnce(t *testing.T) {
 	case got := <-stopper.ch:
 		t.Fatalf("duplicate participant leave requested another stop: %q", got)
 	case <-time.After(40 * time.Millisecond):
+	}
+}
+
+func TestStartHydratesExistingVoiceParticipantsBeforeLeave(t *testing.T) {
+	voice := &snapshotVoice{
+		known: true,
+		snapshot: discord.ParticipantSnapshot{
+			Revision: 1,
+			Participants: []discord.VoiceParticipant{
+				{UserID: "user-a"},
+				{UserID: "user-b"},
+			},
+		},
+	}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(); status.ParticipantCount != 2 {
+		t.Fatalf("start must hydrate both already-present users, got %#v", status)
+	}
+
+	// B leaving must not stop the stream while A was already in the VC before
+	// the job became active.
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-b", Present: false})
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("remaining hydrated participant should block auto-stop, got %q", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-a", Present: false})
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("auto-stop stream = %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for empty-VC auto-stop")
+	}
+}
+
+func TestParticipantsSyncedReplacesStaleMemberAfterGatewayRecovery(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.autoStopDelay = 5 * time.Millisecond
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-stale", Present: true})
+
+	// The gateway reconnect can miss the old leave dispatch. A complete,
+	// authoritative State view of the target VC must replace—not merge—the
+	// stale member so the empty-channel stop path resumes.
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       2,
+	})
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("auto-stop stream = %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authoritative empty snapshot did not resume auto-stop")
+	}
+}
+
+func TestParticipantsSyncedIgnoresDelayedOlderSnapshot(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.autoStopDelay = 20 * time.Millisecond
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Participants:   []discord.VoiceParticipant{{UserID: "user-01"}},
+		Revision:       3,
+	})
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       4,
+	})
+	// An older asynchronous handler must not restore a departed participant
+	// and cancel the valid empty-VC stop.
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Participants:   []discord.VoiceParticipant{{UserID: "user-01"}},
+		Revision:       3,
+	})
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("auto-stop stream = %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("older snapshot incorrectly canceled empty-VC auto-stop")
+	}
+}
+
+func TestVoiceRejoinHydratesCurrentParticipants(t *testing.T) {
+	voice := &snapshotVoice{
+		known: true,
+		snapshot: discord.ParticipantSnapshot{
+			Revision:     1,
+			Participants: []discord.VoiceParticipant{{UserID: "user-stale"}},
+		},
+	}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(); status.ParticipantCount != 1 {
+		t.Fatalf("start snapshot = %#v, want one participant", status)
+	}
+
+	// A voice-only reconnect does not emit Gateway RESUMED. Its successful
+	// rejoin must still replace stale membership before the empty-VC stop is
+	// evaluated.
+	voice.snapshot = discord.ParticipantSnapshot{Revision: 2}
+	manager.mu.Lock()
+	generation := manager.reconnectGeneration
+	manager.mu.Unlock()
+	manager.rejoinVoiceWithBackoff(job, ReconnectPolicy{Enabled: true, MaxAttempts: 1}, generation)
+
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("auto-stop stream = %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("voice rejoin did not hydrate its authoritative empty VC snapshot")
 	}
 }
 

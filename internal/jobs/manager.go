@@ -12,43 +12,44 @@ import (
 )
 
 type Manager struct {
-	voice                discord.Client
-	reporter             EventReporter
-	streamStarter        StreamStarter
-	streamStopper        StreamStopper
-	mu                   sync.Mutex
-	current              discord.VoiceJob
-	defaults             VoiceDefaults
-	streamDefaults       map[string]VoiceDefaults
-	autoStartPending     map[string]time.Time
-	autoStopPending      map[string]bool
-	autoStopGeneration   map[string]uint64
-	autoStopAttempts     map[string]int
-	autoStopInFlight     map[string]autoStopInFlight
-	autoStopLastAttempt  map[string]time.Time
-	rejoinIntents        map[string]autoStopRejoinIntent
-	rejoinIntentSequence uint64
-	rejoinReconcileRun   map[string]bool
-	rejoinReconcileDelay []time.Duration
-	autoStartCooldown    time.Duration
-	autoStopDelay        time.Duration
-	autoStopRetryDelays  []time.Duration
-	autoStopCooldown     time.Duration
-	autoStartRefresher   func() error
-	autoStartRefreshAt   time.Time
-	autoStartRefreshWait time.Duration
-	lastAutoStartLogAt   time.Time
-	lastAutoStartLogKey  string
-	reconnectPolicy      ReconnectPolicy
-	reconnectGeneration  int64
-	startedAt            time.Time
-	participants         map[string]Participant
-	activeSpeaker        string
-	lastEventAt          time.Time
-	workerFailures       int64
-	voiceRejoinAttempts  int64
-	voiceRejoinFailures  int64
-	notificationReceipts map[notificationEventKey]*notificationReceipt
+	voice                       discord.Client
+	reporter                    EventReporter
+	streamStarter               StreamStarter
+	streamStopper               StreamStopper
+	mu                          sync.Mutex
+	current                     discord.VoiceJob
+	defaults                    VoiceDefaults
+	streamDefaults              map[string]VoiceDefaults
+	autoStartPending            map[string]time.Time
+	autoStopPending             map[string]bool
+	autoStopGeneration          map[string]uint64
+	autoStopAttempts            map[string]int
+	autoStopInFlight            map[string]autoStopInFlight
+	autoStopLastAttempt         map[string]time.Time
+	rejoinIntents               map[string]autoStopRejoinIntent
+	rejoinIntentSequence        uint64
+	rejoinReconcileRun          map[string]bool
+	rejoinReconcileDelay        []time.Duration
+	autoStartCooldown           time.Duration
+	autoStopDelay               time.Duration
+	autoStopRetryDelays         []time.Duration
+	autoStopCooldown            time.Duration
+	autoStartRefresher          func() error
+	autoStartRefreshAt          time.Time
+	autoStartRefreshWait        time.Duration
+	lastAutoStartLogAt          time.Time
+	lastAutoStartLogKey         string
+	reconnectPolicy             ReconnectPolicy
+	reconnectGeneration         int64
+	startedAt                   time.Time
+	participants                map[string]Participant
+	participantSnapshotRevision uint64
+	activeSpeaker               string
+	lastEventAt                 time.Time
+	workerFailures              int64
+	voiceRejoinAttempts         int64
+	voiceRejoinFailures         int64
+	notificationReceipts        map[notificationEventKey]*notificationReceipt
 }
 
 type VoiceDefaults struct {
@@ -189,14 +190,17 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 
 	m.mu.Lock()
 	m.reconnectGeneration++
-	defer m.mu.Unlock()
 	m.current = job
 	now := time.Now().UTC()
 	m.startedAt = now
 	m.lastEventAt = now
 	m.participants = map[string]Participant{}
+	m.participantSnapshotRevision = 0
 	m.activeSpeaker = ""
 	delete(m.autoStartPending, job.StreamID)
+	m.mu.Unlock()
+
+	m.hydrateVoiceParticipants(job)
 	return nil
 }
 
@@ -429,26 +433,7 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 	job := m.current
 	participants := m.participantsSnapshotLocked()
 	reporter := m.reporter
-	stopper := m.streamStopper
-	shouldAutoStop := !event.Present && len(m.participants) == 0 && stopper != nil
-	var autoStopGeneration uint64
-	if event.Present {
-		if m.hasAutoStopInFlightLocked(job.StreamID) {
-			m.recordAutoStopRejoinIntentLocked(job.StreamID, firstNonEmptyTrimmed(event.GuildID, job.GuildID), firstNonEmptyTrimmed(event.VoiceChannelID, job.VoiceChannelID))
-		}
-		m.cancelAutoStopLocked(job.StreamID)
-	}
-	if shouldAutoStop {
-		lastAttempt := m.autoStopLastAttempt[job.StreamID]
-		if m.autoStopPending[job.StreamID] || (!lastAttempt.IsZero() && now.Sub(lastAttempt) < m.autoStopCooldown) {
-			shouldAutoStop = false
-		} else {
-			m.autoStopPending[job.StreamID] = true
-			m.autoStopGeneration[job.StreamID]++
-			autoStopGeneration = m.autoStopGeneration[job.StreamID]
-			m.autoStopAttempts[job.StreamID] = 0
-		}
-	}
+	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
 	m.mu.Unlock()
 	if reporter != nil {
 		if err := reporter.ParticipantsChanged(job, participants); err != nil {
@@ -458,6 +443,109 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 	if shouldAutoStop {
 		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
 	}
+}
+
+// ParticipantsSynced replaces the locally inferred participant set with a
+// current Discord State snapshot. This closes both startup and reconnect gaps:
+// an already-present member cannot be missed, while a leave lost during a
+// gateway reconnect cannot keep an empty VC alive indefinitely.
+func (m *Manager) ParticipantsSynced(snapshot discord.ParticipantSnapshot) {
+	snapshot.StreamID = strings.TrimSpace(snapshot.StreamID)
+	snapshot.GuildID = strings.TrimSpace(snapshot.GuildID)
+	snapshot.VoiceChannelID = strings.TrimSpace(snapshot.VoiceChannelID)
+	if snapshot.StreamID == "" || snapshot.GuildID == "" || snapshot.VoiceChannelID == "" {
+		return
+	}
+
+	m.mu.Lock()
+	job := m.current
+	if job.StreamID != snapshot.StreamID || job.GuildID != snapshot.GuildID || job.VoiceChannelID != snapshot.VoiceChannelID {
+		m.mu.Unlock()
+		return
+	}
+	if snapshot.Revision != 0 && snapshot.Revision <= m.participantSnapshotRevision {
+		m.mu.Unlock()
+		return
+	}
+	if snapshot.Revision != 0 {
+		m.participantSnapshotRevision = snapshot.Revision
+	}
+	now := time.Now().UTC()
+	participantsByID := make(map[string]Participant, len(snapshot.Participants))
+	for _, item := range snapshot.Participants {
+		userID := strings.TrimSpace(item.UserID)
+		if userID == "" {
+			continue
+		}
+		participant := Participant{UserID: userID, Username: strings.TrimSpace(item.Username), JoinedAt: now}
+		if existing, ok := m.participants[userID]; ok {
+			if !existing.JoinedAt.IsZero() {
+				participant.JoinedAt = existing.JoinedAt
+			}
+			if participant.Username == "" {
+				participant.Username = existing.Username
+			}
+		}
+		participantsByID[userID] = participant
+	}
+	m.participants = participantsByID
+	if m.activeSpeaker != "" {
+		if _, present := m.participants[m.activeSpeaker]; !present {
+			m.activeSpeaker = ""
+		}
+	}
+	m.lastEventAt = now
+	participants := m.participantsSnapshotLocked()
+	reporter := m.reporter
+	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
+	m.mu.Unlock()
+
+	if reporter != nil {
+		if err := reporter.ParticipantsChanged(job, participants); err != nil {
+			m.recordWorkerPublishFailure()
+		}
+	}
+	if shouldAutoStop {
+		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
+	}
+}
+
+func (m *Manager) hydrateVoiceParticipants(job discord.VoiceJob) {
+	source, ok := m.voice.(discord.ParticipantSnapshotSource)
+	if !ok {
+		return
+	}
+	snapshot, known := source.SnapshotVoiceParticipants(job)
+	if !known {
+		return
+	}
+	m.ParticipantsSynced(snapshot)
+}
+
+// updateAutoStopForParticipantSetLocked applies the single empty/non-empty
+// policy to both transition events and authoritative snapshot replacement.
+// The caller must hold m.mu.
+func (m *Manager) updateAutoStopForParticipantSetLocked(job discord.VoiceJob, now time.Time) (StreamStopper, bool, uint64) {
+	stopper := m.streamStopper
+	if len(m.participants) > 0 {
+		if m.hasAutoStopInFlightLocked(job.StreamID) {
+			m.recordAutoStopRejoinIntentLocked(job.StreamID, job.GuildID, job.VoiceChannelID)
+		}
+		m.cancelAutoStopLocked(job.StreamID)
+		return stopper, false, 0
+	}
+	if stopper == nil {
+		return nil, false, 0
+	}
+	lastAttempt := m.autoStopLastAttempt[job.StreamID]
+	if m.autoStopPending[job.StreamID] || (!lastAttempt.IsZero() && now.Sub(lastAttempt) < m.autoStopCooldown) {
+		return stopper, false, 0
+	}
+	m.autoStopPending[job.StreamID] = true
+	m.autoStopGeneration[job.StreamID]++
+	autoStopGeneration := m.autoStopGeneration[job.StreamID]
+	m.autoStopAttempts[job.StreamID] = 0
+	return stopper, true, autoStopGeneration
 }
 
 func (m *Manager) autoStopWhenEmpty(streamID string, generation uint64, stopper StreamStopper, delay time.Duration) {
@@ -1070,10 +1158,14 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 		m.mu.Unlock()
 		if err := m.voice.JoinVoice(job); err == nil {
 			m.mu.Lock()
-			if generation == m.reconnectGeneration && m.current.StreamID == job.StreamID {
+			stillCurrent := generation == m.reconnectGeneration && m.current.StreamID == job.StreamID
+			if stillCurrent {
 				m.lastEventAt = time.Now().UTC()
 			}
 			m.mu.Unlock()
+			if stillCurrent {
+				m.hydrateVoiceParticipants(job)
+			}
 			return
 		}
 		m.mu.Lock()

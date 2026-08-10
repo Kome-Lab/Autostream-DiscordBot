@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,25 @@ type ParticipantEvent struct {
 	Present        bool   `json:"present"`
 }
 
+// VoiceParticipant is a non-secret, current member of a tracked Discord voice
+// channel. It deliberately carries no gateway session or voice-server fields.
+type VoiceParticipant struct {
+	UserID   string
+	Username string
+}
+
+// ParticipantSnapshot is an authoritative view of the human members currently
+// in one active stream's configured voice channel. Revision increases for each
+// snapshot produced by a client so a delayed snapshot cannot overwrite a newer
+// view in the job manager.
+type ParticipantSnapshot struct {
+	StreamID       string
+	GuildID        string
+	VoiceChannelID string
+	Participants   []VoiceParticipant
+	Revision       uint64
+}
+
 type VoiceJoinEvent struct {
 	GuildID        string `json:"guild_id"`
 	VoiceChannelID string `json:"voice_channel_id"`
@@ -64,6 +84,20 @@ type EventSink interface {
 
 type EventSource interface {
 	SetEventSink(sink EventSink)
+}
+
+// ParticipantSnapshotSink is implemented by consumers that can replace their
+// participant state from an authoritative Discord State snapshot. EventSink is
+// intentionally kept backward-compatible for lightweight consumers that only
+// need transition notifications.
+type ParticipantSnapshotSink interface {
+	ParticipantsSynced(snapshot ParticipantSnapshot)
+}
+
+// ParticipantSnapshotSource is implemented by Discord clients that can read a
+// current voice-channel membership snapshot after a job is joined.
+type ParticipantSnapshotSource interface {
+	SnapshotVoiceParticipants(job VoiceJob) (ParticipantSnapshot, bool)
 }
 
 type AudioForwarder interface {
@@ -132,8 +166,13 @@ type RealClient struct {
 	audioStop chan struct{}
 	ssrcUsers map[uint32]string
 	mu        sync.Mutex
-	status    Status
-	job       VoiceJob
+	// participantSyncMu serializes snapshot creation and delivery. DiscordGo
+	// invokes typed handlers asynchronously, so an older handler must always
+	// re-read the latest State while holding this gate before it can publish.
+	participantSyncMu       sync.Mutex
+	participantSnapshotNext uint64
+	status                  Status
+	job                     VoiceJob
 }
 
 func NewRealClient(cfg Config) (*RealClient, error) {
@@ -148,6 +187,7 @@ func NewRealClient(cfg Config) (*RealClient, error) {
 	client := &RealClient{cfg: cfg, session: session}
 	session.AddHandler(client.onGatewayDisconnect)
 	session.AddHandler(client.onGatewayResumed)
+	session.AddHandler(client.onGuildCreate)
 	session.AddHandler(client.onVoiceStateUpdate)
 	session.AddHandler(client.onMessageCreate)
 	return client, nil
@@ -409,7 +449,7 @@ func (c *RealClient) onGatewayDisconnect(_ *discordgo.Session, _ *discordgo.Disc
 	}
 }
 
-func (c *RealClient) onGatewayResumed(_ *discordgo.Session, _ *discordgo.Resumed) {
+func (c *RealClient) onGatewayResumed(session *discordgo.Session, _ *discordgo.Resumed) {
 	c.mu.Lock()
 	c.status.Connected = true
 	c.status.GatewayReconnectCount++
@@ -419,18 +459,37 @@ func (c *RealClient) onGatewayResumed(_ *discordgo.Session, _ *discordgo.Resumed
 	if sink != nil {
 		sink.DiscordConnected()
 	}
+	c.syncCurrentVoiceParticipants(session)
+}
+
+// onGuildCreate is also emitted while DiscordGo is rebuilding State after a
+// non-resumable gateway reconnect. Unlike Ready, this event carries a complete
+// guild snapshot, so an empty target channel is authoritative rather than a
+// transient cache gap.
+func (c *RealClient) onGuildCreate(session *discordgo.Session, event *discordgo.GuildCreate) {
+	if event == nil || event.Guild == nil {
+		return
+	}
+	c.mu.Lock()
+	job := c.job
+	c.mu.Unlock()
+	if strings.TrimSpace(job.StreamID) == "" || event.Guild.ID != job.GuildID {
+		return
+	}
+	c.syncVoiceParticipants(session, job)
 }
 
 func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateUpdate) {
 	if event == nil || event.VoiceState == nil {
 		return
 	}
+	currentVoiceChannelID, currentVoiceStateKnown := currentTrackedVoiceChannel(session, event.GuildID, event.UserID)
 	c.mu.Lock()
 	job := c.job
 	sink := c.sink
 	c.mu.Unlock()
 	selfUserID := sessionUserID(session)
-	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) {
+	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && (!currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID) {
 		sink.VoiceUserJoined(VoiceJoinEvent{
 			GuildID:        event.GuildID,
 			VoiceChannelID: event.ChannelID,
@@ -440,7 +499,7 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	if job.StreamID == "" || event.GuildID != job.GuildID {
 		return
 	}
-	if event.UserID == selfUserID && event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID && event.ChannelID != job.VoiceChannelID {
+	if event.UserID == selfUserID && event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID && event.ChannelID != job.VoiceChannelID && (!currentVoiceStateKnown || currentVoiceChannelID != job.VoiceChannelID) {
 		c.markVoiceDisconnected("voice_state_disconnected", true)
 		return
 	}
@@ -452,7 +511,16 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	if event.UserID == selfUserID {
 		return
 	}
+	if _, supportsSnapshots := sink.(ParticipantSnapshotSink); supportsSnapshots {
+		if event.ChannelID == job.VoiceChannelID || (event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID) {
+			c.syncVoiceParticipants(session, job)
+		}
+		return
+	}
 	if event.ChannelID == job.VoiceChannelID {
+		if currentVoiceStateKnown && currentVoiceChannelID != job.VoiceChannelID {
+			return
+		}
 		sink.ParticipantChanged(ParticipantEvent{
 			StreamID:       job.StreamID,
 			GuildID:        job.GuildID,
@@ -463,6 +531,9 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 		return
 	}
 	if event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID {
+		if currentVoiceStateKnown && currentVoiceChannelID == job.VoiceChannelID {
+			return
+		}
 		sink.ParticipantChanged(ParticipantEvent{
 			StreamID:       job.StreamID,
 			GuildID:        job.GuildID,
@@ -510,11 +581,164 @@ func (c *RealClient) onMessageCreate(session *discordgo.Session, event *discordg
 	})
 }
 
+// SnapshotVoiceParticipants returns one current, authoritative view of a
+// joined job's target VC. A missing guild or disabled voice State is explicitly
+// non-authoritative: callers must retain their previous view rather than
+// mistaking a cache gap for an empty channel.
+func (c *RealClient) SnapshotVoiceParticipants(job VoiceJob) (ParticipantSnapshot, bool) {
+	c.participantSyncMu.Lock()
+	defer c.participantSyncMu.Unlock()
+
+	c.mu.Lock()
+	current := c.job
+	session := c.session
+	c.mu.Unlock()
+	if !sameVoiceJob(current, job) {
+		return ParticipantSnapshot{}, false
+	}
+	return c.snapshotVoiceParticipantsLocked(session, current)
+}
+
+func (c *RealClient) syncCurrentVoiceParticipants(session *discordgo.Session) {
+	c.mu.Lock()
+	job := c.job
+	c.mu.Unlock()
+	if strings.TrimSpace(job.StreamID) == "" {
+		return
+	}
+	c.syncVoiceParticipants(session, job)
+}
+
+func (c *RealClient) syncVoiceParticipants(session *discordgo.Session, expected VoiceJob) {
+	c.participantSyncMu.Lock()
+	defer c.participantSyncMu.Unlock()
+
+	c.mu.Lock()
+	job := c.job
+	sink := c.sink
+	c.mu.Unlock()
+	if !sameVoiceJob(job, expected) {
+		return
+	}
+	snapshotSink, ok := sink.(ParticipantSnapshotSink)
+	if !ok {
+		return
+	}
+	if session == nil {
+		session = c.session
+	}
+	snapshot, ok := c.snapshotVoiceParticipantsLocked(session, job)
+	if !ok {
+		return
+	}
+	snapshotSink.ParticipantsSynced(snapshot)
+}
+
+// snapshotVoiceParticipantsLocked must be called while participantSyncMu is
+// held. It takes DiscordGo's State read lock only while copying the small,
+// target-VC subset, then invokes no sink while that State lock is held.
+func (c *RealClient) snapshotVoiceParticipantsLocked(session *discordgo.Session, job VoiceJob) (ParticipantSnapshot, bool) {
+	if session == nil || session.State == nil || !session.State.TrackVoice {
+		return ParticipantSnapshot{}, false
+	}
+	job.StreamID = strings.TrimSpace(job.StreamID)
+	job.GuildID = strings.TrimSpace(job.GuildID)
+	job.VoiceChannelID = strings.TrimSpace(job.VoiceChannelID)
+	if job.StreamID == "" || job.GuildID == "" || job.VoiceChannelID == "" {
+		return ParticipantSnapshot{}, false
+	}
+
+	state := session.State
+	state.RLock()
+	defer state.RUnlock()
+	selfUserID := ""
+	if state.User != nil {
+		selfUserID = strings.TrimSpace(state.User.ID)
+	}
+	if selfUserID == "" {
+		return ParticipantSnapshot{}, false
+	}
+	for _, guild := range state.Guilds {
+		if guild == nil || guild.ID != job.GuildID {
+			continue
+		}
+		participants := make([]VoiceParticipant, 0, len(guild.VoiceStates))
+		for _, voiceState := range guild.VoiceStates {
+			if voiceState == nil || voiceState.ChannelID != job.VoiceChannelID {
+				continue
+			}
+			userID := strings.TrimSpace(voiceState.UserID)
+			if userID == "" || userID == selfUserID {
+				continue
+			}
+			username := ""
+			if voiceState.Member != nil && voiceState.Member.User != nil {
+				username = strings.TrimSpace(voiceState.Member.User.Username)
+			}
+			participants = append(participants, VoiceParticipant{UserID: userID, Username: username})
+		}
+		sort.Slice(participants, func(i, j int) bool {
+			return participants[i].UserID < participants[j].UserID
+		})
+		c.participantSnapshotNext++
+		return ParticipantSnapshot{
+			StreamID:       job.StreamID,
+			GuildID:        job.GuildID,
+			VoiceChannelID: job.VoiceChannelID,
+			Participants:   participants,
+			Revision:       c.participantSnapshotNext,
+		}, true
+	}
+	return ParticipantSnapshot{}, false
+}
+
+func sameVoiceJob(left, right VoiceJob) bool {
+	return strings.TrimSpace(left.StreamID) == strings.TrimSpace(right.StreamID) &&
+		strings.TrimSpace(left.GuildID) == strings.TrimSpace(right.GuildID) &&
+		strings.TrimSpace(left.VoiceChannelID) == strings.TrimSpace(right.VoiceChannelID)
+}
+
 func sessionUserID(session *discordgo.Session) string {
 	if session == nil || session.State == nil || session.State.User == nil {
 		return ""
 	}
 	return session.State.User.ID
+}
+
+// currentTrackedVoiceChannel snapshots a user's latest voice channel while
+// holding discordgo's State lock. discordgo updates State in Gateway order
+// before starting typed handlers, which run asynchronously by default. The
+// snapshot therefore lets each target-VC transition reject only an obsolete
+// enter or leave without dropping a still-needed leave from that target.
+//
+// State.VoiceState is intentionally not used here: it unlocks after resolving
+// the guild and then scans VoiceStates, which can race a later Gateway update.
+// An unavailable snapshot is non-authoritative and callers retain the event to
+// avoid falsely treating a present participant as absent.
+func currentTrackedVoiceChannel(session *discordgo.Session, guildID, userID string) (string, bool) {
+	if session == nil || session.State == nil || !session.State.TrackVoice {
+		return "", false
+	}
+	guildID = strings.TrimSpace(guildID)
+	userID = strings.TrimSpace(userID)
+	if guildID == "" || userID == "" {
+		return "", false
+	}
+	state := session.State
+	state.RLock()
+	defer state.RUnlock()
+	for _, guild := range state.Guilds {
+		if guild.ID != guildID {
+			continue
+		}
+		for _, voiceState := range guild.VoiceStates {
+			if voiceState.UserID == userID {
+				return voiceState.ChannelID, true
+			}
+		}
+		return "", true
+	}
+	return "", false
 }
 
 func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {

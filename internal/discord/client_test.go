@@ -38,6 +38,15 @@ func (f *fakeEventSink) ActiveSpeakerDetected(streamID, userID string) {
 func (f *fakeEventSink) DiscordConnected()          {}
 func (f *fakeEventSink) DiscordDisconnected(string) {}
 
+type snapshotEventSink struct {
+	fakeEventSink
+	snapshots []ParticipantSnapshot
+}
+
+func (f *snapshotEventSink) ParticipantsSynced(snapshot ParticipantSnapshot) {
+	f.snapshots = append(f.snapshots, snapshot)
+}
+
 type fakeAudioForwarder struct {
 	mu              sync.Mutex
 	called          chan struct{}
@@ -512,6 +521,194 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	})
 	if sink.voiceJoin.VoiceChannelID != "voice-01" {
 		t.Fatalf("bot's own voice join should not trigger auto-start event: %#v", sink.voiceJoin)
+	}
+}
+
+func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
+	newSession := func(t *testing.T, initialVoiceStates []*discordgo.VoiceState) *discordgo.Session {
+		t.Helper()
+		session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+		session.State.User = &discordgo.User{ID: "bot-01"}
+		if err := session.State.GuildAdd(&discordgo.Guild{ID: "guild-01", VoiceStates: initialVoiceStates}); err != nil {
+			t.Fatalf("add guild state: %v", err)
+		}
+		return session
+	}
+	apply := func(t *testing.T, session *discordgo.Session, event *discordgo.VoiceStateUpdate) {
+		t.Helper()
+		if err := session.State.OnInterface(session, event); err != nil {
+			t.Fatalf("apply gateway voice state: %v", err)
+		}
+	}
+
+	t.Run("ultimately empty ignores delayed join", func(t *testing.T) {
+		sink := &fakeEventSink{}
+		client := &RealClient{
+			sink: sink,
+			job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+		}
+		session := newSession(t, nil)
+		joined := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}}
+		left := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: ""}}
+		apply(t, session, joined)
+		apply(t, session, left)
+
+		// discordgo updates State in gateway order before it runs handlers, but
+		// handlers are asynchronous by default. Model the leave handler running
+		// first and the stale join handler running later.
+		client.onVoiceStateUpdate(session, left)
+		client.onVoiceStateUpdate(session, joined)
+
+		if len(sink.participants) != 1 || sink.participants[0].Present || sink.participants[0].UserID != "user-01" {
+			t.Fatalf("empty final state must publish only the leave, got %#v", sink.participants)
+		}
+		if sink.voiceJoin.UserID != "" {
+			t.Fatalf("delayed join must not cancel empty-channel auto-stop: %#v", sink.voiceJoin)
+		}
+	})
+
+	t.Run("ultimately occupied ignores delayed leave", func(t *testing.T) {
+		sink := &fakeEventSink{}
+		client := &RealClient{
+			sink: sink,
+			job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+		}
+		session := newSession(t, []*discordgo.VoiceState{{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}})
+		left := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: ""}}
+		joined := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}}
+		apply(t, session, left)
+		apply(t, session, joined)
+
+		client.onVoiceStateUpdate(session, joined)
+		client.onVoiceStateUpdate(session, left)
+
+		if len(sink.participants) != 1 || !sink.participants[0].Present || sink.participants[0].UserID != "user-01" {
+			t.Fatalf("occupied final state must publish only the join, got %#v", sink.participants)
+		}
+		if sink.voiceJoin.UserID != "user-01" {
+			t.Fatalf("current join must still cancel empty-channel auto-stop: %#v", sink.voiceJoin)
+		}
+	})
+
+	t.Run("move away then leave elsewhere still removes target participant", func(t *testing.T) {
+		sink := &fakeEventSink{}
+		client := &RealClient{
+			sink: sink,
+			job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+		}
+		session := newSession(t, []*discordgo.VoiceState{{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}})
+		movedAway := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-02"}}
+		leftElsewhere := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: ""}}
+		apply(t, session, movedAway)
+		apply(t, session, leftElsewhere)
+
+		// The later leave from voice-02 is not itself a target-VC leave. The
+		// delayed move is the only event that can remove this user from voice-01.
+		client.onVoiceStateUpdate(session, leftElsewhere)
+		client.onVoiceStateUpdate(session, movedAway)
+
+		if len(sink.participants) != 1 || sink.participants[0].Present || sink.participants[0].UserID != "user-01" {
+			t.Fatalf("move away must still remove the target participant, got %#v", sink.participants)
+		}
+		if sink.voiceJoin.UserID != "" {
+			t.Fatalf("stale move must not create a new join signal: %#v", sink.voiceJoin)
+		}
+	})
+}
+
+func TestVoiceParticipantSnapshotsHydrateAndRecoverAuthoritatively(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+	if err := session.State.GuildAdd(&discordgo.Guild{
+		ID: "guild-01",
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01"},
+			{UserID: "user-a", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{User: &discordgo.User{ID: "user-a", Username: "Alice"}}},
+			{UserID: "user-b", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{User: &discordgo.User{ID: "user-b", Username: "Bob"}}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	sink := &snapshotEventSink{}
+	client := &RealClient{session: session, sink: sink, job: job}
+
+	initial, known := client.SnapshotVoiceParticipants(job)
+	if !known || initial.Revision != 1 || len(initial.Participants) != 2 || initial.Participants[0].UserID != "user-a" || initial.Participants[1].UserID != "user-b" {
+		t.Fatalf("start snapshot must include only existing humans, got %#v known=%t", initial, known)
+	}
+
+	left := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-b", GuildID: "guild-01", ChannelID: ""}}
+	if err := session.State.OnInterface(session, left); err != nil {
+		t.Fatal(err)
+	}
+	client.onGatewayResumed(session, &discordgo.Resumed{})
+	if len(sink.snapshots) != 1 || sink.snapshots[0].Revision != 2 || len(sink.snapshots[0].Participants) != 1 || sink.snapshots[0].Participants[0].UserID != "user-a" {
+		t.Fatalf("resume must replace state with the current authoritative VC members: %#v", sink.snapshots)
+	}
+
+	left = &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-a", GuildID: "guild-01", ChannelID: ""}}
+	if err := session.State.OnInterface(session, left); err != nil {
+		t.Fatal(err)
+	}
+	client.onGuildCreate(session, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "guild-01"}})
+	if len(sink.snapshots) != 2 || sink.snapshots[1].Revision != 3 || len(sink.snapshots[1].Participants) != 0 {
+		t.Fatalf("full reconnect guild sync must publish an authoritative empty VC: %#v", sink.snapshots)
+	}
+}
+
+func TestVoiceStateUpdateUsesSnapshotSinkForActiveTargetVC(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+	if err := session.State.GuildAdd(&discordgo.Guild{ID: "guild-01", VoiceStates: []*discordgo.VoiceState{
+		{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	sink := &snapshotEventSink{}
+	client := &RealClient{session: session, sink: sink, job: job}
+	left := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: ""}}
+	if err := session.State.OnInterface(session, left); err != nil {
+		t.Fatal(err)
+	}
+	client.onVoiceStateUpdate(session, left)
+
+	if len(sink.snapshots) != 1 || len(sink.snapshots[0].Participants) != 0 {
+		t.Fatalf("target VC leave must deliver the current full snapshot: %#v", sink.snapshots)
+	}
+	if len(sink.participants) != 0 {
+		t.Fatalf("snapshot-aware sink must not receive an unsafe delta first: %#v", sink.participants)
+	}
+}
+
+func TestDelayedTargetLeaveUsesCurrentSnapshotNotStaleDelta(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+	if err := session.State.GuildAdd(&discordgo.Guild{ID: "guild-01", VoiceStates: []*discordgo.VoiceState{
+		{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01"},
+		{UserID: "user-current", GuildID: "guild-01", ChannelID: "voice-01"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	sink := &snapshotEventSink{}
+	client := &RealClient{session: session, sink: sink, job: job}
+
+	// DiscordGo applies State before it asynchronously invokes typed handlers.
+	// This leave belongs to a prior job/state epoch: the departed user is no
+	// longer in State, while the current job's participant remains in the VC.
+	delayedLeave := &discordgo.VoiceStateUpdate{
+		VoiceState:   &discordgo.VoiceState{UserID: "user-old", GuildID: "guild-01", ChannelID: ""},
+		BeforeUpdate: &discordgo.VoiceState{UserID: "user-old", GuildID: "guild-01", ChannelID: "voice-01"},
+	}
+	client.onVoiceStateUpdate(session, delayedLeave)
+
+	if len(sink.snapshots) != 1 || len(sink.snapshots[0].Participants) != 1 || sink.snapshots[0].Participants[0].UserID != "user-current" {
+		t.Fatalf("delayed leave must publish the current full participant view, got %#v", sink.snapshots)
+	}
+	if len(sink.participants) != 0 {
+		t.Fatalf("delayed leave must not emit a stale participant delta: %#v", sink.participants)
 	}
 }
 
