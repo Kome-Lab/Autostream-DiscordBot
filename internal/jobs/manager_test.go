@@ -997,12 +997,12 @@ func TestControlPanelStopCallbackDoesNotCancelOwnAutoStopRequest(t *testing.T) {
 	}
 }
 
-func TestVoiceJoinAfterPanelStopCallbackReconcilesSuccessorAfterTwoServiceWindows(t *testing.T) {
+func TestVoiceJoinAfterPanelStopCallbackReconcilesRearmedStreamAfterRuntimeRefresh(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.autoStopDelay = 0
 	// The production policy retains the intent for more than one minute. Use
-	// millisecond-scale service windows here while requiring the successor to
-	// remain absent for two sequential refreshes.
+	// millisecond-scale service windows here while requiring the rearmed source
+	// row to remain absent for two sequential refreshes.
 	manager.rejoinReconcileDelay = []time.Duration{0, 5 * time.Millisecond, 5 * time.Millisecond, 5 * time.Millisecond}
 	stopper := &panelStopCallbackStreamStopper{
 		manager:  manager,
@@ -1026,11 +1026,9 @@ func TestVoiceJoinAfterPanelStopCallbackReconcilesSuccessorAfterTwoServiceWindow
 		refreshes++
 		attempt := refreshes
 		refreshMu.Unlock()
-		defaults := map[string]VoiceDefaults{
-			"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
-		}
+		defaults := map[string]VoiceDefaults{}
 		if attempt >= 3 {
-			defaults["stream-02"] = VoiceDefaults{GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true}
+			defaults["stream-01"] = VoiceDefaults{GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true}
 		}
 		manager.SetStreamVoiceDefaults(defaults)
 		return nil
@@ -1081,11 +1079,11 @@ func TestVoiceJoinAfterPanelStopCallbackReconcilesSuccessorAfterTwoServiceWindow
 	}
 	select {
 	case got := <-starter.ch:
-		if got != "stream-02" {
-			t.Fatalf("delayed rejoin started %q, want stream-02", got)
+		if got != "stream-01" {
+			t.Fatalf("delayed rejoin started %q, want stream-01", got)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for delayed successor auto-start")
+		t.Fatal("timed out waiting for delayed rearmed auto-start")
 	}
 	select {
 	case got := <-starter.ch:
@@ -1096,7 +1094,7 @@ func TestVoiceJoinAfterPanelStopCallbackReconcilesSuccessorAfterTwoServiceWindow
 	gotRefreshes := refreshes
 	refreshMu.Unlock()
 	if gotRefreshes < 3 {
-		t.Fatalf("refresh attempts = %d, want successor visibility after at least two service windows", gotRefreshes)
+		t.Fatalf("refresh attempts = %d, want rearmed source visibility after at least two service windows", gotRefreshes)
 	}
 }
 
@@ -1113,7 +1111,7 @@ func TestAutoStopRejoinPolicyCoversSequentialPanelStops(t *testing.T) {
 	}
 }
 
-func TestVoiceJoinDuringCommittedAutoStopReconcilesRearmedSuccessor(t *testing.T) {
+func TestVoiceJoinDuringCommittedAutoStopReconcilesRearmedStream(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.autoStopDelay = 0
 	manager.rejoinReconcileDelay = []time.Duration{0, 5 * time.Millisecond, 5 * time.Millisecond}
@@ -1132,10 +1130,9 @@ func TestVoiceJoinDuringCommittedAutoStopReconcilesRearmedSuccessor(t *testing.T
 	refreshed := make(chan struct{}, 3)
 	manager.SetAutoStartRefresher(func() error {
 		manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
-			// Runtime config can briefly include both the completed source and
-			// the rearmed successor. Reconciliation must never start the source.
+			// The Control Panel re-arms the completed source row. Reconciliation
+			// must start that same durable stream ID after the stop commits.
 			"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
-			"stream-02": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
 		})
 		select {
 		case refreshed <- struct{}{}:
@@ -1191,11 +1188,11 @@ func TestVoiceJoinDuringCommittedAutoStopReconcilesRearmedSuccessor(t *testing.T
 	}
 	select {
 	case got := <-starter.ch:
-		if got != "stream-02" {
-			t.Fatalf("rejoined VC started %q, want rearmed stream-02", got)
+		if got != "stream-01" {
+			t.Fatalf("rejoined VC started %q, want rearmed stream-01", got)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for rearmed successor auto-start")
+		t.Fatal("timed out waiting for rearmed auto-start")
 	}
 	select {
 	case got := <-starter.ch:

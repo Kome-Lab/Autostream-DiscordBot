@@ -827,26 +827,26 @@ func (m *Manager) reconcileAutoStopRejoin(sourceStreamID string) {
 			m.mu.Unlock()
 			continue
 		}
-		successor := m.matchingAutoStartSuccessorLocked(intent.GuildID, intent.VoiceChannelID, sourceStreamID)
-		if successor == "" || m.streamStarter == nil {
+		rearmed := m.matchingAutoStartStreamLocked(intent.GuildID, intent.VoiceChannelID)
+		if rearmed == "" || rearmed != sourceStreamID || m.streamStarter == nil {
 			m.mu.Unlock()
 			continue
 		}
 		now := time.Now().UTC()
-		if last, pending := m.autoStartPending[successor]; pending && now.Sub(last) < m.autoStartCooldown {
+		if last, pending := m.autoStartPending[rearmed]; pending && now.Sub(last) < m.autoStartCooldown {
 			delete(m.rejoinIntents, key)
 			m.mu.Unlock()
 			return
 		}
-		m.autoStartPending[successor] = now
+		m.autoStartPending[rearmed] = now
 		m.lastEventAt = now
 		starter := m.streamStarter
 		delete(m.rejoinIntents, key)
 		m.mu.Unlock()
 
 		go func() {
-			if err := starter.StartStream(successor); err != nil {
-				log.Printf("Discord VC auto-stop rejoin request failed for stream=%s: %v", successor, err)
+			if err := starter.StartStream(rearmed); err != nil {
+				log.Printf("Discord VC auto-stop rejoin request failed for stream=%s: %v", rearmed, err)
 			}
 		}()
 		return
@@ -1060,29 +1060,6 @@ func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) 
 			continue
 		}
 		if defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {
-			continue
-		}
-		if matched != "" {
-			return ""
-		}
-		matched = streamID
-	}
-	return matched
-}
-
-// matchingAutoStartSuccessorLocked selects only a newly rearmed candidate for
-// a recorded auto-stop source. It deliberately rejects ambiguity instead of
-// guessing between historical stream rows that share a Discord VC.
-func (m *Manager) matchingAutoStartSuccessorLocked(guildID, voiceChannelID, sourceStreamID string) string {
-	guildID = strings.TrimSpace(guildID)
-	voiceChannelID = strings.TrimSpace(voiceChannelID)
-	sourceStreamID = strings.TrimSpace(sourceStreamID)
-	if guildID == "" || voiceChannelID == "" || sourceStreamID == "" {
-		return ""
-	}
-	matched := ""
-	for streamID, defaults := range m.streamDefaults {
-		if streamID == sourceStreamID || !defaults.AutoStartEnabled || defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {
 			continue
 		}
 		if matched != "" {
