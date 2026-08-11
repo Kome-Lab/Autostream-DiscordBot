@@ -81,6 +81,12 @@ func (e ControlPanelError) ControlPanelCode() string {
 	return e.Code
 }
 
+// HTTPStatusCode exposes the response status to bounded recovery logic while
+// keeping callers independent from the concrete error type.
+func (e ControlPanelError) HTTPStatusCode() int {
+	return e.StatusCode
+}
+
 // RetryableAutoStop reports whether an auto-stop request may be retried
 // without treating a rejected stream state or authorization failure as a
 // transient outage. Only rate limiting and server failures are retryable.

@@ -76,6 +76,11 @@ type StreamStarter interface {
 	StartStream(streamID string) error
 }
 
+type staleAutoStartError interface {
+	ControlPanelCode() string
+	HTTPStatusCode() int
+}
+
 type StreamStopper interface {
 	StopStream(streamID string) error
 }
@@ -200,7 +205,12 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	delete(m.autoStartPending, job.StreamID)
 	m.mu.Unlock()
 
-	m.hydrateVoiceParticipants(job)
+	// Discord's gateway cache can briefly report the target channel as empty
+	// while JoinVoice is establishing the bot's session. Do not turn that
+	// transient initial snapshot into an immediate auto-stop; a later voice
+	// event or reconnect snapshot remains authoritative. Rejoin hydration keeps
+	// accepting an explicitly empty snapshot because the job was already live.
+	m.hydrateVoiceParticipants(job, true)
 	return nil
 }
 
@@ -510,13 +520,16 @@ func (m *Manager) ParticipantsSynced(snapshot discord.ParticipantSnapshot) {
 	}
 }
 
-func (m *Manager) hydrateVoiceParticipants(job discord.VoiceJob) {
+func (m *Manager) hydrateVoiceParticipants(job discord.VoiceJob, suppressInitialEmpty bool) {
 	source, ok := m.voice.(discord.ParticipantSnapshotSource)
 	if !ok {
 		return
 	}
 	snapshot, known := source.SnapshotVoiceParticipants(job)
 	if !known {
+		return
+	}
+	if suppressInitialEmpty && len(snapshot.Participants) == 0 {
 		return
 	}
 	m.ParticipantsSynced(snapshot)
@@ -943,8 +956,46 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	go func() {
 		if err := starter.StartStream(streamID); err != nil {
 			log.Printf("Discord VC auto-start request failed for stream=%s: %v", streamID, err)
+			if !isStaleAutoStartError(err) || refresher == nil {
+				return
+			}
+			if refreshErr := refresher(); refreshErr != nil {
+				log.Printf("Discord VC auto-start stale-stream refresh failed for stream=%s: %v", streamID, refreshErr)
+				return
+			}
+			m.mu.Lock()
+			if m.current.StreamID != "" {
+				m.mu.Unlock()
+				return
+			}
+			successor := m.matchingAutoStartStreamLocked(event.GuildID, event.VoiceChannelID)
+			if successor != "" && successor != streamID {
+				m.autoStartPending[successor] = time.Now().UTC()
+			}
+			m.mu.Unlock()
+			if successor == "" || successor == streamID {
+				log.Printf("Discord VC auto-start stale stream has no refreshed successor: old_stream=%s", streamID)
+				return
+			}
+			if retryErr := starter.StartStream(successor); retryErr != nil {
+				log.Printf("Discord VC auto-start successor request failed for stream=%s (old_stream=%s): %v", successor, streamID, retryErr)
+			} else {
+				log.Printf("Discord VC auto-start successor accepted by control panel for stream=%s (old_stream=%s)", successor, streamID)
+			}
+			return
 		}
+		// This receipt means only that the Control Panel accepted the request;
+		// Encoder/YouTube lifecycle readiness is verified separately.
+		log.Printf("Discord VC auto-start accepted by control panel for stream=%s", streamID)
 	}()
+}
+
+func isStaleAutoStartError(err error) bool {
+	var classified staleAutoStartError
+	if !errors.As(err, &classified) {
+		return false
+	}
+	return classified.HTTPStatusCode() == 404 && classified.ControlPanelCode() == "not_found"
 }
 
 func (m *Manager) shouldLogAutoStartLocked(key string, now time.Time) bool {
@@ -1164,7 +1215,7 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 			}
 			m.mu.Unlock()
 			if stillCurrent {
-				m.hydrateVoiceParticipants(job)
+				m.hydrateVoiceParticipants(job, false)
 			}
 			return
 		}

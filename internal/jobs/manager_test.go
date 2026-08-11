@@ -49,6 +49,7 @@ type fakeStreamStarter struct {
 	started []string
 	ch      chan string
 	err     error
+	errs    []error
 }
 
 type fakeStreamStopper struct {
@@ -190,6 +191,11 @@ func (f *fakeReporter) ChatMessageReceived(job discord.VoiceJob, message ChatMes
 func (f *fakeStreamStarter) StartStream(streamID string) error {
 	f.mu.Lock()
 	f.started = append(f.started, streamID)
+	err := f.err
+	if len(f.errs) > 0 {
+		err = f.errs[0]
+		f.errs = f.errs[1:]
+	}
 	f.mu.Unlock()
 	if f.ch != nil {
 		select {
@@ -197,7 +203,7 @@ func (f *fakeStreamStarter) StartStream(streamID string) error {
 		default:
 		}
 	}
-	return f.err
+	return err
 }
 
 func (f *fakeStreamStopper) StopStream(streamID string) error {
@@ -414,6 +420,42 @@ func TestVoiceUserJoinedRefreshesDefaultsBeforeMatching(t *testing.T) {
 	}
 }
 
+func TestVoiceUserJoinedRefreshesAndRetriesARearmedSuccessorAfterNotFound(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-old": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
+	})
+	starter := &fakeStreamStarter{
+		ch:   make(chan string, 2),
+		errs: []error{control.ControlPanelError{StatusCode: 404, Code: "not_found"}, nil},
+	}
+	manager.SetStreamStarter(starter)
+	manager.SetAutoStartRefresher(func() error {
+		manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+			"stream-new": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
+		})
+		return nil
+	})
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-01"})
+	select {
+	case got := <-starter.ch:
+		if got != "stream-old" {
+			t.Fatalf("first auto-start stream = %q, want stream-old", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stale auto-start")
+	}
+	select {
+	case got := <-starter.ch:
+		if got != "stream-new" {
+			t.Fatalf("successor auto-start stream = %q, want stream-new", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for refreshed successor auto-start")
+	}
+}
+
 func TestVoiceUserJoinedRequiresAutoStartEnabled(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
@@ -580,6 +622,49 @@ func TestStartHydratesExistingVoiceParticipantsBeforeLeave(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for empty-VC auto-stop")
+	}
+}
+
+func TestStartDoesNotAutoStopOnTransientEmptyInitialSnapshot(t *testing.T) {
+	voice := &snapshotVoice{
+		known: true,
+		snapshot: discord.ParticipantSnapshot{
+			Revision:       1,
+			StreamID:       "stream-01",
+			GuildID:        "guild-01",
+			VoiceChannelID: "voice-01",
+			Participants:   nil,
+		},
+	}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("empty initial hydration must not immediately stop a newly joined job: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Once a later authoritative snapshot arrives, the normal empty-VC policy
+	// is still allowed to stop the job.
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       2,
+	})
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("authoritative empty snapshot stopped %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for authoritative empty-VC auto-stop")
 	}
 }
 
