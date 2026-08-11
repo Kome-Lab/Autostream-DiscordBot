@@ -43,6 +43,17 @@ type snapshotEventSink struct {
 	snapshots []ParticipantSnapshot
 }
 
+type activeSpeakerStateSink struct {
+	fakeEventSink
+	speaking []bool
+}
+
+func (f *activeSpeakerStateSink) ActiveSpeakerStateChanged(streamID, userID string, speaking bool) {
+	f.activeStreamID = streamID
+	f.activeUserID = userID
+	f.speaking = append(f.speaking, speaking)
+}
+
 func (f *snapshotEventSink) ParticipantsSynced(snapshot ParticipantSnapshot) {
 	f.snapshots = append(f.snapshots, snapshot)
 }
@@ -442,6 +453,21 @@ func TestVoiceSpeakingUpdateIgnoresStopSpeaking(t *testing.T) {
 
 	if sink.activeStreamID != "" || sink.activeUserID != "" {
 		t.Fatalf("stop-speaking update should not publish active speaker: %#v", sink)
+	}
+}
+
+func TestVoiceSpeakingUpdateReportsStopToStateSink(t *testing.T) {
+	sink := &activeSpeakerStateSink{}
+	client := &RealClient{
+		sink: sink,
+		job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	}
+
+	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
+	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: false})
+
+	if !reflect.DeepEqual(sink.speaking, []bool{true, false}) || sink.activeUserID != "user-01" {
+		t.Fatalf("speaking state edges were not reported: %#v", sink)
 	}
 }
 

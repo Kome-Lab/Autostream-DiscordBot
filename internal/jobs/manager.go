@@ -72,6 +72,13 @@ type EventReporter interface {
 	ChatMessageReceived(job discord.VoiceJob, message ChatMessage) error
 }
 
+// ActiveSpeakerStateReporter is an optional EventReporter extension. It lets
+// the worker distinguish a speaker stopping from a new speaker being detected
+// while keeping the legacy reporter contract source-compatible.
+type ActiveSpeakerStateReporter interface {
+	ActiveSpeakerStateChanged(job discord.VoiceJob, userID, displayName string, speaking bool) error
+}
+
 type StreamStarter interface {
 	StartStream(streamID string) error
 }
@@ -110,9 +117,12 @@ type autoStopRejoinIntent struct {
 }
 
 type Participant struct {
-	UserID   string    `json:"user_id"`
-	Username string    `json:"username,omitempty"`
-	JoinedAt time.Time `json:"joined_at"`
+	UserID    string    `json:"user_id"`
+	Username  string    `json:"username,omitempty"`
+	AvatarURL string    `json:"avatar_url,omitempty"`
+	IsBot     bool      `json:"is_bot,omitempty"`
+	Speaking  bool      `json:"speaking,omitempty"`
+	JoinedAt  time.Time `json:"joined_at"`
 }
 
 type ChatMessage struct {
@@ -432,7 +442,17 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 		if existing, ok := m.participants[event.UserID]; ok && !existing.JoinedAt.IsZero() {
 			joinedAt = existing.JoinedAt
 		}
-		m.participants[event.UserID] = Participant{UserID: event.UserID, Username: event.Username, JoinedAt: joinedAt}
+		participant := Participant{UserID: event.UserID, Username: event.Username, AvatarURL: event.AvatarURL, IsBot: event.IsBot, JoinedAt: joinedAt}
+		if existing, ok := m.participants[event.UserID]; ok {
+			if participant.Username == "" {
+				participant.Username = existing.Username
+			}
+			if participant.AvatarURL == "" {
+				participant.AvatarURL = existing.AvatarURL
+			}
+			participant.IsBot = participant.IsBot || existing.IsBot
+		}
+		m.participants[event.UserID] = participant
 	} else {
 		delete(m.participants, event.UserID)
 		if m.activeSpeaker == event.UserID {
@@ -487,7 +507,7 @@ func (m *Manager) ParticipantsSynced(snapshot discord.ParticipantSnapshot) {
 		if userID == "" {
 			continue
 		}
-		participant := Participant{UserID: userID, Username: strings.TrimSpace(item.Username), JoinedAt: now}
+		participant := Participant{UserID: userID, Username: strings.TrimSpace(item.Username), AvatarURL: strings.TrimSpace(item.AvatarURL), IsBot: item.IsBot, JoinedAt: now}
 		if existing, ok := m.participants[userID]; ok {
 			if !existing.JoinedAt.IsZero() {
 				participant.JoinedAt = existing.JoinedAt
@@ -495,6 +515,10 @@ func (m *Manager) ParticipantsSynced(snapshot discord.ParticipantSnapshot) {
 			if participant.Username == "" {
 				participant.Username = existing.Username
 			}
+			if participant.AvatarURL == "" {
+				participant.AvatarURL = existing.AvatarURL
+			}
+			participant.IsBot = participant.IsBot || existing.IsBot
 		}
 		participantsByID[userID] = participant
 	}
@@ -1093,7 +1117,24 @@ func (m *Manager) ActiveSpeakerDetected(streamID, userID string) {
 	_ = m.SetActiveSpeaker(streamID, userID)
 }
 
+// ActiveSpeakerStateChanged tracks both edges of Discord's speaking signal.
+// A stop from a non-active participant must not clear another participant's
+// currently highlighted speaker.
+func (m *Manager) ActiveSpeakerStateChanged(streamID, userID string, speaking bool) {
+	if speaking {
+		_ = m.SetActiveSpeaker(streamID, userID)
+		return
+	}
+	// Keep the compare-and-clear under the same lock as the assignment so a
+	// concurrent new speaker cannot be cleared by an older stop notification.
+	_ = m.setActiveSpeaker(streamID, "", &userID)
+}
+
 func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
+	return m.setActiveSpeaker(streamID, userID, nil)
+}
+
+func (m *Manager) setActiveSpeaker(streamID, userID string, expectedPrevious *string) error {
 	m.mu.Lock()
 	if m.current.StreamID == "" {
 		m.mu.Unlock()
@@ -1102,6 +1143,10 @@ func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
 	if streamID != "" && streamID != m.current.StreamID {
 		m.mu.Unlock()
 		return errors.New("stream_id does not match current job")
+	}
+	if expectedPrevious != nil && m.activeSpeaker != *expectedPrevious {
+		m.mu.Unlock()
+		return nil
 	}
 	if userID != "" {
 		if _, ok := m.participants[userID]; !ok {
@@ -1123,7 +1168,13 @@ func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
 	reporter := m.reporter
 	m.mu.Unlock()
 	if reporter != nil {
-		if err := reporter.ActiveSpeakerChanged(job, userID, displayName); err != nil {
+		var err error
+		if stateReporter, ok := reporter.(ActiveSpeakerStateReporter); ok {
+			err = stateReporter.ActiveSpeakerStateChanged(job, userID, displayName, userID != "")
+		} else if userID != "" {
+			err = reporter.ActiveSpeakerChanged(job, userID, displayName)
+		}
+		if err != nil {
 			m.recordWorkerPublishFailure()
 		}
 	}
@@ -1133,6 +1184,7 @@ func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
 func (m *Manager) participantsSnapshotLocked() []Participant {
 	out := make([]Participant, 0, len(m.participants))
 	for _, participant := range m.participants {
+		participant.Speaking = participant.UserID == m.activeSpeaker
 		out = append(out, participant)
 	}
 	return out

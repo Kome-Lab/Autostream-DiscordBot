@@ -44,6 +44,20 @@ type fakeReporter struct {
 	err                 error
 }
 
+type activeSpeakerStateReporter struct {
+	fakeReporter
+	speaking []bool
+}
+
+func (f *activeSpeakerStateReporter) ActiveSpeakerStateChanged(job discord.VoiceJob, userID, displayName string, speaking bool) error {
+	f.speakerStreamID = job.StreamID
+	f.speakerUserID = userID
+	f.speakerDisplayName = displayName
+	f.speakerCallCount++
+	f.speaking = append(f.speaking, speaking)
+	return f.err
+}
+
 type fakeStreamStarter struct {
 	mu      sync.Mutex
 	started []string
@@ -1415,6 +1429,28 @@ func TestDuplicateActiveSpeakerDetectedIsNoop(t *testing.T) {
 
 	if reporter.speakerCallCount != 1 {
 		t.Fatalf("duplicate active speaker should not be reported repeatedly, got %d", reporter.speakerCallCount)
+	}
+}
+
+func TestActiveSpeakerStateChangedClearsOnlyTheStoppedSpeaker(t *testing.T) {
+	reporter := &activeSpeakerStateReporter{}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-01", Username: "alice", Present: true})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: "stream-01", UserID: "user-02", Username: "bob", Present: true})
+	manager.ActiveSpeakerStateChanged("stream-01", "user-01", true)
+	manager.ActiveSpeakerStateChanged("stream-01", "user-02", false)
+	if got := manager.Status().ActiveSpeakerID; got != "user-01" {
+		t.Fatalf("stopping a different participant cleared active speaker: %q", got)
+	}
+	manager.ActiveSpeakerStateChanged("stream-01", "user-01", false)
+	if got := manager.Status().ActiveSpeakerID; got != "" {
+		t.Fatalf("stopping active participant did not clear speaker: %q", got)
+	}
+	if len(reporter.speaking) != 2 || reporter.speaking[0] != true || reporter.speaking[1] != false {
+		t.Fatalf("unexpected speaker state reports: %#v", reporter.speaking)
 	}
 }
 

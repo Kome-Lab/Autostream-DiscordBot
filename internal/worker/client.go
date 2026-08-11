@@ -30,6 +30,8 @@ type Reporter struct {
 type participantPayload struct {
 	UserID      string `json:"user_id"`
 	DisplayName string `json:"display_name,omitempty"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	IsBot       bool   `json:"is_bot,omitempty"`
 	Speaking    bool   `json:"speaking"`
 }
 
@@ -68,13 +70,20 @@ func (r Reporter) ParticipantsChanged(job discord.VoiceJob, participants []jobs.
 		payload.Participants = append(payload.Participants, participantPayload{
 			UserID:      participant.UserID,
 			DisplayName: participant.Username,
+			AvatarURL:   participant.AvatarURL,
+			IsBot:       participant.IsBot,
+			Speaking:    participant.Speaking,
 		})
 	}
 	return r.post(context.Background(), job, "/streams/"+url.PathEscape(job.StreamID)+"/events/participants", payload)
 }
 
 func (r Reporter) ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName string) error {
-	payload := map[string]string{"user_id": userID, "display_name": displayName}
+	return r.ActiveSpeakerStateChanged(job, userID, displayName, true)
+}
+
+func (r Reporter) ActiveSpeakerStateChanged(job discord.VoiceJob, userID, displayName string, speaking bool) error {
+	payload := map[string]any{"user_id": userID, "display_name": displayName, "speaking": speaking}
 	return r.post(context.Background(), job, "/streams/"+url.PathEscape(job.StreamID)+"/events/active-speaker", payload)
 }
 

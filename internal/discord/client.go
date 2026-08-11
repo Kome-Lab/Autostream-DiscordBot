@@ -33,14 +33,20 @@ type ParticipantEvent struct {
 	VoiceChannelID string `json:"voice_channel_id"`
 	UserID         string `json:"user_id"`
 	Username       string `json:"username,omitempty"`
+	AvatarURL      string `json:"avatar_url,omitempty"`
+	IsBot          bool   `json:"is_bot,omitempty"`
 	Present        bool   `json:"present"`
 }
 
 // VoiceParticipant is a non-secret, current member of a tracked Discord voice
 // channel. It deliberately carries no gateway session or voice-server fields.
+// The bot's own user is filtered before this value is produced; other Discord
+// bots remain visible so the preview matches the channel membership.
 type VoiceParticipant struct {
-	UserID   string
-	Username string
+	UserID    string
+	Username  string
+	AvatarURL string
+	IsBot     bool
 }
 
 // ParticipantSnapshot is an authoritative view of the human members currently
@@ -80,6 +86,13 @@ type EventSink interface {
 	ActiveSpeakerDetected(streamID, userID string)
 	DiscordConnected()
 	DiscordDisconnected(reason string)
+}
+
+// ActiveSpeakerStateSink is an optional extension for consumers that need both
+// speaking-start and speaking-stop notifications. EventSink remains stable for
+// lightweight consumers that only care about the currently detected speaker.
+type ActiveSpeakerStateSink interface {
+	ActiveSpeakerStateChanged(streamID, userID string, speaking bool)
 }
 
 type EventSource interface {
@@ -320,7 +333,14 @@ func (c *RealClient) onVoiceSpeakingUpdate(_ *discordgo.VoiceConnection, event *
 	userID := event.UserID
 	speaking := event.Speaking
 	c.mu.Unlock()
-	if speaking && streamID != "" && userID != "" && sink != nil {
+	if streamID == "" || userID == "" || sink == nil {
+		return
+	}
+	if stateSink, ok := sink.(ActiveSpeakerStateSink); ok {
+		stateSink.ActiveSpeakerStateChanged(streamID, userID, speaking)
+		return
+	}
+	if speaking {
 		sink.ActiveSpeakerDetected(streamID, userID)
 	}
 }
@@ -679,10 +699,14 @@ func (c *RealClient) snapshotVoiceParticipantsLocked(session *discordgo.Session,
 				continue
 			}
 			username := ""
+			avatarURL := ""
+			isBot := false
 			if voiceState.Member != nil && voiceState.Member.User != nil {
 				username = strings.TrimSpace(voiceState.Member.User.Username)
+				avatarURL = strings.TrimSpace(voiceState.Member.User.AvatarURL("128"))
+				isBot = voiceState.Member.User.Bot
 			}
-			participants = append(participants, VoiceParticipant{UserID: userID, Username: username})
+			participants = append(participants, VoiceParticipant{UserID: userID, Username: username, AvatarURL: avatarURL, IsBot: isBot})
 		}
 		sort.Slice(participants, func(i, j int) bool {
 			return participants[i].UserID < participants[j].UserID

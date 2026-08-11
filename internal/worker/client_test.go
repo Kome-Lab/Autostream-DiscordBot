@@ -31,17 +31,21 @@ func TestReporterPublishesParticipants(t *testing.T) {
 
 	reporter := Reporter{Config: Config{Timeout: time.Second}}
 	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
-	if err := reporter.ParticipantsChanged(job, []jobs.Participant{{UserID: "user-01", Username: "alice"}}); err != nil {
+	if err := reporter.ParticipantsChanged(job, []jobs.Participant{{UserID: "user-01", Username: "alice", AvatarURL: "https://cdn.discordapp.com/avatars/user-01/a.png", IsBot: true, Speaking: true}}); err != nil {
 		t.Fatal(err)
 	}
 
-	if gotAuth != "Bearer secret-token" || len(got.Participants) != 1 || got.Participants[0].DisplayName != "alice" {
+	if gotAuth != "Bearer secret-token" || len(got.Participants) != 1 || got.Participants[0].DisplayName != "alice" || got.Participants[0].AvatarURL == "" || !got.Participants[0].IsBot || !got.Participants[0].Speaking {
 		t.Fatalf("unexpected publish request: auth=%q body=%#v", gotAuth, got)
 	}
 }
 
 func TestReporterPublishesActiveSpeaker(t *testing.T) {
-	var got map[string]string
+	var got struct {
+		UserID      string `json:"user_id"`
+		DisplayName string `json:"display_name"`
+		Speaking    bool   `json:"speaking"`
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/streams/stream-01/events/active-speaker" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -59,8 +63,34 @@ func TestReporterPublishesActiveSpeaker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got["user_id"] != "user-01" || got["display_name"] != "alice" {
+	if got.UserID != "user-01" || got.DisplayName != "alice" || !got.Speaking {
 		t.Fatalf("unexpected active speaker payload: %#v", got)
+	}
+}
+
+func TestReporterPublishesSpeakerStop(t *testing.T) {
+	var got struct {
+		UserID   string `json:"user_id"`
+		Speaking bool   `json:"speaking"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/streams/stream-01/events/active-speaker" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	reporter := Reporter{Config: Config{Timeout: time.Second}}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	if err := reporter.ActiveSpeakerStateChanged(job, "user-01", "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	if got.UserID != "user-01" || got.Speaking {
+		t.Fatalf("unexpected speaker stop payload: %#v", got)
 	}
 }
 
