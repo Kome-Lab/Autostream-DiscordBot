@@ -122,20 +122,30 @@ jobs:
               cxx_compiler=aarch64-linux-gnu-g++
             fi
             build_dir="$dave_cpp/build-$arch"
-            cmake -S "$dave_cpp" -B "$build_dir" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DVCPKG_MANIFEST_DIR="$dave_cpp/vcpkg-alts/openssl_3" \
-              -DCMAKE_TOOLCHAIN_FILE="$dave_cpp/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-              -DVCPKG_TARGET_TRIPLET="$triplet" \
-              -DVCPKG_OVERLAY_TRIPLETS="$vcpkg_dir/triplets/community" \
-              -DCMAKE_C_COMPILER="$c_compiler" \
-              -DCMAKE_CXX_COMPILER="$cxx_compiler" \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DENABLE_SANITIZERS=OFF \
-              -DPERSISTENT_KEYS=OFF \
-              -DTESTING=OFF \
-              -DINSTALL_VCPKG_LICENSES=OFF
-            cmake --build "$build_dir" --target libdave --parallel 2
+            for attempt in 1 2 3; do
+              echo "Building libdave for ${arch} (attempt ${attempt}/3)"
+              if cmake -S "$dave_cpp" -B "$build_dir" -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DVCPKG_MANIFEST_DIR="$dave_cpp/vcpkg-alts/openssl_3" \
+                -DCMAKE_TOOLCHAIN_FILE="$dave_cpp/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+                -DVCPKG_TARGET_TRIPLET="$triplet" \
+                -DVCPKG_OVERLAY_TRIPLETS="$vcpkg_dir/triplets/community" \
+                -DCMAKE_C_COMPILER="$c_compiler" \
+                -DCMAKE_CXX_COMPILER="$cxx_compiler" \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DENABLE_SANITIZERS=OFF \
+                -DPERSISTENT_KEYS=OFF \
+                -DTESTING=OFF \
+                -DINSTALL_VCPKG_LICENSES=OFF \
+                && cmake --build "$build_dir" --target libdave --parallel 2; then
+                break
+              fi
+              if [[ "$attempt" -eq 3 ]]; then
+                echo "libdave ${arch} build failed after 3 attempts" >&2
+                exit 1
+              fi
+              sleep $((attempt * 15))
+            done
           done
 
       - name: Package linux artifacts
