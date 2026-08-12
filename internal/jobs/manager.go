@@ -468,9 +468,7 @@ func (m *Manager) Participants(streamID string) ([]Participant, error) {
 		return nil, errors.New("stream_id does not match current job")
 	}
 	out := make([]Participant, 0, len(m.participants))
-	for _, participant := range m.participants {
-		out = append(out, participant)
-	}
+	out = append(out, m.participantsSnapshotLocked()...)
 	return out, nil
 }
 

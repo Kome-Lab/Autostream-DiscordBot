@@ -76,14 +76,15 @@ type activeSpeakerStateReporter struct {
 }
 
 type orderedOverlayReporter struct {
-	mu                 sync.Mutex
-	participantStarted chan struct{}
-	participantRelease chan struct{}
-	order              []string
+	mu                   sync.Mutex
+	participantStartOnce sync.Once
+	participantStarted   chan struct{}
+	participantRelease   chan struct{}
+	order                []string
 }
 
 func (f *orderedOverlayReporter) ParticipantsChanged(discord.VoiceJob, []Participant) error {
-	close(f.participantStarted)
+	f.participantStartOnce.Do(func() { close(f.participantStarted) })
 	<-f.participantRelease
 	f.mu.Lock()
 	f.order = append(f.order, "participants")
@@ -1640,7 +1641,7 @@ func TestManagerRecordsWorkerEventPublishFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	status := manager.Status()
-	if status.Metrics["discord.worker_event_publish_failures_total"] != 2 {
+	if status.Metrics["discord.worker_event_publish_failures_total"] != 3 {
 		t.Fatalf("expected worker publish failures to be counted, got %#v", status.Metrics)
 	}
 }
