@@ -36,7 +36,13 @@ jobs:
           git -C third_party/discordgo/dave/libdave/cpp/vcpkg \
             fetch --unshallow || \
             git -C third_party/discordgo/dave/libdave/cpp/vcpkg fetch --all --tags
-          make -C third_party/discordgo/dave/libdave/cpp BUILD_TYPE=Release
+          vcpkg_root="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
+          "$vcpkg_root/bootstrap-vcpkg.sh" -disableMetrics
+          test -x "$vcpkg_root/vcpkg"
+          CMAKE_GENERATOR=Ninja \
+          CC=gcc \
+          CXX=g++ \
+            make -C third_party/discordgo/dave/libdave/cpp BUILD_TYPE=Release
       - name: Test Go packages with DAVE-linked DiscordGo
         shell: bash
         run: |
