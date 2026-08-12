@@ -90,6 +90,12 @@ Inbound Control Panel dispatch uses `SERVICE_CONTROL_TOKEN` or `SERVICE_CONTROL_
 
 Control Panel の Discord Bot Config に `bot_token`、`guild_id`、`voice_channel_id`、`text_channel_id`、caption/STT 設定を登録してください。`DISCORD_BOT_TOKEN`、`DISCORD_GUILD_ID`、`DISCORD_VOICE_CHANNEL_ID` は互換 fallback または local dry-run 用に限定します。
 
+## Discord Gateway Intents
+
+Bot は Gateway 接続時に `Guild Voice States`、`Guild Messages`、`Message Content` を要求します。`Guild Voice States` は VC参加者、名前・アイコン、発話状態を取得するための通常 Intent です。Discord Developer Portal の privileged toggle ではありません。
+
+配信オーバーレイへ Discord チャットを表示するには、コード側の `Guild Messages` と `Message Content` に加えて、Discord Developer Portal の **Bot → Privileged Gateway Intents → `Message Content Intent`** を有効にしてください。有効化後は `autostream-discord-bot` を再起動して Gateway へ再接続します。これを無効にしたままでも VC参加者、発話状態、VC音声は動作しますが、チャットだけが空のままになります。
+
 ## Runtime Config
 
 起動時に service token で `/services/register` を呼び、その後 `/services/runtime-config?service_id=<SERVICE_ID>` を取得します。runtime config には raw secret は含まれず、`bot_token_secret_name` のような参照だけが含まれます。

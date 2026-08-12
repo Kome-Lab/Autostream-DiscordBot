@@ -1,8 +1,11 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +35,22 @@ type snapshotVoice struct {
 	known    bool
 }
 
+type sequenceSnapshotVoice struct {
+	fakeVoice
+	mu        sync.Mutex
+	snapshots []discord.ParticipantSnapshot
+	next      int
+}
+
+type blockingSnapshotVoice struct {
+	fakeVoice
+	mu       sync.Mutex
+	snapshot discord.ParticipantSnapshot
+	calls    int
+	started  chan struct{}
+	release  chan struct{}
+}
+
 type fakeReporter struct {
 	participantStreamID string
 	participants        []Participant
@@ -44,9 +63,47 @@ type fakeReporter struct {
 	err                 error
 }
 
+type recordingParticipantReporter struct {
+	mu                sync.Mutex
+	calls             chan []Participant
+	callCount         int
+	failuresRemaining int
+}
+
 type activeSpeakerStateReporter struct {
 	fakeReporter
 	speaking []bool
+}
+
+type orderedOverlayReporter struct {
+	mu                 sync.Mutex
+	participantStarted chan struct{}
+	participantRelease chan struct{}
+	order              []string
+}
+
+func (f *orderedOverlayReporter) ParticipantsChanged(discord.VoiceJob, []Participant) error {
+	close(f.participantStarted)
+	<-f.participantRelease
+	f.mu.Lock()
+	f.order = append(f.order, "participants")
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *orderedOverlayReporter) ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName string) error {
+	return f.ActiveSpeakerStateChanged(job, userID, displayName, true)
+}
+
+func (f *orderedOverlayReporter) ActiveSpeakerStateChanged(discord.VoiceJob, string, string, bool) error {
+	f.mu.Lock()
+	f.order = append(f.order, "speaker")
+	f.mu.Unlock()
+	return nil
+}
+
+func (*orderedOverlayReporter) ChatMessageReceived(discord.VoiceJob, ChatMessage) error {
+	return nil
 }
 
 func (f *activeSpeakerStateReporter) ActiveSpeakerStateChanged(job discord.VoiceJob, userID, displayName string, speaking bool) error {
@@ -180,6 +237,89 @@ func (f *snapshotVoice) SnapshotVoiceParticipants(job discord.VoiceJob) (discord
 		snapshot.VoiceChannelID = job.VoiceChannelID
 	}
 	return snapshot, true
+}
+
+func (f *sequenceSnapshotVoice) SnapshotVoiceParticipants(job discord.VoiceJob) (discord.ParticipantSnapshot, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.snapshots) == 0 {
+		return discord.ParticipantSnapshot{}, false
+	}
+	index := f.next
+	if index >= len(f.snapshots) {
+		index = len(f.snapshots) - 1
+	} else {
+		f.next++
+	}
+	snapshot := f.snapshots[index]
+	if snapshot.StreamID == "" {
+		snapshot.StreamID = job.StreamID
+	}
+	if snapshot.GuildID == "" {
+		snapshot.GuildID = job.GuildID
+	}
+	if snapshot.VoiceChannelID == "" {
+		snapshot.VoiceChannelID = job.VoiceChannelID
+	}
+	if snapshot.Revision == 0 {
+		snapshot.Revision = uint64(f.next)
+	}
+	return snapshot, true
+}
+
+func (f *blockingSnapshotVoice) SnapshotVoiceParticipants(job discord.VoiceJob) (discord.ParticipantSnapshot, bool) {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	snapshot := f.snapshot
+	f.mu.Unlock()
+	if call == 2 {
+		close(f.started)
+		<-f.release
+	}
+	if snapshot.StreamID == "" {
+		snapshot.StreamID = job.StreamID
+	}
+	if snapshot.GuildID == "" {
+		snapshot.GuildID = job.GuildID
+	}
+	if snapshot.VoiceChannelID == "" {
+		snapshot.VoiceChannelID = job.VoiceChannelID
+	}
+	return snapshot, true
+}
+
+func (f *recordingParticipantReporter) ParticipantsChanged(_ discord.VoiceJob, participants []Participant) error {
+	f.mu.Lock()
+	cloned := append([]Participant(nil), participants...)
+	f.callCount++
+	shouldFail := f.failuresRemaining > 0
+	if shouldFail {
+		f.failuresRemaining--
+	}
+	f.mu.Unlock()
+	select {
+	case f.calls <- cloned:
+	default:
+	}
+	if shouldFail {
+		return errors.New("transient worker event failure")
+	}
+	return nil
+}
+
+func (f *recordingParticipantReporter) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.callCount
+}
+
+func (*recordingParticipantReporter) ActiveSpeakerChanged(discord.VoiceJob, string, string) error {
+	return nil
+}
+
+func (*recordingParticipantReporter) ChatMessageReceived(discord.VoiceJob, ChatMessage) error {
+	return nil
 }
 
 func (f *fakeReporter) ParticipantsChanged(job discord.VoiceJob, participants []Participant) error {
@@ -750,6 +890,156 @@ func TestParticipantsSyncedIgnoresDelayedOlderSnapshot(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("older snapshot incorrectly canceled empty-VC auto-stop")
+	}
+}
+
+func TestPeriodicParticipantReplayCannotOverwriteNewerGatewaySnapshot(t *testing.T) {
+	reporter := &fakeReporter{}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       2,
+		Participants:   []discord.VoiceParticipant{{UserID: "user-new", Username: "new"}},
+	})
+	manager.mu.Lock()
+	generation := manager.reconnectGeneration
+	manager.mu.Unlock()
+
+	manager.participantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       1,
+		Participants:   []discord.VoiceParticipant{{UserID: "user-old", Username: "old"}},
+	}, participantSnapshotApplyOptions{expectedGeneration: generation, requireGeneration: true, authoritativeReplay: true})
+	participants, err := manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 1 || participants[0].UserID != "user-new" {
+		t.Fatalf("older periodic snapshot replaced newer gateway state: %#v", participants)
+	}
+
+	reporter.participants = nil
+	manager.participantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       2,
+		Participants:   []discord.VoiceParticipant{{UserID: "user-old", Username: "old"}},
+	}, participantSnapshotApplyOptions{expectedGeneration: generation, requireGeneration: true, authoritativeReplay: true})
+	if len(reporter.participants) != 1 || reporter.participants[0].UserID != "user-new" {
+		t.Fatalf("same-revision replay did not publish current manager state: %#v", reporter.participants)
+	}
+}
+
+func TestPeriodicSnapshotReadCannotOverwriteConcurrentParticipantEvent(t *testing.T) {
+	voice := &blockingSnapshotVoice{
+		snapshot: discord.ParticipantSnapshot{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-old", Username: "old"}}},
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	reporter := &recordingParticipantReporter{calls: make(chan []Participant, 8)}
+	manager := NewManagerWithReporter(voice, reporter)
+	manager.participantSyncDelays = []time.Duration{0}
+	manager.participantSyncInterval = 0
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	<-reporter.calls
+
+	<-voice.started
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-new", Username: "new", Present: true})
+	close(voice.release)
+	time.Sleep(20 * time.Millisecond)
+
+	participants, err := manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("stale periodic read overwrote concurrent participant event: %#v", participants)
+	}
+}
+
+func TestStartRehydratesParticipantsAfterTransientInitialEmpty(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1},
+		{Revision: 2, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	reporter := &recordingParticipantReporter{calls: make(chan []Participant, 4)}
+	manager := NewManagerWithReporter(voice, reporter)
+
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case participants := <-reporter.calls:
+		if len(participants) != 1 || participants[0].UserID != "user-01" {
+			t.Fatalf("delayed authoritative snapshot was not published: %#v", participants)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for delayed participant hydration")
+	}
+}
+
+func TestStartReplaysParticipantsAfterInitialWorkerPublishFailure(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+		{Revision: 2, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	reporter := &recordingParticipantReporter{calls: make(chan []Participant, 4), failuresRemaining: 1}
+	manager := NewManagerWithReporter(voice, reporter)
+
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	<-reporter.calls
+
+	select {
+	case participants := <-reporter.calls:
+		if len(participants) != 1 || participants[0].UserID != "user-01" {
+			t.Fatalf("replayed snapshot was not published: %#v", participants)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for participant snapshot replay")
+	}
+}
+
+func TestParticipantSnapshotSyncRunsPeriodicallyAndStopsWithJobGeneration(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	reporter := &recordingParticipantReporter{calls: make(chan []Participant, 8)}
+	manager := NewManagerWithReporter(voice, reporter)
+	manager.participantSyncDelays = nil
+	manager.participantSyncInterval = 10 * time.Millisecond
+
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	<-reporter.calls
+	select {
+	case <-reporter.calls:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for periodic participant snapshot")
+	}
+
+	if err := manager.Stop("stream-01"); err != nil {
+		t.Fatal(err)
+	}
+	countAfterStop := reporter.count()
+	time.Sleep(40 * time.Millisecond)
+	if got := reporter.count(); got != countAfterStop {
+		t.Fatalf("participant snapshot was published after stop: before=%d after=%d", countAfterStop, got)
 	}
 }
 
@@ -1391,11 +1681,77 @@ func TestChatMessageReceivedPublishesOnlyCurrentTextChannel(t *testing.T) {
 		MessageID:     "msg-01",
 		UserID:        "user-01",
 		Username:      "alice",
+		AvatarURL:     "https://cdn.discordapp.com/avatars/user-01/avatar.png",
+		IsBot:         true,
 		Content:       " こんにちは ",
 		CreatedAt:     time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
 	})
-	if reporter.chatStreamID != "stream-01" || reporter.chatMessage.MessageID != "msg-01" || reporter.chatMessage.Content != "こんにちは" || reporter.chatMessage.Username != "alice" {
+	if reporter.chatStreamID != "stream-01" || reporter.chatMessage.MessageID != "msg-01" || reporter.chatMessage.Content != "こんにちは" || reporter.chatMessage.Username != "alice" || reporter.chatMessage.AvatarURL == "" || !reporter.chatMessage.IsBot {
 		t.Fatalf("chat message was not published: stream=%q message=%#v", reporter.chatStreamID, reporter.chatMessage)
+	}
+}
+
+func TestChatMessageReceivedBoundsOverlayPayload(t *testing.T) {
+	reporter := &fakeReporter{}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", TextChannelID: "text-01"}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.ChatMessageReceived(discord.ChatMessageEvent{
+		StreamID:      "stream-01",
+		GuildID:       "guild-01",
+		TextChannelID: "text-01",
+		MessageID:     strings.Repeat("m", 200),
+		UserID:        strings.Repeat("u", 200),
+		Username:      strings.Repeat("n", 150),
+		AvatarURL:     "https://cdn.discordapp.com/" + strings.Repeat("a", 2100),
+		Content:       strings.Repeat("文", 1100),
+	})
+
+	message := reporter.chatMessage
+	if len([]rune(message.MessageID)) != 128 || len([]rune(message.UserID)) != 128 || len([]rune(message.Username)) != 100 || len([]rune(message.AvatarURL)) != 2048 || len([]rune(message.Content)) != 1000 {
+		t.Fatalf("chat payload bounds were not applied: message=%#v", message)
+	}
+}
+
+func TestWorkerPublishFailureLogIsRateLimitedAndSecretSafe(t *testing.T) {
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+
+	reporter := &fakeReporter{err: errors.New("https://worker.example.com secret-token hidden-content")}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	manager.workerFailureLogInterval = time.Minute
+	job := discord.VoiceJob{
+		StreamID:          "stream-01",
+		GuildID:           "guild-01",
+		VoiceChannelID:    "voice-01",
+		TextChannelID:     "text-01",
+		WorkerEventsURL:   "https://worker.example.com",
+		WorkerEventsToken: "secret-token",
+	}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	event := discord.ChatMessageEvent{StreamID: job.StreamID, GuildID: job.GuildID, TextChannelID: job.TextChannelID, MessageID: "message-01", UserID: "user-01", Content: "hidden-content"}
+	manager.ChatMessageReceived(event)
+	manager.ChatMessageReceived(event)
+
+	got := output.String()
+	if strings.Count(got, "event_type=overlay.discord_chat") != 1 || !strings.Contains(got, "stream_id=stream-01") || !strings.Contains(got, "error_class=") {
+		t.Fatalf("unexpected worker failure warning: %q", got)
+	}
+	for _, secret := range []string{"secret-token", "worker.example.com", "hidden-content"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("worker failure warning leaked %q: %q", secret, got)
+		}
 	}
 }
 
@@ -1454,6 +1810,157 @@ func TestActiveSpeakerStateChangedClearsOnlyTheStoppedSpeaker(t *testing.T) {
 	}
 }
 
+func TestActiveSpeakerStateChangedKeepsMultipleSpeakersHighlighted(t *testing.T) {
+	manager := NewManagerWithReporter(&fakeVoice{}, &fakeReporter{})
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "Alice", Present: true})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-02", Username: "Bob", Present: true})
+
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-02", true)
+	participants, err := manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	speaking := map[string]bool{}
+	for _, participant := range participants {
+		speaking[participant.UserID] = participant.Speaking
+	}
+	if !speaking["user-01"] || !speaking["user-02"] {
+		t.Fatalf("simultaneous speakers = %#v, want both highlighted", speaking)
+	}
+
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", false)
+	participants, err = manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	speaking = map[string]bool{}
+	for _, participant := range participants {
+		speaking[participant.UserID] = participant.Speaking
+	}
+	if speaking["user-01"] || !speaking["user-02"] {
+		t.Fatalf("speaker stop state = %#v, want only user-02 highlighted", speaking)
+	}
+}
+
+func TestConcurrentSpeakerEdgesPublishAuthoritativeParticipantState(t *testing.T) {
+	reporter := &recordingParticipantReporter{calls: make(chan []Participant, 8)}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "Alice", Present: true})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-02", Username: "Bob", Present: true})
+	for len(reporter.calls) > 0 {
+		<-reporter.calls
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
+	}()
+	go func() {
+		defer wg.Done()
+		manager.ActiveSpeakerStateChanged(job.StreamID, "user-02", true)
+	}()
+	wg.Wait()
+
+	var latest []Participant
+	for len(reporter.calls) > 0 {
+		latest = <-reporter.calls
+	}
+	speaking := map[string]bool{}
+	for _, participant := range latest {
+		speaking[participant.UserID] = participant.Speaking
+	}
+	if !speaking["user-01"] || !speaking["user-02"] {
+		t.Fatalf("published participant state = %#v, want both speakers highlighted", speaking)
+	}
+}
+
+func TestClearActiveSpeakerPublishesAuthoritativeClear(t *testing.T) {
+	reporter := &activeSpeakerStateReporter{}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "Alice", Present: true})
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
+
+	if err := manager.SetActiveSpeaker(job.StreamID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(reporter.participants) != 1 || reporter.participants[0].Speaking {
+		t.Fatalf("clear did not publish authoritative participant state: %#v", reporter.participants)
+	}
+	if got := reporter.speaking; len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("clear speaking edges = %#v, want [true false]", got)
+	}
+}
+
+func TestParticipantSnapshotPublishCannotArriveAfterNewSpeakerEvent(t *testing.T) {
+	reporter := &orderedOverlayReporter{
+		participantStarted: make(chan struct{}),
+		participantRelease: make(chan struct{}),
+	}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	participantDone := make(chan struct{})
+	go func() {
+		manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "alice", Present: true})
+		close(participantDone)
+	}()
+	<-reporter.participantStarted
+	speakerDone := make(chan struct{})
+	go func() {
+		manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
+		close(speakerDone)
+	}()
+	close(reporter.participantRelease)
+	<-participantDone
+	<-speakerDone
+
+	reporter.mu.Lock()
+	order := append([]string(nil), reporter.order...)
+	reporter.mu.Unlock()
+	if len(order) != 3 || order[0] != "participants" || order[1] != "participants" || order[2] != "speaker" {
+		t.Fatalf("overlay event order = %#v, want initial participants then authoritative speaker snapshot and edge", order)
+	}
+}
+
+func TestOvertakenParticipantReportPublishesLatestSpeakerState(t *testing.T) {
+	reporter := &fakeReporter{}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "alice", Present: true})
+	manager.mu.Lock()
+	staleParticipants := manager.participantsSnapshotLocked()
+	staleRevision := manager.participantStateRevision
+	manager.mu.Unlock()
+	reporter.participants = nil
+
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
+	manager.reportParticipantsIfCurrent(job, staleParticipants, staleRevision, 0, false)
+
+	if len(reporter.participants) != 1 || reporter.participants[0].UserID != "user-01" || !reporter.participants[0].Speaking {
+		t.Fatalf("overtaken participant report did not publish latest speaking state: %#v", reporter.participants)
+	}
+}
+
 func TestManagerRejoinsVoiceAfterVoiceDisconnect(t *testing.T) {
 	voice := &fakeVoice{joinCh: make(chan discord.VoiceJob, 2)}
 	manager := NewManager(voice)
@@ -1496,5 +2003,45 @@ func TestManagerDoesNotRejoinOnGatewayDisconnect(t *testing.T) {
 	case job := <-voice.joinCh:
 		t.Fatalf("gateway disconnect should not force voice rejoin: %#v", job)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestGatewayReconnectRestartsPeriodicParticipantSnapshotSync(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	reporter := &recordingParticipantReporter{calls: make(chan []Participant, 16)}
+	manager := NewManagerWithReporter(voice, reporter)
+	manager.participantSyncDelays = nil
+	manager.participantSyncInterval = 10 * time.Millisecond
+	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
+		t.Fatal(err)
+	}
+	<-reporter.calls
+
+	manager.DiscordDisconnected("gateway_disconnect")
+	time.Sleep(30 * time.Millisecond)
+	for {
+		select {
+		case <-reporter.calls:
+			continue
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	countBeforeReconnect := reporter.count()
+	manager.DiscordConnected()
+	select {
+	case <-reporter.calls:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for participant snapshot after gateway reconnect")
+	}
+	if got := reporter.count(); got <= countBeforeReconnect {
+		t.Fatalf("gateway reconnect did not restart participant sync: before=%d after=%d", countBeforeReconnect, got)
+	}
+	if err := manager.Stop("stream-01"); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,9 +18,10 @@ import (
 )
 
 type Config struct {
-	URL     string
-	Token   string
-	Timeout time.Duration
+	URL         string
+	Token       string
+	Timeout     time.Duration
+	RetryDelays []time.Duration
 }
 
 type Reporter struct {
@@ -37,7 +39,8 @@ type participantPayload struct {
 
 func ConfigFromEnv() Config {
 	return Config{
-		Timeout: envDuration("DISCORD_WORKER_EVENT_TIMEOUT_SEC", envDuration("WORKER_EVENT_TIMEOUT_SEC", 3*time.Second)),
+		Timeout:     envDuration("DISCORD_WORKER_EVENT_TIMEOUT_SEC", envDuration("WORKER_EVENT_TIMEOUT_SEC", 3*time.Second)),
+		RetryDelays: defaultRetryDelays(),
 	}
 }
 
@@ -92,8 +95,12 @@ func (r Reporter) ChatMessageReceived(job discord.VoiceJob, message jobs.ChatMes
 		"type": "overlay.discord_chat",
 		"payload": map[string]any{
 			"message_id":      message.MessageID,
+			"author_id":       message.UserID,
 			"user_id":         message.UserID,
 			"display_name":    message.Username,
+			"avatar_url":      message.AvatarURL,
+			"is_bot":          message.IsBot,
+			"content":         message.Content,
 			"text":            message.Content,
 			"text_channel_id": message.TextChannelID,
 			"created_at":      message.CreatedAt.UTC().Format(time.RFC3339Nano),
@@ -114,15 +121,37 @@ func (r Reporter) post(ctx context.Context, job discord.VoiceJob, endpoint strin
 	if err != nil {
 		return err
 	}
-	reqCtx := ctx
-	if cfg.Timeout > 0 {
-		var cancel context.CancelFunc
-		reqCtx, cancel = context.WithTimeout(ctx, cfg.Timeout)
-		defer cancel()
+	retryDelays := cfg.RetryDelays
+	if retryDelays == nil {
+		retryDelays = defaultRetryDelays()
 	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, joinURL(cfg.URL, endpoint), bytes.NewReader(body))
+	publishCtx := ctx
+	cancel := func() {}
+	if cfg.Timeout > 0 {
+		publishCtx, cancel = context.WithTimeout(ctx, cfg.Timeout)
+	}
+	defer cancel()
+	for attempt := 0; ; attempt++ {
+		retryable, err := r.postOnce(publishCtx, cfg, endpoint, body)
+		if err == nil {
+			return nil
+		}
+		if !retryable || attempt >= len(retryDelays) {
+			return err
+		}
+		if err := waitForRetry(publishCtx, retryDelays[attempt]); err != nil {
+			return err
+		}
+	}
+}
+
+func (r Reporter) postOnce(ctx context.Context, cfg Config, endpoint string, body []byte) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(cfg.URL, endpoint), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	req.Header.Set("Content-Type", "application/json")
@@ -132,13 +161,41 @@ func (r Reporter) post(ctx context.Context, job discord.VoiceJob, endpoint strin
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return true, errors.New("worker event publish request failed")
 	}
-	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 4<<10))
+	_ = res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("worker event publish failed with status %d", res.StatusCode)
+		retryable := res.StatusCode == http.StatusRequestTimeout || res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500
+		return retryable, fmt.Errorf("worker event publish failed with status %d", res.StatusCode)
 	}
-	return nil
+	return false, nil
+}
+
+func defaultRetryDelays() []time.Duration {
+	return []time.Duration{100 * time.Millisecond, 300 * time.Millisecond}
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c Config) withJob(job discord.VoiceJob) Config {

@@ -20,6 +20,7 @@ type fakeEventSink struct {
 	voiceJoin      VoiceJoinEvent
 	participants   []ParticipantEvent
 	chatMessage    ChatMessageEvent
+	connectedCount int
 }
 
 func (f *fakeEventSink) VoiceUserJoined(event VoiceJoinEvent) {
@@ -35,7 +36,7 @@ func (f *fakeEventSink) ActiveSpeakerDetected(streamID, userID string) {
 	f.activeStreamID = streamID
 	f.activeUserID = userID
 }
-func (f *fakeEventSink) DiscordConnected()          {}
+func (f *fakeEventSink) DiscordConnected()          { f.connectedCount++ }
 func (f *fakeEventSink) DiscordDisconnected(string) {}
 
 type snapshotEventSink struct {
@@ -701,6 +702,75 @@ func TestVoiceParticipantSnapshotsHydrateAndRecoverAuthoritatively(t *testing.T)
 	}
 }
 
+func TestVoiceParticipantSnapshotUsesDiscordDisplayNameAndGuildAvatar(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.User = &discordgo.User{ID: "bot-self"}
+	guild := &discordgo.Guild{
+		ID: "guild-01",
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot-self", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "bot-self", Username: "self", Bot: true}}},
+			{UserID: "user-nick", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{Nick: "Server Alice", Avatar: "guild-avatar", User: &discordgo.User{ID: "user-nick", Username: "alice", GlobalName: "Global Alice", Avatar: "user-avatar"}}},
+			{UserID: "user-global", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "user-global", Username: "bob", GlobalName: "Global Bob", Avatar: "bob-avatar"}}},
+			{UserID: "bot-other", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "bot-other", Username: "Helper", Bot: true}}},
+		},
+	}
+	if err := session.State.GuildAdd(guild); err != nil {
+		t.Fatal(err)
+	}
+	client := &RealClient{session: session, job: VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}}
+
+	snapshot, known := client.SnapshotVoiceParticipants(client.job)
+	if !known {
+		t.Fatal("participant snapshot was not available")
+	}
+	participants := make(map[string]VoiceParticipant, len(snapshot.Participants))
+	for _, participant := range snapshot.Participants {
+		participants[participant.UserID] = participant
+	}
+	if _, present := participants["bot-self"]; present {
+		t.Fatal("the connected bot itself must not be included")
+	}
+	if other := participants["bot-other"]; !other.IsBot || other.Username != "Helper" {
+		t.Fatalf("another bot must remain visible, got %#v", other)
+	}
+	expectedGuildMember := *guild.VoiceStates[1].Member
+	expectedGuildMember.GuildID = guild.ID
+	if nick := participants["user-nick"]; nick.Username != "Server Alice" || nick.AvatarURL != expectedGuildMember.AvatarURL("128") {
+		t.Fatalf("guild nickname/avatar must win, got %#v", nick)
+	}
+	if global := participants["user-global"]; global.Username != "Global Bob" || global.AvatarURL != guild.VoiceStates[2].Member.User.AvatarURL("128") {
+		t.Fatalf("global name and user avatar must be fallbacks, got %#v", global)
+	}
+}
+
+func TestReadyRestartsConnectedStateAndParticipantSnapshot(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.User = &discordgo.User{ID: "bot-01"}
+	if err := session.State.GuildAdd(&discordgo.Guild{
+		ID: "guild-01",
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01"},
+			{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sink := &snapshotEventSink{}
+	client := &RealClient{
+		session: session,
+		sink:    sink,
+		job:     VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+	}
+
+	client.onReady(session, &discordgo.Ready{})
+	if sink.connectedCount != 1 {
+		t.Fatalf("READY connected notifications = %d, want 1", sink.connectedCount)
+	}
+	if len(sink.snapshots) != 1 || len(sink.snapshots[0].Participants) != 1 || sink.snapshots[0].Participants[0].UserID != "user-01" {
+		t.Fatalf("READY participant snapshot = %#v", sink.snapshots)
+	}
+}
+
 func TestVoiceStateUpdateUsesSnapshotSinkForActiveTargetVC(t *testing.T) {
 	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
 	session.State.User = &discordgo.User{ID: "bot-01"}
@@ -820,10 +890,21 @@ func TestMessageCreatePublishesOnlyActiveTextChannelMessages(t *testing.T) {
 		ID:        "msg-bot",
 		GuildID:   "guild-01",
 		ChannelID: "text-01",
-		Author:    &discordgo.User{ID: "bot-01", Username: "bot", Bot: true},
+		Author:    &discordgo.User{ID: "bot-other", Username: "helper", GlobalName: "Helper Bot", Avatar: "avatar-hash", Bot: true},
 		Content:   "bot message",
 	}})
-	if sink.chatMessage.MessageID != "msg-01" {
+	if sink.chatMessage.MessageID != "msg-bot" || sink.chatMessage.UserID != "bot-other" || sink.chatMessage.Username != "Helper Bot" || sink.chatMessage.AvatarURL == "" || !sink.chatMessage.IsBot {
+		t.Fatalf("another bot's message should be published: %#v", sink.chatMessage)
+	}
+
+	client.onMessageCreate(session, &discordgo.MessageCreate{Message: &discordgo.Message{
+		ID:        "msg-self",
+		GuildID:   "guild-01",
+		ChannelID: "text-01",
+		Author:    &discordgo.User{ID: "bot-01", Username: "self", Bot: true},
+		Content:   "self message",
+	}})
+	if sink.chatMessage.MessageID != "msg-bot" {
 		t.Fatalf("bot's own message should be ignored: %#v", sink.chatMessage)
 	}
 }

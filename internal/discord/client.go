@@ -75,6 +75,8 @@ type ChatMessageEvent struct {
 	MessageID     string    `json:"message_id"`
 	UserID        string    `json:"user_id"`
 	Username      string    `json:"username,omitempty"`
+	AvatarURL     string    `json:"avatar_url,omitempty"`
+	IsBot         bool      `json:"is_bot,omitempty"`
 	Content       string    `json:"content"`
 	CreatedAt     time.Time `json:"created_at"`
 }
@@ -199,6 +201,7 @@ func NewRealClient(cfg Config) (*RealClient, error) {
 	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildVoiceStates | discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
 	client := &RealClient{cfg: cfg, session: session}
 	session.AddHandler(client.onGatewayDisconnect)
+	session.AddHandler(client.onReady)
 	session.AddHandler(client.onGatewayResumed)
 	session.AddHandler(client.onGuildCreate)
 	session.AddHandler(client.onVoiceStateUpdate)
@@ -469,6 +472,21 @@ func (c *RealClient) onGatewayDisconnect(_ *discordgo.Session, _ *discordgo.Disc
 	}
 }
 
+func (c *RealClient) onReady(session *discordgo.Session, _ *discordgo.Ready) {
+	c.mu.Lock()
+	c.status.Connected = true
+	c.status.LastError = ""
+	sink := c.sink
+	c.mu.Unlock()
+	if sink != nil {
+		sink.DiscordConnected()
+	}
+	// READY is the non-resumable reconnect counterpart to RESUMED. Its guild
+	// cache may still be filling, so this best-effort snapshot is followed by
+	// the authoritative GUILD_CREATE path below.
+	c.syncCurrentVoiceParticipants(session)
+}
+
 func (c *RealClient) onGatewayResumed(session *discordgo.Session, _ *discordgo.Resumed) {
 	c.mu.Lock()
 	c.status.Connected = true
@@ -575,7 +593,7 @@ func (c *RealClient) onMessageCreate(session *discordgo.Session, event *discordg
 	if event == nil || event.Message == nil || event.Author == nil {
 		return
 	}
-	if event.Author.Bot || event.Author.ID == sessionUserID(session) {
+	if event.Author.ID == sessionUserID(session) {
 		return
 	}
 	c.mu.Lock()
@@ -602,10 +620,27 @@ func (c *RealClient) onMessageCreate(session *discordgo.Session, event *discordg
 		TextChannelID: job.TextChannelID,
 		MessageID:     event.ID,
 		UserID:        event.Author.ID,
-		Username:      strings.TrimSpace(event.Author.Username),
+		Username:      discordMessageDisplayName(event.Message),
+		AvatarURL:     strings.TrimSpace(event.Author.AvatarURL("128")),
+		IsBot:         event.Author.Bot,
 		Content:       content,
 		CreatedAt:     createdAt,
 	})
+}
+
+func discordMessageDisplayName(message *discordgo.Message) string {
+	if message == nil || message.Author == nil {
+		return ""
+	}
+	if message.Member != nil {
+		if nickname := strings.TrimSpace(message.Member.Nick); nickname != "" {
+			return nickname
+		}
+	}
+	if globalName := strings.TrimSpace(message.Author.GlobalName); globalName != "" {
+		return globalName
+	}
+	return strings.TrimSpace(message.Author.Username)
 }
 
 // SnapshotVoiceParticipants returns one current, authoritative view of a
@@ -702,9 +737,24 @@ func (c *RealClient) snapshotVoiceParticipantsLocked(session *discordgo.Session,
 			avatarURL := ""
 			isBot := false
 			if voiceState.Member != nil && voiceState.Member.User != nil {
-				username = strings.TrimSpace(voiceState.Member.User.Username)
-				avatarURL = strings.TrimSpace(voiceState.Member.User.AvatarURL("128"))
-				isBot = voiceState.Member.User.Bot
+				member := voiceState.Member
+				user := member.User
+				username = strings.TrimSpace(member.Nick)
+				if username == "" {
+					username = strings.TrimSpace(user.GlobalName)
+				}
+				if username == "" {
+					username = strings.TrimSpace(user.Username)
+				}
+				memberForAvatar := *member
+				if strings.TrimSpace(memberForAvatar.GuildID) == "" {
+					memberForAvatar.GuildID = guild.ID
+				}
+				avatarURL = strings.TrimSpace(memberForAvatar.AvatarURL("128"))
+				if avatarURL == "" {
+					avatarURL = strings.TrimSpace(user.AvatarURL("128"))
+				}
+				isBot = user.Bot
 			}
 			participants = append(participants, VoiceParticipant{UserID: userID, Username: username, AvatarURL: avatarURL, IsBot: isBot})
 		}

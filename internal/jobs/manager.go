@@ -44,9 +44,17 @@ type Manager struct {
 	startedAt                   time.Time
 	participants                map[string]Participant
 	participantSnapshotRevision uint64
+	participantStateRevision    uint64
+	participantReportMu         sync.Mutex
+	participantSyncCancel       context.CancelFunc
+	participantSyncDelays       []time.Duration
+	participantSyncInterval     time.Duration
 	activeSpeaker               string
+	activeSpeakers              map[string]bool
 	lastEventAt                 time.Time
 	workerFailures              int64
+	workerFailureLogAt          map[string]time.Time
+	workerFailureLogInterval    time.Duration
 	voiceRejoinAttempts         int64
 	voiceRejoinFailures         int64
 	notificationReceipts        map[notificationEventKey]*notificationReceipt
@@ -129,6 +137,8 @@ type ChatMessage struct {
 	MessageID     string    `json:"message_id"`
 	UserID        string    `json:"user_id"`
 	Username      string    `json:"username,omitempty"`
+	AvatarURL     string    `json:"avatar_url,omitempty"`
+	IsBot         bool      `json:"is_bot,omitempty"`
 	Content       string    `json:"content"`
 	TextChannelID string    `json:"text_channel_id"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -157,6 +167,7 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		voice:               voice,
 		reporter:            reporter,
 		participants:        map[string]Participant{},
+		activeSpeakers:      map[string]bool{},
 		streamDefaults:      map[string]VoiceDefaults{},
 		autoStartPending:    map[string]time.Time{},
 		autoStopPending:     map[string]bool{},
@@ -176,7 +187,15 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		autoStopRetryDelays:  []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second},
 		autoStopCooldown:     15 * time.Second,
 		autoStartRefreshWait: 5 * time.Second,
-		notificationReceipts: map[notificationEventKey]*notificationReceipt{},
+		// Discord's state cache may lag immediately after JoinVoice, while the
+		// Bot -> Worker -> Encoder event path can fail transiently during service
+		// restarts. Re-publish one authoritative full snapshot on a bounded warmup
+		// schedule, then periodically while this exact job generation is active.
+		participantSyncDelays:    []time.Duration{250 * time.Millisecond, time.Second, 3 * time.Second},
+		participantSyncInterval:  15 * time.Second,
+		workerFailureLogAt:       map[string]time.Time{},
+		workerFailureLogInterval: 30 * time.Second,
+		notificationReceipts:     map[notificationEventKey]*notificationReceipt{},
 	}
 }
 
@@ -205,13 +224,17 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 
 	m.mu.Lock()
 	m.reconnectGeneration++
+	participantSyncGeneration := m.reconnectGeneration
+	participantSyncContext := m.restartParticipantSyncLocked()
 	m.current = job
 	now := time.Now().UTC()
 	m.startedAt = now
 	m.lastEventAt = now
 	m.participants = map[string]Participant{}
 	m.participantSnapshotRevision = 0
+	m.participantStateRevision = 0
 	m.activeSpeaker = ""
+	m.activeSpeakers = map[string]bool{}
 	delete(m.autoStartPending, job.StreamID)
 	m.mu.Unlock()
 
@@ -221,6 +244,7 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	// event or reconnect snapshot remains authoritative. Rejoin hydration keeps
 	// accepting an explicitly empty snapshot because the job was already live.
 	m.hydrateVoiceParticipants(job, true)
+	go m.keepVoiceParticipantsSynced(participantSyncContext, job, participantSyncGeneration)
 	return nil
 }
 
@@ -351,6 +375,10 @@ func (m *Manager) Stop(streamID string) error {
 	}
 
 	m.mu.Lock()
+	if m.participantSyncCancel != nil {
+		m.participantSyncCancel()
+		m.participantSyncCancel = nil
+	}
 	m.reconnectGeneration++
 	defer m.mu.Unlock()
 	m.current = discord.VoiceJob{}
@@ -358,6 +386,7 @@ func (m *Manager) Stop(streamID string) error {
 	m.lastEventAt = time.Now().UTC()
 	m.participants = map[string]Participant{}
 	m.activeSpeaker = ""
+	m.activeSpeakers = map[string]bool{}
 	return nil
 }
 
@@ -405,10 +434,28 @@ func (m *Manager) Metrics() map[string]float64 {
 	return status.Metrics
 }
 
-func (m *Manager) recordWorkerPublishFailure() {
+func (m *Manager) recordWorkerPublishFailure(eventType, streamID string, err error) {
+	eventType = strings.TrimSpace(eventType)
+	streamID = strings.TrimSpace(streamID)
+	if eventType == "" {
+		eventType = "unknown"
+	}
+	now := time.Now().UTC()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.workerFailures += 1
+	if m.workerFailureLogAt == nil {
+		m.workerFailureLogAt = map[string]time.Time{}
+	}
+	logKey := eventType + "\x00" + streamID
+	lastLogAt := m.workerFailureLogAt[logKey]
+	shouldLog := lastLogAt.IsZero() || m.workerFailureLogInterval <= 0 || now.Sub(lastLogAt) >= m.workerFailureLogInterval
+	if shouldLog {
+		m.workerFailureLogAt[logKey] = now
+	}
+	m.mu.Unlock()
+	if shouldLog {
+		log.Printf("Discord worker event publish failed: event_type=%s stream_id=%s error_class=%T", eventType, streamID, err)
+	}
 }
 
 func (m *Manager) Participants(streamID string) ([]Participant, error) {
@@ -455,24 +502,30 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 		m.participants[event.UserID] = participant
 	} else {
 		delete(m.participants, event.UserID)
+		delete(m.activeSpeakers, event.UserID)
 		if m.activeSpeaker == event.UserID {
-			m.activeSpeaker = ""
+			m.activeSpeaker = anyActiveSpeaker(m.activeSpeakers)
 		}
 	}
 	m.lastEventAt = now
+	m.participantStateRevision++
+	participantStateRevision := m.participantStateRevision
 	job := m.current
 	participants := m.participantsSnapshotLocked()
-	reporter := m.reporter
 	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
 	m.mu.Unlock()
-	if reporter != nil {
-		if err := reporter.ParticipantsChanged(job, participants); err != nil {
-			m.recordWorkerPublishFailure()
-		}
-	}
+	m.reportParticipantsIfCurrent(job, participants, participantStateRevision, 0, false)
 	if shouldAutoStop {
 		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
 	}
+}
+
+type participantSnapshotApplyOptions struct {
+	expectedGeneration    int64
+	requireGeneration     bool
+	authoritativeReplay   bool
+	expectedStateRevision uint64
+	requireStateRevision  bool
 }
 
 // ParticipantsSynced replaces the locally inferred participant set with a
@@ -480,24 +533,45 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 // an already-present member cannot be missed, while a leave lost during a
 // gateway reconnect cannot keep an empty VC alive indefinitely.
 func (m *Manager) ParticipantsSynced(snapshot discord.ParticipantSnapshot) {
+	m.participantsSynced(snapshot, participantSnapshotApplyOptions{})
+}
+
+func (m *Manager) participantsSynced(snapshot discord.ParticipantSnapshot, options participantSnapshotApplyOptions) bool {
 	snapshot.StreamID = strings.TrimSpace(snapshot.StreamID)
 	snapshot.GuildID = strings.TrimSpace(snapshot.GuildID)
 	snapshot.VoiceChannelID = strings.TrimSpace(snapshot.VoiceChannelID)
 	if snapshot.StreamID == "" || snapshot.GuildID == "" || snapshot.VoiceChannelID == "" {
-		return
+		return false
 	}
 
 	m.mu.Lock()
 	job := m.current
-	if job.StreamID != snapshot.StreamID || job.GuildID != snapshot.GuildID || job.VoiceChannelID != snapshot.VoiceChannelID {
+	if job.StreamID != snapshot.StreamID || job.GuildID != snapshot.GuildID || job.VoiceChannelID != snapshot.VoiceChannelID || (options.requireGeneration && m.reconnectGeneration != options.expectedGeneration) {
 		m.mu.Unlock()
-		return
+		return false
+	}
+	if options.requireStateRevision && m.participantStateRevision != options.expectedStateRevision {
+		participants := m.participantsSnapshotLocked()
+		stateRevision := m.participantStateRevision
+		m.mu.Unlock()
+		m.reportParticipantsIfCurrent(job, participants, stateRevision, options.expectedGeneration, options.requireGeneration)
+		return true
 	}
 	if snapshot.Revision != 0 && snapshot.Revision <= m.participantSnapshotRevision {
+		if options.authoritativeReplay && snapshot.Revision == m.participantSnapshotRevision {
+			participants := m.participantsSnapshotLocked()
+			stateRevision := m.participantStateRevision
+			m.mu.Unlock()
+			m.reportParticipantsIfCurrent(job, participants, stateRevision, options.expectedGeneration, options.requireGeneration)
+			return true
+		}
+		// A periodic snapshot can race a newer gateway snapshot between reading
+		// Discord state and taking the manager lock. Never let that older view
+		// replace the newer participant set.
 		m.mu.Unlock()
-		return
+		return true
 	}
-	if snapshot.Revision != 0 {
+	if snapshot.Revision > m.participantSnapshotRevision {
 		m.participantSnapshotRevision = snapshot.Revision
 	}
 	now := time.Now().UTC()
@@ -523,25 +597,26 @@ func (m *Manager) ParticipantsSynced(snapshot discord.ParticipantSnapshot) {
 		participantsByID[userID] = participant
 	}
 	m.participants = participantsByID
-	if m.activeSpeaker != "" {
-		if _, present := m.participants[m.activeSpeaker]; !present {
-			m.activeSpeaker = ""
+	for userID := range m.activeSpeakers {
+		if _, present := m.participants[userID]; !present {
+			delete(m.activeSpeakers, userID)
 		}
 	}
+	if !m.activeSpeakers[m.activeSpeaker] {
+		m.activeSpeaker = anyActiveSpeaker(m.activeSpeakers)
+	}
 	m.lastEventAt = now
+	m.participantStateRevision++
+	stateRevision := m.participantStateRevision
 	participants := m.participantsSnapshotLocked()
-	reporter := m.reporter
 	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
 	m.mu.Unlock()
 
-	if reporter != nil {
-		if err := reporter.ParticipantsChanged(job, participants); err != nil {
-			m.recordWorkerPublishFailure()
-		}
-	}
+	m.reportParticipantsIfCurrent(job, participants, stateRevision, options.expectedGeneration, options.requireGeneration)
 	if shouldAutoStop {
 		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
 	}
+	return true
 }
 
 func (m *Manager) hydrateVoiceParticipants(job discord.VoiceJob, suppressInitialEmpty bool) {
@@ -557,6 +632,139 @@ func (m *Manager) hydrateVoiceParticipants(job discord.VoiceJob, suppressInitial
 		return
 	}
 	m.ParticipantsSynced(snapshot)
+}
+
+func (m *Manager) keepVoiceParticipantsSynced(ctx context.Context, job discord.VoiceJob, generation int64) {
+	if _, ok := m.voice.(discord.ParticipantSnapshotSource); !ok {
+		return
+	}
+	m.mu.Lock()
+	delays := append([]time.Duration(nil), m.participantSyncDelays...)
+	interval := m.participantSyncInterval
+	m.mu.Unlock()
+
+	for index, delay := range delays {
+		if !waitForParticipantSync(ctx, delay) || !m.participantJobCurrent(job, generation, true) {
+			return
+		}
+		// Keep the earliest cache-warmup snapshots from turning Discord's
+		// transient empty state into an auto-stop. The final delayed snapshot is
+		// authoritative even when empty.
+		suppressEmpty := index < len(delays)-1
+		if !m.hydrateVoiceParticipantsForGeneration(job, suppressEmpty, generation) {
+			return
+		}
+	}
+
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !m.hydrateVoiceParticipantsForGeneration(job, false, generation) {
+				return
+			}
+		}
+	}
+}
+
+// restartParticipantSyncLocked replaces the one sync loop owned by the active
+// job. The caller must hold m.mu and start keepVoiceParticipantsSynced only
+// after releasing it.
+func (m *Manager) restartParticipantSyncLocked() context.Context {
+	if m.participantSyncCancel != nil {
+		m.participantSyncCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.participantSyncCancel = cancel
+	return ctx
+}
+
+func (m *Manager) hydrateVoiceParticipantsForGeneration(job discord.VoiceJob, suppressEmpty bool, generation int64) bool {
+	m.mu.Lock()
+	if m.reconnectGeneration != generation || m.current.StreamID != job.StreamID || m.current.GuildID != job.GuildID || m.current.VoiceChannelID != job.VoiceChannelID {
+		m.mu.Unlock()
+		return false
+	}
+	stateRevision := m.participantStateRevision
+	m.mu.Unlock()
+	source, ok := m.voice.(discord.ParticipantSnapshotSource)
+	if !ok {
+		return false
+	}
+	snapshot, known := source.SnapshotVoiceParticipants(job)
+	if !known {
+		return m.participantJobCurrent(job, generation, true)
+	}
+	if suppressEmpty && len(snapshot.Participants) == 0 {
+		return m.participantJobCurrent(job, generation, true)
+	}
+	return m.participantsSynced(snapshot, participantSnapshotApplyOptions{
+		expectedGeneration:    generation,
+		requireGeneration:     true,
+		authoritativeReplay:   true,
+		expectedStateRevision: stateRevision,
+		requireStateRevision:  true,
+	})
+}
+
+func (m *Manager) participantJobCurrent(job discord.VoiceJob, generation int64, requireGeneration bool) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if requireGeneration && m.reconnectGeneration != generation {
+		return false
+	}
+	return m.current.StreamID == job.StreamID && m.current.GuildID == job.GuildID && m.current.VoiceChannelID == job.VoiceChannelID
+}
+
+func (m *Manager) reportParticipantsIfCurrent(job discord.VoiceJob, participants []Participant, stateRevision uint64, generation int64, requireGeneration bool) {
+	m.participantReportMu.Lock()
+	defer m.participantReportMu.Unlock()
+
+	m.mu.Lock()
+	current := m.current
+	if current.StreamID != job.StreamID || current.GuildID != job.GuildID || current.VoiceChannelID != job.VoiceChannelID || (requireGeneration && m.reconnectGeneration != generation) {
+		m.mu.Unlock()
+		return
+	}
+	if m.participantStateRevision != stateRevision {
+		// Participant and speaking callbacks update state before waiting for the
+		// shared publish lock. If one overtakes this report, publish the newest
+		// full snapshot instead of dropping the participant card until the next
+		// periodic sync. Any newer event is then serialized after this snapshot.
+		participants = m.participantsSnapshotLocked()
+	}
+	reporter := m.reporter
+	m.mu.Unlock()
+	if reporter != nil {
+		if err := reporter.ParticipantsChanged(job, participants); err != nil {
+			m.recordWorkerPublishFailure("overlay.participants", job.StreamID, err)
+		}
+	}
+}
+
+func waitForParticipantSync(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // updateAutoStopForParticipantSetLocked applies the single empty/non-empty
@@ -1033,7 +1241,9 @@ func (m *Manager) shouldLogAutoStartLocked(key string, now time.Time) bool {
 
 func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 	content := trimDiscordChatContent(event.Content)
-	if content == "" {
+	messageID := trimDiscordChatField(event.MessageID, 128)
+	userID := trimDiscordChatField(event.UserID, 128)
+	if content == "" || messageID == "" || userID == "" {
 		return
 	}
 	m.mu.Lock()
@@ -1045,11 +1255,13 @@ func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 	reporter := m.reporter
 	m.lastEventAt = time.Now().UTC()
 	message := ChatMessage{
-		MessageID:     strings.TrimSpace(event.MessageID),
-		UserID:        strings.TrimSpace(event.UserID),
-		Username:      strings.TrimSpace(event.Username),
+		MessageID:     messageID,
+		UserID:        userID,
+		Username:      trimDiscordChatField(event.Username, 100),
+		AvatarURL:     trimDiscordChatField(event.AvatarURL, 2048),
+		IsBot:         event.IsBot,
 		Content:       content,
-		TextChannelID: strings.TrimSpace(event.TextChannelID),
+		TextChannelID: trimDiscordChatField(event.TextChannelID, 128),
 		CreatedAt:     event.CreatedAt,
 	}
 	if message.CreatedAt.IsZero() {
@@ -1058,18 +1270,25 @@ func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 	m.mu.Unlock()
 	if reporter != nil {
 		if err := reporter.ChatMessageReceived(job, message); err != nil {
-			m.recordWorkerPublishFailure()
+			m.recordWorkerPublishFailure("overlay.discord_chat", job.StreamID, err)
 		}
 	}
 }
 
 func trimDiscordChatContent(content string) string {
-	content = strings.TrimSpace(content)
-	runes := []rune(content)
-	if len(runes) <= 1000 {
-		return content
+	return trimDiscordChatField(content, 1000)
+}
+
+func trimDiscordChatField(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if maxRunes <= 0 {
+		return ""
 	}
-	return strings.TrimSpace(string(runes[:1000]))
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:maxRunes]))
 }
 
 func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) string {
@@ -1096,8 +1315,17 @@ func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) 
 
 func (m *Manager) DiscordConnected() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.lastEventAt = time.Now().UTC()
+	job := m.current
+	generation := m.reconnectGeneration
+	var participantSyncContext context.Context
+	if job.StreamID != "" {
+		participantSyncContext = m.restartParticipantSyncLocked()
+	}
+	m.mu.Unlock()
+	if participantSyncContext != nil {
+		go m.keepVoiceParticipantsSynced(participantSyncContext, job, generation)
+	}
 }
 
 func (m *Manager) DiscordDisconnected(reason string) {
@@ -1105,6 +1333,10 @@ func (m *Manager) DiscordDisconnected(reason string) {
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	policy := m.reconnectPolicy
+	if m.participantSyncCancel != nil {
+		m.participantSyncCancel()
+		m.participantSyncCancel = nil
+	}
 	m.reconnectGeneration++
 	generation := m.reconnectGeneration
 	m.mu.Unlock()
@@ -1121,20 +1353,17 @@ func (m *Manager) ActiveSpeakerDetected(streamID, userID string) {
 // A stop from a non-active participant must not clear another participant's
 // currently highlighted speaker.
 func (m *Manager) ActiveSpeakerStateChanged(streamID, userID string, speaking bool) {
-	if speaking {
-		_ = m.SetActiveSpeaker(streamID, userID)
-		return
-	}
-	// Keep the compare-and-clear under the same lock as the assignment so a
-	// concurrent new speaker cannot be cleared by an older stop notification.
-	_ = m.setActiveSpeaker(streamID, "", &userID)
+	_ = m.setSpeakerState(streamID, userID, speaking, true)
 }
 
 func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
-	return m.setActiveSpeaker(streamID, userID, nil)
+	if userID == "" {
+		return m.clearSpeakerStates(streamID)
+	}
+	return m.setSpeakerState(streamID, userID, true, false)
 }
 
-func (m *Manager) setActiveSpeaker(streamID, userID string, expectedPrevious *string) error {
+func (m *Manager) setSpeakerState(streamID, userID string, speaking, preserveOthers bool) error {
 	m.mu.Lock()
 	if m.current.StreamID == "" {
 		m.mu.Unlock()
@@ -1144,50 +1373,118 @@ func (m *Manager) setActiveSpeaker(streamID, userID string, expectedPrevious *st
 		m.mu.Unlock()
 		return errors.New("stream_id does not match current job")
 	}
-	if expectedPrevious != nil && m.activeSpeaker != *expectedPrevious {
+	if _, ok := m.participants[userID]; !ok {
+		m.mu.Unlock()
+		return errors.New("active speaker must be an active participant")
+	}
+	if m.activeSpeakers == nil {
+		m.activeSpeakers = map[string]bool{}
+	}
+	currentlySpeaking := m.activeSpeakers[userID]
+	if preserveOthers && currentlySpeaking == speaking {
 		m.mu.Unlock()
 		return nil
 	}
-	if userID != "" {
-		if _, ok := m.participants[userID]; !ok {
-			m.mu.Unlock()
-			return errors.New("active speaker must be an active participant")
+	if speaking && !preserveOthers && currentlySpeaking && len(m.activeSpeakers) == 1 {
+		m.mu.Unlock()
+		return nil
+	}
+	if speaking {
+		if !preserveOthers {
+			m.activeSpeakers = map[string]bool{}
+		}
+		m.activeSpeakers[userID] = true
+		m.activeSpeaker = userID
+	} else {
+		delete(m.activeSpeakers, userID)
+		if m.activeSpeaker == userID {
+			m.activeSpeaker = anyActiveSpeaker(m.activeSpeakers)
 		}
 	}
-	if m.activeSpeaker == userID {
-		m.mu.Unlock()
-		return nil
-	}
-	m.activeSpeaker = userID
+	m.participantStateRevision++
+	stateRevision := m.participantStateRevision
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	displayName := ""
 	if participant, ok := m.participants[userID]; ok {
 		displayName = participant.Username
 	}
+	participants := m.participantsSnapshotLocked()
+	m.mu.Unlock()
+	m.reportParticipantsIfCurrent(job, participants, stateRevision, 0, false)
+	m.reportActiveSpeakerIfCurrent(job, userID, displayName, speaking, stateRevision)
+	return nil
+}
+
+func (m *Manager) clearSpeakerStates(streamID string) error {
+	m.mu.Lock()
+	if m.current.StreamID == "" {
+		m.mu.Unlock()
+		return errors.New("no active stream job")
+	}
+	if streamID != "" && streamID != m.current.StreamID {
+		m.mu.Unlock()
+		return errors.New("stream_id does not match current job")
+	}
+	if len(m.activeSpeakers) == 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	m.activeSpeakers = map[string]bool{}
+	m.activeSpeaker = ""
+	m.participantStateRevision++
+	stateRevision := m.participantStateRevision
+	m.lastEventAt = time.Now().UTC()
+	job := m.current
+	participants := m.participantsSnapshotLocked()
+	m.mu.Unlock()
+	m.reportParticipantsIfCurrent(job, participants, stateRevision, 0, false)
+	m.reportActiveSpeakerIfCurrent(job, "", "", false, stateRevision)
+	return nil
+}
+
+func (m *Manager) reportActiveSpeakerIfCurrent(job discord.VoiceJob, userID, displayName string, speaking bool, stateRevision uint64) {
+	m.participantReportMu.Lock()
+	defer m.participantReportMu.Unlock()
+
+	m.mu.Lock()
+	current := m.current
+	if current.StreamID != job.StreamID || current.GuildID != job.GuildID || current.VoiceChannelID != job.VoiceChannelID || m.participantStateRevision != stateRevision {
+		m.mu.Unlock()
+		return
+	}
 	reporter := m.reporter
 	m.mu.Unlock()
-	if reporter != nil {
-		var err error
-		if stateReporter, ok := reporter.(ActiveSpeakerStateReporter); ok {
-			err = stateReporter.ActiveSpeakerStateChanged(job, userID, displayName, userID != "")
-		} else if userID != "" {
-			err = reporter.ActiveSpeakerChanged(job, userID, displayName)
-		}
-		if err != nil {
-			m.recordWorkerPublishFailure()
-		}
+	if reporter == nil {
+		return
 	}
-	return nil
+	var err error
+	if stateReporter, ok := reporter.(ActiveSpeakerStateReporter); ok {
+		err = stateReporter.ActiveSpeakerStateChanged(job, userID, displayName, speaking)
+	} else if speaking {
+		err = reporter.ActiveSpeakerChanged(job, userID, displayName)
+	}
+	if err != nil {
+		m.recordWorkerPublishFailure("overlay.active_speaker", job.StreamID, err)
+	}
 }
 
 func (m *Manager) participantsSnapshotLocked() []Participant {
 	out := make([]Participant, 0, len(m.participants))
 	for _, participant := range m.participants {
-		participant.Speaking = participant.UserID == m.activeSpeaker
+		participant.Speaking = m.activeSpeakers[participant.UserID]
 		out = append(out, participant)
 	}
 	return out
+}
+
+func anyActiveSpeaker(active map[string]bool) string {
+	for userID, speaking := range active {
+		if speaking {
+			return userID
+		}
+	}
+	return ""
 }
 
 func metricsFromStatus(status discord.Status, participantCount int) map[string]float64 {
@@ -1239,12 +1536,15 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 		if err := m.voice.JoinVoice(job); err == nil {
 			m.mu.Lock()
 			stillCurrent := generation == m.reconnectGeneration && m.current.StreamID == job.StreamID
+			var participantSyncContext context.Context
 			if stillCurrent {
 				m.lastEventAt = time.Now().UTC()
+				participantSyncContext = m.restartParticipantSyncLocked()
 			}
 			m.mu.Unlock()
 			if stillCurrent {
 				m.hydrateVoiceParticipants(job, false)
+				go m.keepVoiceParticipantsSynced(participantSyncContext, job, generation)
 			}
 			return
 		}

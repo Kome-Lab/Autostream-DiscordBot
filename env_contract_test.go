@@ -44,6 +44,26 @@ func TestBaseComposePublishesCanonicalDiscordBotPort(t *testing.T) {
 	)
 }
 
+func TestDiscordGatewayIntentDocumentationContract(t *testing.T) {
+	assertFileContains(t, "internal/discord/client.go",
+		"discordgo.IntentsGuildVoiceStates",
+		"discordgo.IntentsGuildMessages",
+		"discordgo.IntentsMessageContent",
+	)
+	assertFileContains(t, "README.md",
+		"`Guild Voice States`",
+		"`Message Content Intent`",
+		"VC参加者",
+		"チャットだけが空",
+	)
+	assertFileContains(t, "release/README.install.md",
+		"`Guild Voice States`",
+		"`Message Content Intent`",
+		"VC participant",
+		"chat overlay remains empty",
+	)
+}
+
 func TestProductionComposeReplacesBasePortWithLoopbackPublish(t *testing.T) {
 	assertFileContains(t, "docker-compose.prod.yml",
 		"AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}",

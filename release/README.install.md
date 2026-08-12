@@ -13,6 +13,19 @@ This archive contains the Linux binary, systemd example, and placeholder environ
 - Discord application credentials supplied outside Git.
 - Network access to the Control Panel and Discord.
 
+## Discord Gateway intents
+
+The Bot requests `Guild Voice States`, `Guild Messages`, and `Message Content`
+when it connects to the Gateway. `Guild Voice States` is the standard intent
+used for VC participant names, avatars, and speaking state; it is distinct from
+Discord's privileged Message Content setting.
+
+For Discord chat in the stream overlay, enable **Bot → Privileged Gateway
+Intents → `Message Content Intent`** for the application in the Discord
+Developer Portal. Restart `autostream-discord-bot` after changing the toggle so
+the Gateway session reconnects. If it is disabled, VC participant and speaking
+state continue to work, but the chat overlay remains empty.
+
 ## Verify and transfer one archive
 
 On the operator machine, download and attest the exact amd64 archive:
