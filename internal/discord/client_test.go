@@ -472,6 +472,35 @@ func TestVoiceSpeakingUpdateReportsStopToStateSink(t *testing.T) {
 	}
 }
 
+func TestAudioActivityExpiresMissingSpeakerStop(t *testing.T) {
+	sink := &activeSpeakerStateSink{}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	client := &RealClient{sink: sink, job: job}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	client.recordAudioSpeakerActivity(job, "user-01", now)
+	client.expireIdleAudioSpeakers(job, now.Add(audioSpeakerIdleTimeout))
+
+	if !reflect.DeepEqual(sink.speaking, []bool{true, false}) || sink.activeUserID != "user-01" {
+		t.Fatalf("audio activity did not converge a missing Discord speaking stop: %#v", sink)
+	}
+}
+
+func TestAudioActivityRefreshKeepsCurrentSpeakerHighlighted(t *testing.T) {
+	sink := &activeSpeakerStateSink{}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	client := &RealClient{sink: sink, job: job}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	client.recordAudioSpeakerActivity(job, "user-01", now)
+	client.recordAudioSpeakerActivity(job, "user-01", now.Add(audioSpeakerIdleTimeout/2))
+	client.expireIdleAudioSpeakers(job, now.Add(audioSpeakerIdleTimeout))
+
+	if !reflect.DeepEqual(sink.speaking, []bool{true}) {
+		t.Fatalf("active audio was cleared before the idle timeout: %#v", sink.speaking)
+	}
+}
+
 func TestGatewayReconnectStatus(t *testing.T) {
 	client := &RealClient{status: Status{Connected: true}}
 	client.onGatewayDisconnect(nil, &discordgo.Disconnect{})

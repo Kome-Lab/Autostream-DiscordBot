@@ -172,15 +172,16 @@ func (c Config) Validate() error {
 }
 
 type RealClient struct {
-	cfg       Config
-	session   *discordgo.Session
-	voice     *discordgo.VoiceConnection
-	sink      EventSink
-	forward   AudioForwarder
-	source    string
-	audioStop chan struct{}
-	ssrcUsers map[uint32]string
-	mu        sync.Mutex
+	cfg           Config
+	session       *discordgo.Session
+	voice         *discordgo.VoiceConnection
+	sink          EventSink
+	forward       AudioForwarder
+	source        string
+	audioStop     chan struct{}
+	ssrcUsers     map[uint32]string
+	audioSpeakers map[string]time.Time
+	mu            sync.Mutex
 	// participantSyncMu serializes snapshot creation and delivery. DiscordGo
 	// invokes typed handlers asynchronously, so an older handler must always
 	// re-read the latest State while holding this gate before it can publish.
@@ -189,6 +190,8 @@ type RealClient struct {
 	status                  Status
 	job                     VoiceJob
 }
+
+const audioSpeakerIdleTimeout = 1250 * time.Millisecond
 
 func NewRealClient(cfg Config) (*RealClient, error) {
 	if err := cfg.Validate(); err != nil {
@@ -273,6 +276,7 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	c.job = job
 	c.audioStop = audioStop
 	c.ssrcUsers = map[uint32]string{}
+	c.audioSpeakers = map[string]time.Time{}
 	forwarder := c.forward
 	source := c.source
 	c.status.VoiceConnected = true
@@ -304,6 +308,7 @@ func (c *RealClient) LeaveVoice(streamID string) error {
 	c.voice = nil
 	c.job = VoiceJob{}
 	c.ssrcUsers = nil
+	c.audioSpeakers = nil
 	c.status.VoiceConnected = false
 	c.status.AudioReceiving = false
 	c.status.AudioForwardActive = false
@@ -335,6 +340,16 @@ func (c *RealClient) onVoiceSpeakingUpdate(_ *discordgo.VoiceConnection, event *
 	sink := c.sink
 	userID := event.UserID
 	speaking := event.Speaking
+	if userID != "" {
+		if speaking {
+			if c.audioSpeakers == nil {
+				c.audioSpeakers = map[string]time.Time{}
+			}
+			c.audioSpeakers[userID] = time.Now().UTC()
+		} else {
+			delete(c.audioSpeakers, userID)
+		}
+	}
 	c.mu.Unlock()
 	if streamID == "" || userID == "" || sink == nil {
 		return
@@ -418,6 +433,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 			flush()
 			return
 		case <-flushEvery.C:
+			c.expireIdleAudioSpeakers(job, time.Now().UTC())
 			flush()
 		case packet, ok := <-packets:
 			if !ok {
@@ -430,6 +446,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 			}
 			userID := c.userForSSRC(packet.SSRC)
 			now := time.Now().UTC()
+			c.recordAudioSpeakerActivity(job, userID, now)
 			c.mu.Lock()
 			c.status.AudioReceiving = true
 			c.status.LastAudioAt = now.Format(time.RFC3339Nano)
@@ -447,6 +464,59 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 				flush()
 			}
 		}
+	}
+}
+
+func (c *RealClient) recordAudioSpeakerActivity(job VoiceJob, userID string, now time.Time) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.job.StreamID != job.StreamID || c.job.GuildID != job.GuildID || c.job.VoiceChannelID != job.VoiceChannelID {
+		c.mu.Unlock()
+		return
+	}
+	if c.audioSpeakers == nil {
+		c.audioSpeakers = map[string]time.Time{}
+	}
+	_, alreadyActive := c.audioSpeakers[userID]
+	c.audioSpeakers[userID] = now
+	streamID := c.job.StreamID
+	sink := c.sink
+	c.mu.Unlock()
+	if alreadyActive || sink == nil {
+		return
+	}
+	if stateSink, ok := sink.(ActiveSpeakerStateSink); ok {
+		stateSink.ActiveSpeakerStateChanged(streamID, userID, true)
+	} else {
+		sink.ActiveSpeakerDetected(streamID, userID)
+	}
+}
+
+func (c *RealClient) expireIdleAudioSpeakers(job VoiceJob, now time.Time) {
+	c.mu.Lock()
+	if c.job.StreamID != job.StreamID || c.job.GuildID != job.GuildID || c.job.VoiceChannelID != job.VoiceChannelID {
+		c.mu.Unlock()
+		return
+	}
+	expired := make([]string, 0)
+	for userID, lastAudioAt := range c.audioSpeakers {
+		if !lastAudioAt.Add(audioSpeakerIdleTimeout).After(now) {
+			delete(c.audioSpeakers, userID)
+			expired = append(expired, userID)
+		}
+	}
+	streamID := c.job.StreamID
+	sink := c.sink
+	c.mu.Unlock()
+	stateSink, ok := sink.(ActiveSpeakerStateSink)
+	if !ok {
+		return
+	}
+	for _, userID := range expired {
+		stateSink.ActiveSpeakerStateChanged(streamID, userID, false)
 	}
 }
 
@@ -831,6 +901,7 @@ func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {
 	}
 	c.voice = nil
 	c.ssrcUsers = nil
+	c.audioSpeakers = nil
 	c.status.VoiceConnected = false
 	c.status.AudioReceiving = false
 	c.status.AudioForwardActive = false
