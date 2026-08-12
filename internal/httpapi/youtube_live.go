@@ -75,16 +75,26 @@ func (s Server) youtubeLiveNotification(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	streamConfig, ok := cfg.DiscordConfigForStream(streamID)
-	if !ok {
-		writeNotificationError(w, http.StatusConflict, "discord_config_not_found", "primary Discord config is not available for the stream", false)
-		return
+	textChannelID := ""
+	if ok {
+		textChannelID = strings.TrimSpace(streamConfig.TextChannelID)
 	}
-	textChannelID := strings.TrimSpace(streamConfig.TextChannelID)
 	if textChannelID == "" {
+		// Live streams are deliberately omitted from the waiting/auto-start
+		// runtime config. Use the channel captured in the active, assignment-
+		// scoped job when that omission is the only reason the lookup failed.
+		if activeChannelID, active := s.manager.ActiveLiveJobTextChannelID(streamID); active {
+			textChannelID = activeChannelID
+		}
+	}
+	if textChannelID == "" {
+		if !ok {
+			writeNotificationError(w, http.StatusConflict, "discord_config_not_found", "primary Discord config is not available for the stream", false)
+			return
+		}
 		writeNotificationError(w, http.StatusConflict, "text_channel_not_configured", "primary Discord config has no text channel", false)
 		return
 	}
-
 	result, err := s.manager.NotifyYouTubeLive(r.Context(), streamID, req.EventID, textChannelID, watchURL)
 	if err != nil {
 		writeYouTubeLiveNotificationError(w, err)

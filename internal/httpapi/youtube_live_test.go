@@ -79,6 +79,38 @@ func TestYouTubeLiveNotificationUsesRuntimeChannelAndIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestYouTubeLiveNotificationUsesActiveJobChannelWhenLiveRuntimeConfigOmitsStream(t *testing.T) {
+	voice := &httpFakeVoice{sendMessageID: "message-active-job"}
+	manager := jobs.NewManager(voice)
+	if err := manager.Start(discord.VoiceJob{
+		StreamID:       "stream-01",
+		GuildID:        "guild-01",
+		VoiceChannelID: "voice-01",
+		TextChannelID:  "text-from-start",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServerWithRuntimeConfig(control.ServiceType, manager, TokenVerifier{PlainToken: "expected"}, func(context.Context) (control.RuntimeConfig, error) {
+		return control.RuntimeConfig{
+			Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+			Assignments: []control.StreamServiceAssignment{{
+				StreamID:       "stream-01",
+				ServiceID:      "discord-bot-01",
+				ServiceType:    control.ServiceType,
+				AssignmentRole: "primary",
+			}},
+		}, nil
+	})
+
+	res := performYouTubeNotificationRequest(t, handler, "expected", `{"event_id":"event-active-job","watch_url":"https://youtu.be/abc123"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	if len(voice.sentMessages) != 1 || voice.sentMessages[0].ChannelID != "text-from-start" {
+		t.Fatalf("notification did not use active job channel: %#v", voice.sentMessages)
+	}
+}
+
 func TestYouTubeLiveNotificationRejectsPayloadChannelID(t *testing.T) {
 	voice := &httpFakeVoice{}
 	manager := jobs.NewManager(voice)

@@ -33,6 +33,26 @@ type NotificationResult struct {
 	AlreadySent bool
 }
 
+// ActiveLiveJobTextChannelID returns the channel captured when the current
+// stream job was started. The Control Panel intentionally omits live streams
+// from the Bot's waiting/auto-start runtime config, so a notification arriving
+// immediately after the start transition may not find a stream config there.
+// The caller must still authenticate the service and verify the stream
+// assignment before using this value.
+func (m *Manager) ActiveLiveJobTextChannelID(streamID string) (string, bool) {
+	streamID = strings.TrimSpace(streamID)
+	if m == nil || streamID == "" {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if strings.TrimSpace(m.current.StreamID) != streamID {
+		return "", false
+	}
+	channelID := strings.TrimSpace(m.current.TextChannelID)
+	return channelID, channelID != ""
+}
+
 type notificationEventKey [sha256.Size]byte
 
 type notificationReceipt struct {
