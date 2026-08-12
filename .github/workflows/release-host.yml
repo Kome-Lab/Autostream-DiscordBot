@@ -109,7 +109,17 @@ jobs:
             libc6-dev-arm64-cross
           vcpkg_dir="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
           git -C "$vcpkg_dir" fetch --unshallow || git -C "$vcpkg_dir" fetch --all --tags
-          "$vcpkg_dir/bootstrap-vcpkg.sh" -disableMetrics
+          for bootstrap_attempt in 1 2 3; do
+            echo "Bootstrapping vcpkg (attempt ${bootstrap_attempt}/3)"
+            if "$vcpkg_dir/bootstrap-vcpkg.sh" -disableMetrics; then
+              break
+            fi
+            if [[ "$bootstrap_attempt" -eq 3 ]]; then
+              echo 'vcpkg bootstrap failed after 3 attempts' >&2
+              exit 1
+            fi
+            sleep $((bootstrap_attempt * 15))
+          done
           dave_cpp="$PWD/third_party/discordgo/dave/libdave/cpp"
           for arch in amd64 arm64; do
             if [[ "$arch" == amd64 ]]; then
