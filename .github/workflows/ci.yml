@@ -44,6 +44,8 @@ jobs:
           export CC=gcc CXX=g++
           # Hosted-runner GitHub archive downloads can reset transiently; retain
           # completed vcpkg packages and retry the configure/build as a unit.
+          # This is the explicit-CMake equivalent of:
+          # make -C third_party/discordgo/dave/libdave/cpp BUILD_TYPE=Release
           for attempt in 1 2 3; do
             echo "Building pinned libdave (attempt ${attempt}/3)"
             if cmake -S "$cpp_root" -B "$build_dir" -G Ninja \
