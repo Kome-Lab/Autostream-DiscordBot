@@ -37,12 +37,34 @@ jobs:
             fetch --unshallow || \
             git -C third_party/discordgo/dave/libdave/cpp/vcpkg fetch --all --tags
           vcpkg_root="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
+          cpp_root="$PWD/third_party/discordgo/dave/libdave/cpp"
+          build_dir="$cpp_root/build"
           "$vcpkg_root/bootstrap-vcpkg.sh" -disableMetrics
           test -x "$vcpkg_root/vcpkg"
-          CMAKE_GENERATOR=Ninja \
-          CC=gcc \
-          CXX=g++ \
-            make -C third_party/discordgo/dave/libdave/cpp BUILD_TYPE=Release
+          export CC=gcc CXX=g++
+          # Hosted-runner GitHub archive downloads can reset transiently; retain
+          # completed vcpkg packages and retry the configure/build as a unit.
+          for attempt in 1 2 3; do
+            echo "Building pinned libdave (attempt ${attempt}/3)"
+            if cmake -S "$cpp_root" -B "$build_dir" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DVCPKG_MANIFEST_DIR="$cpp_root/vcpkg-alts/openssl_3" \
+              -DCMAKE_TOOLCHAIN_FILE="$cpp_root/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DENABLE_SANITIZERS=OFF \
+              -DPERSISTENT_KEYS=OFF \
+              -DTESTING=OFF \
+              -DCMAKE_INSTALL_PREFIX="$build_dir/install" \
+              -DINSTALL_VCPKG_LICENSES=OFF \
+              && cmake --build "$build_dir" --target libdave --config Release; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo 'libdave build failed after 3 attempts' >&2
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
       - name: Test Go packages with DAVE-linked DiscordGo
         shell: bash
         run: |
