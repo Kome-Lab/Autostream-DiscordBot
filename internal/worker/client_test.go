@@ -157,8 +157,34 @@ func TestReporterErrorDoesNotLeakToken(t *testing.T) {
 	}
 }
 
+func TestReporterClassifiesRetryableHTTPStatusWithoutSecrets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "secret-token https://worker.example.invalid/private", http.StatusConflict)
+	}))
+	defer server.Close()
+
+	reporter := Reporter{Config: Config{Timeout: time.Second, RetryDelays: []time.Duration{}}}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	err := reporter.post(context.Background(), job, "/streams/stream-01/events/participants", map[string]any{})
+	if err == nil {
+		t.Fatal("expected publish error")
+	}
+	var classified *PublishError
+	if !errors.As(err, &classified) {
+		t.Fatalf("publish error type = %T, want *PublishError", err)
+	}
+	if classified.HTTPStatusCode() != http.StatusConflict || classified.ErrorClass() != "http_status" || !classified.RetryablePublish() {
+		t.Fatalf("unexpected publish classification: status=%d class=%q retryable=%t", classified.HTTPStatusCode(), classified.ErrorClass(), classified.RetryablePublish())
+	}
+	for _, secret := range []string{"secret-token", "worker.example.invalid", "private"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("publish error leaked %q: %v", secret, err)
+		}
+	}
+}
+
 func TestReporterRetriesTransientWorkerFailure(t *testing.T) {
-	for _, statusCode := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+	for _, statusCode := range []int{http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
 		t.Run(http.StatusText(statusCode), func(t *testing.T) {
 			attempts := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +246,24 @@ func TestReporterRetriesTransientTransportFailure(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Fatalf("transport publish attempts = %d, want 2", attempts)
+	}
+}
+
+func TestReporterStopsAfterConfiguredRetryBudget(t *testing.T) {
+	attempts := 0
+	reporter := Reporter{
+		Config: Config{Timeout: time.Second, RetryDelays: []time.Duration{0, 0}},
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			attempts++
+			return nil, errors.New("temporary transport failure")
+		})},
+	}
+	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: "https://worker.example.com", WorkerEventsToken: "secret-token"}
+	if err := reporter.ParticipantsChanged(job, []jobs.Participant{{UserID: "user-01"}}); err == nil {
+		t.Fatal("expected bounded publish failure")
+	}
+	if attempts != 3 {
+		t.Fatalf("publish attempts = %d, want initial attempt plus two retries", attempts)
 	}
 }
 

@@ -18,6 +18,8 @@ type Manager struct {
 	streamStopper               StreamStopper
 	mu                          sync.Mutex
 	current                     discord.VoiceJob
+	stopping                    bool
+	disconnected                bool
 	defaults                    VoiceDefaults
 	streamDefaults              map[string]VoiceDefaults
 	autoStartPending            map[string]time.Time
@@ -49,6 +51,7 @@ type Manager struct {
 	participantSyncCancel       context.CancelFunc
 	participantSyncDelays       []time.Duration
 	participantSyncInterval     time.Duration
+	workerRetry                 *workerEventRetryQueue
 	activeSpeaker               string
 	activeSpeakers              map[string]bool
 	lastEventAt                 time.Time
@@ -78,6 +81,21 @@ type EventReporter interface {
 	ParticipantsChanged(job discord.VoiceJob, participants []Participant) error
 	ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName string) error
 	ChatMessageReceived(job discord.VoiceJob, message ChatMessage) error
+}
+
+// The context-aware extensions are optional so existing reporters and focused
+// test doubles remain source-compatible. The production Worker reporter uses
+// them so Stop/Disconnect can cancel an in-flight HTTP request.
+type ParticipantsContextReporter interface {
+	ParticipantsChangedContext(ctx context.Context, job discord.VoiceJob, participants []Participant) error
+}
+
+type ActiveSpeakerContextReporter interface {
+	ActiveSpeakerStateChangedContext(ctx context.Context, job discord.VoiceJob, userID, displayName string, speaking bool) error
+}
+
+type ChatContextReporter interface {
+	ChatMessageReceivedContext(ctx context.Context, job discord.VoiceJob, message ChatMessage) error
 }
 
 // ActiveSpeakerStateReporter is an optional EventReporter extension. It lets
@@ -211,6 +229,10 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 		return errors.New("voice_channel_id is required")
 	}
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return errors.New("stream job is stopping")
+	}
 	if m.current.StreamID != "" && m.current.StreamID != job.StreamID {
 		m.mu.Unlock()
 		return errors.New("another stream job is already active")
@@ -226,7 +248,12 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	m.reconnectGeneration++
 	participantSyncGeneration := m.reconnectGeneration
 	participantSyncContext := m.restartParticipantSyncLocked()
+	previousWorkerRetry := m.workerRetry
+	workerRetry := newWorkerEventRetryQueue()
+	m.workerRetry = workerRetry
 	m.current = job
+	m.stopping = false
+	m.disconnected = false
 	now := time.Now().UTC()
 	m.startedAt = now
 	m.lastEventAt = now
@@ -237,6 +264,10 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	m.activeSpeakers = map[string]bool{}
 	delete(m.autoStartPending, job.StreamID)
 	m.mu.Unlock()
+	if previousWorkerRetry != nil {
+		previousWorkerRetry.stopAndWait()
+	}
+	workerRetry.start(m)
 
 	// Discord's gateway cache can briefly report the target channel as empty
 	// while JoinVoice is establishing the bot's session. Do not turn that
@@ -358,6 +389,10 @@ func (m *Manager) Stop(streamID string) error {
 		m.mu.Unlock()
 		return errors.New("no active stream job")
 	}
+	if m.stopping {
+		m.mu.Unlock()
+		return errors.New("stream job is stopping")
+	}
 	if streamID != "" && streamID != currentStreamID {
 		m.mu.Unlock()
 		return errors.New("stream_id does not match current job")
@@ -368,9 +403,30 @@ func (m *Manager) Stop(streamID string) error {
 	// Encoder/Worker stops and creates the successor waiting stream. Participant
 	// rejoin paths still use cancelAutoStopLocked to abort a stale request.
 	m.invalidateAutoStopLocked(currentStreamID)
+	m.stopping = true
+	remainingWorkerRetry := m.workerRetry
+	m.workerRetry = nil
+	m.reconnectGeneration++
 	m.mu.Unlock()
+	if remainingWorkerRetry != nil {
+		remainingWorkerRetry.stopAndWait()
+	}
 
 	if err := m.voice.LeaveVoice(currentStreamID); err != nil {
+		m.mu.Lock()
+		if m.current.StreamID == currentStreamID && m.stopping {
+			m.stopping = false
+			jobAfterFailure := m.current
+			participantSyncGeneration := m.reconnectGeneration
+			participantSyncContext := m.restartParticipantSyncLocked()
+			workerRetry := newWorkerEventRetryQueue()
+			m.workerRetry = workerRetry
+			m.mu.Unlock()
+			workerRetry.start(m)
+			go m.keepVoiceParticipantsSynced(participantSyncContext, jobAfterFailure, participantSyncGeneration)
+		} else {
+			m.mu.Unlock()
+		}
 		return err
 	}
 
@@ -379,14 +435,19 @@ func (m *Manager) Stop(streamID string) error {
 		m.participantSyncCancel()
 		m.participantSyncCancel = nil
 	}
-	m.reconnectGeneration++
-	defer m.mu.Unlock()
+	previousWorkerRetry := m.workerRetry
+	m.workerRetry = nil
 	m.current = discord.VoiceJob{}
+	m.stopping = false
 	m.startedAt = time.Time{}
 	m.lastEventAt = time.Now().UTC()
 	m.participants = map[string]Participant{}
 	m.activeSpeaker = ""
 	m.activeSpeakers = map[string]bool{}
+	m.mu.Unlock()
+	if previousWorkerRetry != nil {
+		previousWorkerRetry.stopAndWait()
+	}
 	return nil
 }
 
@@ -435,11 +496,19 @@ func (m *Manager) Metrics() map[string]float64 {
 }
 
 func (m *Manager) recordWorkerPublishFailure(eventType, streamID string, err error) {
+	m.recordWorkerPublishFailureAttempt(eventType, streamID, 1, err)
+}
+
+func (m *Manager) recordWorkerPublishFailureAttempt(eventType, streamID string, retryCount int, err error) {
 	eventType = strings.TrimSpace(eventType)
 	streamID = strings.TrimSpace(streamID)
 	if eventType == "" {
 		eventType = "unknown"
 	}
+	if retryCount < 1 {
+		retryCount = 1
+	}
+	errorClass, httpStatus, retryable := workerPublishMetadata(err)
 	now := time.Now().UTC()
 	m.mu.Lock()
 	m.workerFailures += 1
@@ -454,7 +523,7 @@ func (m *Manager) recordWorkerPublishFailure(eventType, streamID string, err err
 	}
 	m.mu.Unlock()
 	if shouldLog {
-		log.Printf("Discord worker event publish failed: event_type=%s stream_id=%s error_class=%T", eventType, streamID, err)
+		log.Printf("Discord worker event publish failed: event_type=%s stream_id=%s error_class=%s http_status=%d retryable=%t retry_count=%d", eventType, streamID, errorClass, httpStatus, retryable, retryCount)
 	}
 }
 
@@ -477,11 +546,13 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 		return
 	}
 	m.mu.Lock()
-	if m.current.StreamID == "" || event.StreamID != m.current.StreamID {
+	if m.eventsPausedLocked() || m.current.StreamID == "" || event.StreamID != m.current.StreamID {
 		m.mu.Unlock()
 		return
 	}
 	now := time.Now().UTC()
+	speakerStopped := false
+	speakerDisplayName := ""
 	if event.Present {
 		joinedAt := now
 		if existing, ok := m.participants[event.UserID]; ok && !existing.JoinedAt.IsZero() {
@@ -499,6 +570,10 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 		}
 		m.participants[event.UserID] = participant
 	} else {
+		if participant, ok := m.participants[event.UserID]; ok {
+			speakerDisplayName = participant.Username
+		}
+		speakerStopped = m.activeSpeakers[event.UserID]
 		delete(m.participants, event.UserID)
 		delete(m.activeSpeakers, event.UserID)
 		if m.activeSpeaker == event.UserID {
@@ -508,11 +583,15 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 	m.lastEventAt = now
 	m.participantStateRevision++
 	participantStateRevision := m.participantStateRevision
+	reconnectGeneration := m.reconnectGeneration
 	job := m.current
 	participants := m.participantsSnapshotLocked()
 	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
 	m.mu.Unlock()
-	m.reportParticipantsIfCurrent(job, participants, participantStateRevision, 0, false)
+	m.reportParticipantsIfCurrent(job, participants, participantStateRevision, reconnectGeneration, true)
+	if speakerStopped {
+		m.reportActiveSpeakerIfCurrent(job, event.UserID, speakerDisplayName, false, participantStateRevision, reconnectGeneration)
+	}
 	if shouldAutoStop {
 		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
 	}
@@ -544,23 +623,25 @@ func (m *Manager) participantsSynced(snapshot discord.ParticipantSnapshot, optio
 
 	m.mu.Lock()
 	job := m.current
-	if job.StreamID != snapshot.StreamID || job.GuildID != snapshot.GuildID || job.VoiceChannelID != snapshot.VoiceChannelID || (options.requireGeneration && m.reconnectGeneration != options.expectedGeneration) {
+	if m.eventsPausedLocked() || job.StreamID != snapshot.StreamID || job.GuildID != snapshot.GuildID || job.VoiceChannelID != snapshot.VoiceChannelID || (options.requireGeneration && m.reconnectGeneration != options.expectedGeneration) {
 		m.mu.Unlock()
 		return false
 	}
 	if options.requireStateRevision && m.participantStateRevision != options.expectedStateRevision {
 		participants := m.participantsSnapshotLocked()
 		stateRevision := m.participantStateRevision
+		reportGeneration := m.reconnectGeneration
 		m.mu.Unlock()
-		m.reportParticipantsIfCurrent(job, participants, stateRevision, options.expectedGeneration, options.requireGeneration)
+		m.reportParticipantsIfCurrent(job, participants, stateRevision, reportGeneration, true)
 		return true
 	}
 	if snapshot.Revision != 0 && snapshot.Revision <= m.participantSnapshotRevision {
 		if options.authoritativeReplay && snapshot.Revision == m.participantSnapshotRevision {
 			participants := m.participantsSnapshotLocked()
 			stateRevision := m.participantStateRevision
+			reportGeneration := m.reconnectGeneration
 			m.mu.Unlock()
-			m.reportParticipantsIfCurrent(job, participants, stateRevision, options.expectedGeneration, options.requireGeneration)
+			m.reportParticipantsIfCurrent(job, participants, stateRevision, reportGeneration, true)
 			return true
 		}
 		// A periodic snapshot can race a newer gateway snapshot between reading
@@ -607,10 +688,11 @@ func (m *Manager) participantsSynced(snapshot discord.ParticipantSnapshot, optio
 	m.participantStateRevision++
 	stateRevision := m.participantStateRevision
 	participants := m.participantsSnapshotLocked()
+	reportGeneration := m.reconnectGeneration
 	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
 	m.mu.Unlock()
 
-	m.reportParticipantsIfCurrent(job, participants, stateRevision, options.expectedGeneration, options.requireGeneration)
+	m.reportParticipantsIfCurrent(job, participants, stateRevision, reportGeneration, true)
 	if shouldAutoStop {
 		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
 	}
@@ -717,7 +799,13 @@ func (m *Manager) participantJobCurrent(job discord.VoiceJob, generation int64, 
 	if requireGeneration && m.reconnectGeneration != generation {
 		return false
 	}
-	return m.current.StreamID == job.StreamID && m.current.GuildID == job.GuildID && m.current.VoiceChannelID == job.VoiceChannelID
+	return !m.eventsPausedLocked() && m.current.StreamID == job.StreamID && m.current.GuildID == job.GuildID && m.current.VoiceChannelID == job.VoiceChannelID
+}
+
+// eventsPausedLocked is the generation fence for Stop and Discord reconnect
+// windows. The caller must hold m.mu.
+func (m *Manager) eventsPausedLocked() bool {
+	return m.stopping || m.disconnected
 }
 
 func (m *Manager) reportParticipantsIfCurrent(job discord.VoiceJob, participants []Participant, stateRevision uint64, generation int64, requireGeneration bool) {
@@ -726,7 +814,7 @@ func (m *Manager) reportParticipantsIfCurrent(job discord.VoiceJob, participants
 
 	m.mu.Lock()
 	current := m.current
-	if current.StreamID != job.StreamID || current.GuildID != job.GuildID || current.VoiceChannelID != job.VoiceChannelID || (requireGeneration && m.reconnectGeneration != generation) {
+	if m.eventsPausedLocked() || !sameWorkerEventJob(current, job) || (requireGeneration && m.reconnectGeneration != generation) {
 		m.mu.Unlock()
 		return
 	}
@@ -736,12 +824,30 @@ func (m *Manager) reportParticipantsIfCurrent(job discord.VoiceJob, participants
 		// full snapshot instead of dropping the participant card until the next
 		// periodic sync. Any newer event is then serialized after this snapshot.
 		participants = m.participantsSnapshotLocked()
+		stateRevision = m.participantStateRevision
 	}
 	reporter := m.reporter
+	reportGeneration := m.reconnectGeneration
+	queue := m.workerRetry
 	m.mu.Unlock()
 	if reporter != nil {
-		if err := reporter.ParticipantsChanged(job, participants); err != nil {
+		ctx := context.Background()
+		if queue != nil {
+			ctx = queue.ctx
+		}
+		if err := publishParticipants(ctx, reporter, current, participants); err != nil {
 			m.recordWorkerPublishFailure("overlay.participants", job.StreamID, err)
+			m.enqueueWorkerEventRetry(workerEventRetryReport{
+				key:                 workerParticipantsRetryKey(current),
+				eventType:           "overlay.participants",
+				job:                 current,
+				reconnectGeneration: reportGeneration,
+				participants:        append([]Participant(nil), participants...),
+				stateRevision:       stateRevision,
+				err:                 err,
+			})
+		} else {
+			m.supersedeWorkerEventRetry(current, reportGeneration, workerParticipantsRetryKey(current))
 		}
 	}
 }
@@ -1245,12 +1351,13 @@ func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 		return
 	}
 	m.mu.Lock()
-	if m.current.StreamID == "" || event.StreamID != m.current.StreamID || event.GuildID != m.current.GuildID || event.TextChannelID != m.current.TextChannelID {
+	if m.eventsPausedLocked() || m.current.StreamID == "" || event.StreamID != m.current.StreamID || event.GuildID != m.current.GuildID || event.TextChannelID != m.current.TextChannelID {
 		m.mu.Unlock()
 		return
 	}
 	job := m.current
 	reporter := m.reporter
+	reconnectGeneration := m.reconnectGeneration
 	m.lastEventAt = time.Now().UTC()
 	message := ChatMessage{
 		MessageID:     messageID,
@@ -1266,10 +1373,35 @@ func (m *Manager) ChatMessageReceived(event discord.ChatMessageEvent) {
 		message.CreatedAt = time.Now().UTC()
 	}
 	m.mu.Unlock()
-	if reporter != nil {
-		if err := reporter.ChatMessageReceived(job, message); err != nil {
-			m.recordWorkerPublishFailure("overlay.discord_chat", job.StreamID, err)
-		}
+	if reporter == nil {
+		return
+	}
+	m.participantReportMu.Lock()
+	defer m.participantReportMu.Unlock()
+	m.mu.Lock()
+	if m.eventsPausedLocked() || !sameWorkerEventJob(m.current, job) || m.reconnectGeneration != reconnectGeneration {
+		m.mu.Unlock()
+		return
+	}
+	reporter = m.reporter
+	queue := m.workerRetry
+	m.mu.Unlock()
+	ctx := context.Background()
+	if queue != nil {
+		ctx = queue.ctx
+	}
+	if err := publishChatMessage(ctx, reporter, job, message); err != nil {
+		m.recordWorkerPublishFailure("overlay.discord_chat", job.StreamID, err)
+		m.enqueueWorkerEventRetry(workerEventRetryReport{
+			key:                 workerChatRetryKey(job, message),
+			eventType:           "overlay.discord_chat",
+			job:                 job,
+			reconnectGeneration: reconnectGeneration,
+			chat:                message,
+			err:                 err,
+		})
+	} else {
+		m.supersedeWorkerEventRetry(job, reconnectGeneration, workerChatRetryKey(job, message))
 	}
 }
 
@@ -1316,11 +1448,24 @@ func (m *Manager) DiscordConnected() {
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	generation := m.reconnectGeneration
+	previousWorkerRetry := m.workerRetry
+	var workerRetry *workerEventRetryQueue
 	var participantSyncContext context.Context
-	if job.StreamID != "" {
+	m.disconnected = false
+	if job.StreamID != "" && !m.stopping {
+		workerRetry = newWorkerEventRetryQueue()
+		m.workerRetry = workerRetry
 		participantSyncContext = m.restartParticipantSyncLocked()
+	} else {
+		m.workerRetry = nil
 	}
 	m.mu.Unlock()
+	if previousWorkerRetry != nil {
+		previousWorkerRetry.stopAndWait()
+	}
+	if workerRetry != nil {
+		workerRetry.start(m)
+	}
 	if participantSyncContext != nil {
 		go m.keepVoiceParticipantsSynced(participantSyncContext, job, generation)
 	}
@@ -1331,14 +1476,21 @@ func (m *Manager) DiscordDisconnected(reason string) {
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	policy := m.reconnectPolicy
+	stopInProgress := m.stopping
 	if m.participantSyncCancel != nil {
 		m.participantSyncCancel()
 		m.participantSyncCancel = nil
 	}
+	m.disconnected = true
+	previousWorkerRetry := m.workerRetry
+	m.workerRetry = nil
 	m.reconnectGeneration++
 	generation := m.reconnectGeneration
 	m.mu.Unlock()
-	if shouldRejoinVoice(reason, job, policy) {
+	if previousWorkerRetry != nil {
+		previousWorkerRetry.stopAndWait()
+	}
+	if !stopInProgress && shouldRejoinVoice(reason, job, policy) {
 		go m.rejoinVoiceWithBackoff(job, policy, generation)
 	}
 }
@@ -1363,7 +1515,7 @@ func (m *Manager) SetActiveSpeaker(streamID, userID string) error {
 
 func (m *Manager) setSpeakerState(streamID, userID string, speaking, preserveOthers bool) error {
 	m.mu.Lock()
-	if m.current.StreamID == "" {
+	if m.eventsPausedLocked() || m.current.StreamID == "" {
 		m.mu.Unlock()
 		return errors.New("no active stream job")
 	}
@@ -1401,6 +1553,7 @@ func (m *Manager) setSpeakerState(streamID, userID string, speaking, preserveOth
 	}
 	m.participantStateRevision++
 	stateRevision := m.participantStateRevision
+	reconnectGeneration := m.reconnectGeneration
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	displayName := ""
@@ -1409,8 +1562,8 @@ func (m *Manager) setSpeakerState(streamID, userID string, speaking, preserveOth
 	}
 	participants := m.participantsSnapshotLocked()
 	m.mu.Unlock()
-	m.reportParticipantsIfCurrent(job, participants, stateRevision, 0, false)
-	m.reportActiveSpeakerIfCurrent(job, userID, displayName, speaking, stateRevision)
+	m.reportParticipantsIfCurrent(job, participants, stateRevision, reconnectGeneration, true)
+	m.reportActiveSpeakerIfCurrent(job, userID, displayName, speaking, stateRevision, reconnectGeneration)
 	return nil
 }
 
@@ -1432,38 +1585,52 @@ func (m *Manager) clearSpeakerStates(streamID string) error {
 	m.activeSpeaker = ""
 	m.participantStateRevision++
 	stateRevision := m.participantStateRevision
+	reconnectGeneration := m.reconnectGeneration
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	participants := m.participantsSnapshotLocked()
 	m.mu.Unlock()
-	m.reportParticipantsIfCurrent(job, participants, stateRevision, 0, false)
-	m.reportActiveSpeakerIfCurrent(job, "", "", false, stateRevision)
+	m.reportParticipantsIfCurrent(job, participants, stateRevision, reconnectGeneration, true)
+	m.reportActiveSpeakerIfCurrent(job, "", "", false, stateRevision, reconnectGeneration)
 	return nil
 }
 
-func (m *Manager) reportActiveSpeakerIfCurrent(job discord.VoiceJob, userID, displayName string, speaking bool, stateRevision uint64) {
+func (m *Manager) reportActiveSpeakerIfCurrent(job discord.VoiceJob, userID, displayName string, speaking bool, stateRevision uint64, generation int64) {
 	m.participantReportMu.Lock()
 	defer m.participantReportMu.Unlock()
 
 	m.mu.Lock()
 	current := m.current
-	if current.StreamID != job.StreamID || current.GuildID != job.GuildID || current.VoiceChannelID != job.VoiceChannelID || m.participantStateRevision != stateRevision {
+	if m.eventsPausedLocked() || !sameWorkerEventJob(current, job) || m.reconnectGeneration != generation || m.participantStateRevision != stateRevision {
 		m.mu.Unlock()
 		return
 	}
 	reporter := m.reporter
+	queue := m.workerRetry
 	m.mu.Unlock()
 	if reporter == nil {
 		return
 	}
-	var err error
-	if stateReporter, ok := reporter.(ActiveSpeakerStateReporter); ok {
-		err = stateReporter.ActiveSpeakerStateChanged(job, userID, displayName, speaking)
-	} else if speaking {
-		err = reporter.ActiveSpeakerChanged(job, userID, displayName)
+	ctx := context.Background()
+	if queue != nil {
+		ctx = queue.ctx
 	}
+	err := publishActiveSpeaker(ctx, reporter, current, userID, displayName, speaking)
 	if err != nil {
 		m.recordWorkerPublishFailure("overlay.active_speaker", job.StreamID, err)
+		m.enqueueWorkerEventRetry(workerEventRetryReport{
+			key:                 workerSpeakerRetryKey(current),
+			eventType:           "overlay.active_speaker",
+			job:                 current,
+			reconnectGeneration: generation,
+			speakerUserID:       userID,
+			speakerDisplayName:  displayName,
+			speaking:            speaking,
+			stateRevision:       stateRevision,
+			err:                 err,
+		})
+	} else {
+		m.supersedeWorkerEventRetry(current, generation, workerSpeakerRetryKey(current))
 	}
 }
 
@@ -1525,7 +1692,7 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 		}
 		m.mu.Lock()
 		current := m.current
-		if generation != m.reconnectGeneration || current.StreamID != job.StreamID {
+		if generation != m.reconnectGeneration || current.StreamID != job.StreamID || m.stopping {
 			m.mu.Unlock()
 			return
 		}
@@ -1533,14 +1700,23 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 		m.mu.Unlock()
 		if err := m.voice.JoinVoice(job); err == nil {
 			m.mu.Lock()
-			stillCurrent := generation == m.reconnectGeneration && m.current.StreamID == job.StreamID
+			stillCurrent := generation == m.reconnectGeneration && m.current.StreamID == job.StreamID && !m.stopping
+			previousWorkerRetry := m.workerRetry
+			var workerRetry *workerEventRetryQueue
 			var participantSyncContext context.Context
 			if stillCurrent {
 				m.lastEventAt = time.Now().UTC()
+				m.disconnected = false
+				workerRetry = newWorkerEventRetryQueue()
+				m.workerRetry = workerRetry
 				participantSyncContext = m.restartParticipantSyncLocked()
 			}
 			m.mu.Unlock()
+			if previousWorkerRetry != nil {
+				previousWorkerRetry.stopAndWait()
+			}
 			if stillCurrent {
+				workerRetry.start(m)
 				m.hydrateVoiceParticipants(job, false)
 				go m.keepVoiceParticipantsSynced(participantSyncContext, job, generation)
 			}

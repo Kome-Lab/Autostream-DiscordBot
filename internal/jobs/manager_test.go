@@ -68,6 +68,27 @@ type recordingParticipantReporter struct {
 	calls             chan []Participant
 	callCount         int
 	failuresRemaining int
+	failureErr        error
+}
+
+type retryableWorkerPublishError struct {
+	status int
+	class  string
+}
+
+func (e retryableWorkerPublishError) Error() string          { return "worker publish failed" }
+func (e retryableWorkerPublishError) ErrorClass() string     { return e.class }
+func (e retryableWorkerPublishError) HTTPStatusCode() int    { return e.status }
+func (e retryableWorkerPublishError) RetryablePublish() bool { return true }
+
+type retryingOverlayReporter struct {
+	mu               sync.Mutex
+	participantFails int
+	speakerFails     int
+	chatFails        int
+	participants     [][]Participant
+	speaking         []bool
+	chatMessages     []ChatMessage
 }
 
 type activeSpeakerStateReporter struct {
@@ -304,6 +325,9 @@ func (f *recordingParticipantReporter) ParticipantsChanged(_ discord.VoiceJob, p
 	default:
 	}
 	if shouldFail {
+		if f.failureErr != nil {
+			return f.failureErr
+		}
 		return errors.New("transient worker event failure")
 	}
 	return nil
@@ -320,6 +344,43 @@ func (*recordingParticipantReporter) ActiveSpeakerChanged(discord.VoiceJob, stri
 }
 
 func (*recordingParticipantReporter) ChatMessageReceived(discord.VoiceJob, ChatMessage) error {
+	return nil
+}
+
+func (r *retryingOverlayReporter) ParticipantsChanged(_ discord.VoiceJob, participants []Participant) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.participantFails > 0 {
+		r.participantFails--
+		return retryableWorkerPublishError{status: 503, class: "http_status"}
+	}
+	r.participants = append(r.participants, append([]Participant(nil), participants...))
+	return nil
+}
+
+func (r *retryingOverlayReporter) ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName string) error {
+	return r.ActiveSpeakerStateChanged(job, userID, displayName, true)
+}
+
+func (r *retryingOverlayReporter) ActiveSpeakerStateChanged(_ discord.VoiceJob, _ string, _ string, speaking bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.speakerFails > 0 {
+		r.speakerFails--
+		return retryableWorkerPublishError{status: 409, class: "http_status"}
+	}
+	r.speaking = append(r.speaking, speaking)
+	return nil
+}
+
+func (r *retryingOverlayReporter) ChatMessageReceived(_ discord.VoiceJob, message ChatMessage) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.chatFails > 0 {
+		r.chatFails--
+		return retryableWorkerPublishError{status: 502, class: "http_status"}
+	}
+	r.chatMessages = append(r.chatMessages, message)
 	return nil
 }
 
@@ -1012,6 +1073,102 @@ func TestStartReplaysParticipantsAfterInitialWorkerPublishFailure(t *testing.T) 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for participant snapshot replay")
+	}
+}
+
+func TestParticipantSnapshotRetriesHTTP409UntilWorkerAccepts(t *testing.T) {
+	reporter := &recordingParticipantReporter{
+		calls:             make(chan []Participant, 8),
+		failuresRemaining: 2,
+		failureErr:        retryableWorkerPublishError{status: 409, class: "http_status"},
+	}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 17}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "alice", Present: true})
+
+	for attempt := 0; attempt < 3; attempt++ {
+		select {
+		case participants := <-reporter.calls:
+			if attempt == 2 && (len(participants) != 1 || participants[0].UserID != "user-01") {
+				t.Fatalf("accepted participant snapshot = %#v", participants)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for participant retry %d", attempt+1)
+		}
+	}
+	if got := reporter.count(); got != 3 {
+		t.Fatalf("participant publish attempts = %d, want 3", got)
+	}
+}
+
+func TestWorkerEventRetryCoalescesSpeakerStopAndRestoresChat(t *testing.T) {
+	reporter := &retryingOverlayReporter{speakerFails: 2, chatFails: 1}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", TextChannelID: "text-01", JobGeneration: 23}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Username: "alice", Present: true})
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
+	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", false)
+	manager.ChatMessageReceived(discord.ChatMessageEvent{StreamID: job.StreamID, GuildID: job.GuildID, TextChannelID: job.TextChannelID, MessageID: "message-01", UserID: "user-01", Content: "hello"})
+
+	deadline := time.After(3 * time.Second)
+	for {
+		reporter.mu.Lock()
+		speakerCount := len(reporter.speaking)
+		chatCount := len(reporter.chatMessages)
+		lastSpeaking := false
+		if speakerCount > 0 {
+			lastSpeaking = reporter.speaking[speakerCount-1]
+		}
+		reporter.mu.Unlock()
+		if speakerCount == 1 && !lastSpeaking && chatCount == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("retry did not converge: speaker=%d last_speaking=%t chat=%d", speakerCount, lastSpeaking, chatCount)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestWorkerEventRetryIsCanceledByStopAndDoesNotReachRearmedGeneration(t *testing.T) {
+	reporter := &recordingParticipantReporter{
+		calls:             make(chan []Participant, 8),
+		failuresRemaining: 1,
+		failureErr:        retryableWorkerPublishError{status: 503, class: "http_status"},
+	}
+	voice := &fakeVoice{}
+	manager := NewManagerWithReporter(voice, reporter)
+	first := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 31}
+	if err := manager.Start(first); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: first.StreamID, UserID: "old-user", Present: true})
+	select {
+	case <-reporter.calls:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial failed publish")
+	}
+	if err := manager.Stop(first.StreamID); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.JobGeneration = 32
+	if err := manager.Start(second); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if got := reporter.count(); got != 1 {
+		t.Fatalf("old generation retry reached rearmed job: attempts=%d", got)
+	}
+	if err := manager.Stop(second.StreamID); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1756,6 +1913,35 @@ func TestWorkerPublishFailureLogIsRateLimitedAndSecretSafe(t *testing.T) {
 	}
 }
 
+func TestWorkerPublishFailureLogIncludesSafeHTTPClassification(t *testing.T) {
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+
+	reporter := &fakeReporter{err: retryableWorkerPublishError{status: 409, class: "http_status"}}
+	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", TextChannelID: "text-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ChatMessageReceived(discord.ChatMessageEvent{StreamID: job.StreamID, GuildID: job.GuildID, TextChannelID: job.TextChannelID, MessageID: "message-01", UserID: "user-01", Content: "hello"})
+	if err := manager.Stop(job.StreamID); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, expected := range []string{"error_class=http_status", "http_status=409", "retryable=true", "retry_count=1"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("worker failure log missing %q: %q", expected, got)
+		}
+	}
+}
+
 func TestActiveSpeakerDetectedPublishesWorkerEvent(t *testing.T) {
 	reporter := &fakeReporter{}
 	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
@@ -1955,7 +2141,10 @@ func TestOvertakenParticipantReportPublishesLatestSpeakerState(t *testing.T) {
 	reporter.participants = nil
 
 	manager.ActiveSpeakerStateChanged(job.StreamID, "user-01", true)
-	manager.reportParticipantsIfCurrent(job, staleParticipants, staleRevision, 0, false)
+	manager.mu.Lock()
+	generation := manager.reconnectGeneration
+	manager.mu.Unlock()
+	manager.reportParticipantsIfCurrent(job, staleParticipants, staleRevision, generation, true)
 
 	if len(reporter.participants) != 1 || reporter.participants[0].UserID != "user-01" || !reporter.participants[0].Speaking {
 		t.Fatalf("overtaken participant report did not publish latest speaking state: %#v", reporter.participants)

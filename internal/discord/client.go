@@ -202,6 +202,7 @@ func NewRealClient(cfg Config) (*RealClient, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	installSafeDAVELogSink()
 	session, err := discordgo.New("Bot " + cfg.BotToken)
 	if err != nil {
 		return nil, err
