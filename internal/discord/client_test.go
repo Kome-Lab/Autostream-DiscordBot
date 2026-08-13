@@ -295,18 +295,24 @@ func TestForwardOpusForwardsCaptionOnly(t *testing.T) {
 		CaptionAudioToken: "caption-token",
 	}
 
-	runSyntheticForwardBatch(t, client, forwarder, job, 1)
+	runSyntheticForwardBatch(t, client, forwarder, job, 4)
 
 	calls := forwarder.callsSnapshot()
-	if len(calls) != 1 {
-		t.Fatalf("expected one caption forward call, got %d", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("expected four caption forward calls, got %d", len(calls))
 	}
-	call := calls[0]
-	if call.url != job.CaptionAudioURL || call.streamID != job.StreamID || call.source != "discord-bot-01" || call.tokenOverride != job.CaptionAudioToken {
-		t.Fatalf("unexpected caption forward context: %#v", call)
+	totalPackets := 0
+	for i, call := range calls {
+		if call.url != job.CaptionAudioURL || call.streamID != job.StreamID || call.source != "discord-bot-01" || call.tokenOverride != job.CaptionAudioToken {
+			t.Fatalf("unexpected caption forward context at call %d: %#v", i, call)
+		}
+		if len(call.packets) == 0 || len(call.packets) > 5 || call.packets[0].UserID != "user-01" {
+			t.Fatalf("unexpected caption packet batch at call %d: %#v", i, call.packets)
+		}
+		totalPackets += len(call.packets)
 	}
-	if len(call.packets) != 20 || call.packets[0].UserID != "user-01" {
-		t.Fatalf("unexpected caption packet batch: %#v", call.packets)
+	if totalPackets != 20 {
+		t.Fatalf("expected 20 caption packets across batches, got %d", totalPackets)
 	}
 	status := client.Status()
 	if status.AudioPacketsForwarded != 0 || status.AudioForwardErrors != 0 || status.CaptionPacketsForwarded != 20 || status.CaptionForwardErrors != 0 {
