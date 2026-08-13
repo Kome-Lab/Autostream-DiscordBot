@@ -67,8 +67,9 @@ func (c Config) Validate() error {
 
 func (r Reporter) ParticipantsChanged(job discord.VoiceJob, participants []jobs.Participant) error {
 	payload := struct {
-		Participants []participantPayload `json:"participants"`
-	}{Participants: make([]participantPayload, 0, len(participants))}
+		Participants  []participantPayload `json:"participants"`
+		JobGeneration uint64               `json:"job_generation,omitempty"`
+	}{Participants: make([]participantPayload, 0, len(participants)), JobGeneration: job.JobGeneration}
 	for _, participant := range participants {
 		payload.Participants = append(payload.Participants, participantPayload{
 			UserID:      participant.UserID,
@@ -86,13 +87,14 @@ func (r Reporter) ActiveSpeakerChanged(job discord.VoiceJob, userID, displayName
 }
 
 func (r Reporter) ActiveSpeakerStateChanged(job discord.VoiceJob, userID, displayName string, speaking bool) error {
-	payload := map[string]any{"user_id": userID, "display_name": displayName, "speaking": speaking}
+	payload := map[string]any{"user_id": userID, "display_name": displayName, "speaking": speaking, "job_generation": job.JobGeneration}
 	return r.post(context.Background(), job, "/streams/"+url.PathEscape(job.StreamID)+"/events/active-speaker", payload)
 }
 
 func (r Reporter) ChatMessageReceived(job discord.VoiceJob, message jobs.ChatMessage) error {
 	payload := map[string]any{
-		"type": "overlay.discord_chat",
+		"type":           "overlay.discord_chat",
+		"job_generation": job.JobGeneration,
 		"payload": map[string]any{
 			"message_id":      message.MessageID,
 			"author_id":       message.UserID,

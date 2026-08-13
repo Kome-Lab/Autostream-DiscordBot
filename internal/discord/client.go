@@ -15,16 +15,20 @@ import (
 )
 
 type VoiceJob struct {
-	GuildID           string `json:"guild_id"`
-	VoiceChannelID    string `json:"voice_channel_id"`
-	TextChannelID     string `json:"text_channel_id,omitempty"`
-	StreamID          string `json:"stream_id"`
-	EncoderAudioURL   string `json:"encoder_audio_url,omitempty"`
-	CaptionAudioURL   string `json:"caption_audio_url,omitempty"`
-	CaptionAudioToken string `json:"caption_audio_token,omitempty"`
-	StreamIngestToken string `json:"stream_ingest_token,omitempty"`
-	WorkerEventsURL   string `json:"worker_events_url,omitempty"`
-	WorkerEventsToken string `json:"worker_events_token,omitempty"`
+	GuildID                     string `json:"guild_id"`
+	VoiceChannelID              string `json:"voice_channel_id"`
+	TextChannelID               string `json:"text_channel_id,omitempty"`
+	StreamID                    string `json:"stream_id"`
+	EncoderAudioURL             string `json:"encoder_audio_url,omitempty"`
+	CaptionAudioURL             string `json:"caption_audio_url,omitempty"`
+	CaptionAudioToken           string `json:"caption_audio_token,omitempty"`
+	StreamIngestToken           string `json:"stream_ingest_token,omitempty"`
+	WorkerEventsURL             string `json:"worker_events_url,omitempty"`
+	WorkerEventsToken           string `json:"worker_events_token,omitempty"`
+	CaptionAudioFlushMS         int    `json:"caption_audio_flush_ms,omitempty"`
+	CaptionAudioMaxBatchPackets int    `json:"caption_audio_max_batch_packets,omitempty"`
+	UnresolvedSSRCBufferMS      int    `json:"unresolved_ssrc_buffer_ms,omitempty"`
+	JobGeneration               uint64 `json:"job_generation,omitempty"`
 }
 
 type ParticipantEvent struct {
@@ -189,6 +193,7 @@ type RealClient struct {
 	participantSnapshotNext uint64
 	status                  Status
 	job                     VoiceJob
+	voiceGeneration         uint64
 }
 
 const audioSpeakerIdleTimeout = 1250 * time.Millisecond
@@ -274,6 +279,7 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	audioStop := make(chan struct{})
 	c.voice = voice
 	c.job = job
+	c.voiceGeneration++
 	c.audioStop = audioStop
 	c.ssrcUsers = map[uint32]string{}
 	c.audioSpeakers = map[string]time.Time{}
@@ -306,6 +312,7 @@ func (c *RealClient) LeaveVoice(streamID string) error {
 		c.audioStop = nil
 	}
 	c.voice = nil
+	c.voiceGeneration++
 	c.job = VoiceJob{}
 	c.ssrcUsers = nil
 	c.audioSpeakers = nil
@@ -364,80 +371,131 @@ func (c *RealClient) onVoiceSpeakingUpdate(_ *discordgo.VoiceConnection, event *
 }
 
 func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet, stop <-chan struct{}, forwarder AudioForwarder, source string) {
-	const maxBatch = 20
-	type forwardTarget struct {
-		url       string
-		token     string
-		isCaption bool
+	encoderBatchMax := 20
+	captionBatchMax := job.CaptionAudioMaxBatchPackets
+	if captionBatchMax <= 0 {
+		captionBatchMax = 5
 	}
-	type forwardResult struct {
-		isCaption bool
-		err       error
+	if captionBatchMax > 100 {
+		captionBatchMax = 100
 	}
-	targets := make([]forwardTarget, 0, 2)
-	if strings.TrimSpace(job.EncoderAudioURL) != "" {
-		targets = append(targets, forwardTarget{url: job.EncoderAudioURL, token: job.StreamIngestToken})
+	captionFlush := time.Duration(job.CaptionAudioFlushMS) * time.Millisecond
+	if captionFlush <= 0 {
+		captionFlush = 100 * time.Millisecond
 	}
-	if strings.TrimSpace(job.CaptionAudioURL) != "" {
-		targets = append(targets, forwardTarget{url: job.CaptionAudioURL, token: job.CaptionAudioToken, isCaption: true})
+	if captionFlush > time.Second {
+		captionFlush = time.Second
 	}
-	flushEvery := time.NewTicker(500 * time.Millisecond)
-	defer flushEvery.Stop()
-	batch := make([]audioforward.OpusPacket, 0, maxBatch)
-	flush := func() {
+	unresolvedWindow := time.Duration(job.UnresolvedSSRCBufferMS) * time.Millisecond
+	if unresolvedWindow <= 0 {
+		unresolvedWindow = time.Second
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	monitorDone := make(chan struct{})
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-monitorDone:
+		}
+	}()
+	defer func() {
+		close(monitorDone)
+		cancel()
+	}()
+
+	encoderBatch := make([]audioforward.OpusPacket, 0, encoderBatchMax)
+	captionBatch := make([]audioforward.OpusPacket, 0, captionBatchMax)
+	lastEncoderFlush := time.Now().UTC()
+	lastCaptionFlush := lastEncoderFlush
+	unresolved := map[uint32][]audioforward.OpusPacket{}
+	unresolvedSince := map[uint32]time.Time{}
+	flush := func(isCaption bool) {
+		var batch []audioforward.OpusPacket
+		if isCaption {
+			batch, captionBatch = captionBatch, nil
+		} else {
+			batch, encoderBatch = encoderBatch, nil
+		}
 		if len(batch) == 0 {
 			return
 		}
-		count := len(batch)
-		results := make(chan forwardResult, len(targets))
-		for _, target := range targets {
-			target := target
-			go func() {
-				if target.isCaption && strings.TrimSpace(target.token) == "" {
-					results <- forwardResult{isCaption: true, err: errors.New("caption_audio_token is required")}
-					return
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				err := forwarder.ForwardOpus(ctx, target.url, job.StreamID, source, target.token, batch)
-				cancel()
-				results <- forwardResult{isCaption: target.isCaption, err: err}
-			}()
+		url := job.EncoderAudioURL
+		token := job.StreamIngestToken
+		if isCaption {
+			url = job.CaptionAudioURL
+			token = job.CaptionAudioToken
+			if strings.TrimSpace(token) == "" {
+				c.setCaptionForwardError(errors.New("caption_audio_token is required").Error())
+				return
+			}
 		}
-		for range targets {
-			result := <-results
-			if result.err != nil {
-				if result.isCaption {
-					c.setCaptionForwardError(result.err.Error())
-				} else {
-					c.setForwardError(result.err.Error())
-				}
+		ctx, cancel := context.WithTimeout(runCtx, 5*time.Second)
+		err := forwarder.ForwardOpus(ctx, url, job.StreamID, source, token, batch)
+		cancel()
+		if err != nil {
+			if isCaption {
+				c.setCaptionForwardError(err.Error())
+			} else {
+				c.setForwardError(err.Error())
+			}
+			return
+		}
+		now := time.Now().UTC()
+		c.mu.Lock()
+		if isCaption {
+			c.status.CaptionPacketsForwarded += int64(len(batch))
+			c.status.LastCaptionForwardError = ""
+		} else {
+			c.status.AudioPacketsForwarded += int64(len(batch))
+			c.status.LastForwardAt = now.Format(time.RFC3339Nano)
+			c.status.LastForwardError = ""
+		}
+		c.mu.Unlock()
+	}
+	appendPacket := func(packet audioforward.OpusPacket) {
+		if strings.TrimSpace(job.EncoderAudioURL) != "" {
+			encoderBatch = append(encoderBatch, packet)
+		}
+		if strings.TrimSpace(job.CaptionAudioURL) != "" {
+			captionBatch = append(captionBatch, packet)
+		}
+	}
+	flushExpiredUnresolved := func(now time.Time, force bool) {
+		for ssrc, buffered := range unresolved {
+			userID := c.userForSSRC(ssrc)
+			if userID == "" && !force && now.Sub(unresolvedSince[ssrc]) < unresolvedWindow {
 				continue
 			}
-			now := time.Now().UTC()
-			c.mu.Lock()
-			if result.isCaption {
-				c.status.CaptionPacketsForwarded += int64(count)
-				c.status.LastCaptionForwardError = ""
-			} else {
-				c.status.AudioPacketsForwarded += int64(count)
-				c.status.LastForwardAt = now.Format(time.RFC3339Nano)
-				c.status.LastForwardError = ""
+			for _, packet := range buffered {
+				packet.UserID = userID
+				appendPacket(packet)
 			}
-			c.mu.Unlock()
+			delete(unresolved, ssrc)
+			delete(unresolvedSince, ssrc)
 		}
-		batch = batch[:0]
 	}
+	flushTicker := time.NewTicker(25 * time.Millisecond)
+	defer flushTicker.Stop()
 	for {
 		select {
 		case <-stop:
-			flush()
 			return
-		case <-flushEvery.C:
-			c.expireIdleAudioSpeakers(job, time.Now().UTC())
-			flush()
+		case now := <-flushTicker.C:
+			now = now.UTC()
+			flushExpiredUnresolved(now, false)
+			if now.Sub(lastCaptionFlush) >= captionFlush {
+				flush(true)
+				lastCaptionFlush = now
+			}
+			if now.Sub(lastEncoderFlush) >= 500*time.Millisecond {
+				flush(false)
+				lastEncoderFlush = now
+			}
+			c.expireIdleAudioSpeakers(job, now)
 		case packet, ok := <-packets:
 			if !ok {
-				flush()
 				c.markVoiceDisconnected("opus_recv_closed", false)
 				return
 			}
@@ -452,19 +510,46 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 			c.status.LastAudioAt = now.Format(time.RFC3339Nano)
 			c.status.AudioPacketsReceived++
 			c.mu.Unlock()
-			batch = append(batch, audioforward.OpusPacket{
-				SSRC:       packet.SSRC,
-				UserID:     userID,
-				Sequence:   packet.Sequence,
-				Timestamp:  packet.Timestamp,
-				ReceivedAt: now,
-				Opus:       append([]byte(nil), packet.Opus...),
-			})
-			if len(batch) >= maxBatch {
-				flush()
+			forwardedPacket := audioforward.OpusPacket{
+				SSRC:                 packet.SSRC,
+				UserID:               userID,
+				Sequence:             packet.Sequence,
+				Timestamp:            packet.Timestamp,
+				ReceivedAt:           now,
+				Opus:                 append([]byte(nil), packet.Opus...),
+				JobGeneration:        job.JobGeneration,
+				ConnectionGeneration: c.connectionGenerationForJob(job),
+			}
+			if userID == "" && unresolvedWindow > 0 {
+				if len(unresolved[packet.SSRC]) < 50 {
+					unresolved[packet.SSRC] = append(unresolved[packet.SSRC], forwardedPacket)
+					if unresolvedSince[packet.SSRC].IsZero() {
+						unresolvedSince[packet.SSRC] = now
+					}
+				}
+			} else {
+				flushExpiredUnresolved(now, false)
+				appendPacket(forwardedPacket)
+			}
+			if len(captionBatch) >= captionBatchMax {
+				flush(true)
+				lastCaptionFlush = now
+			}
+			if len(encoderBatch) >= encoderBatchMax {
+				flush(false)
+				lastEncoderFlush = now
 			}
 		}
 	}
+}
+
+func (c *RealClient) connectionGenerationForJob(job VoiceJob) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.job.StreamID != job.StreamID || c.job.GuildID != job.GuildID || c.job.VoiceChannelID != job.VoiceChannelID {
+		return 0
+	}
+	return c.voiceGeneration
 }
 
 func (c *RealClient) recordAudioSpeakerActivity(job VoiceJob, userID string, now time.Time) {

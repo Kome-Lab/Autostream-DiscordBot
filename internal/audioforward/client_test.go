@@ -25,14 +25,14 @@ func TestClientForwardsOpusPackets(t *testing.T) {
 	defer server.Close()
 
 	client := Client{Config: Config{Token: "token"}}
-	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, UserID: "user-01", JobGeneration: 11, ConnectionGeneration: 7, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer token" || gotPath != "/streams/stream-01/audio/opus" {
 		t.Fatalf("unexpected request auth=%q path=%q", gotAuth, gotPath)
 	}
-	if gotBody.StreamID != "stream-01" || len(gotBody.Packets) != 1 || gotBody.Packets[0].OpusBase64 == "" {
+	if gotBody.StreamID != "stream-01" || len(gotBody.Packets) != 1 || gotBody.Packets[0].OpusBase64 == "" || gotBody.Packets[0].JobGeneration != 11 || gotBody.Packets[0].ConnectionGeneration != 7 || gotBody.Packets[0].UserID != "user-01" {
 		t.Fatalf("unexpected body: %#v", gotBody)
 	}
 }

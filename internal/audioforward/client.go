@@ -28,21 +28,25 @@ type Client struct {
 }
 
 type OpusPacket struct {
-	SSRC       uint32
-	UserID     string
-	Sequence   uint16
-	Timestamp  uint32
-	ReceivedAt time.Time
-	Opus       []byte
+	SSRC                 uint32
+	UserID               string
+	JobGeneration        uint64
+	ConnectionGeneration uint64
+	Sequence             uint16
+	Timestamp            uint32
+	ReceivedAt           time.Time
+	Opus                 []byte
 }
 
 type packetWire struct {
-	SSRC       uint32    `json:"ssrc"`
-	UserID     string    `json:"user_id,omitempty"`
-	Sequence   uint16    `json:"sequence"`
-	Timestamp  uint32    `json:"timestamp"`
-	ReceivedAt time.Time `json:"received_at"`
-	OpusBase64 string    `json:"opus_base64"`
+	SSRC                 uint32    `json:"ssrc"`
+	UserID               string    `json:"user_id,omitempty"`
+	JobGeneration        uint64    `json:"job_generation,omitempty"`
+	ConnectionGeneration uint64    `json:"connection_generation,omitempty"`
+	Sequence             uint16    `json:"sequence"`
+	Timestamp            uint32    `json:"timestamp"`
+	ReceivedAt           time.Time `json:"received_at"`
+	OpusBase64           string    `json:"opus_base64"`
 }
 
 type ingestRequest struct {
@@ -98,12 +102,14 @@ func (c Client) ForwardOpus(ctx context.Context, encoderAudioURL, streamID, sour
 			receivedAt = time.Now().UTC()
 		}
 		wirePackets = append(wirePackets, packetWire{
-			SSRC:       packet.SSRC,
-			UserID:     packet.UserID,
-			Sequence:   packet.Sequence,
-			Timestamp:  packet.Timestamp,
-			ReceivedAt: receivedAt,
-			OpusBase64: base64.StdEncoding.EncodeToString(packet.Opus),
+			SSRC:                 packet.SSRC,
+			UserID:               packet.UserID,
+			JobGeneration:        packet.JobGeneration,
+			ConnectionGeneration: packet.ConnectionGeneration,
+			Sequence:             packet.Sequence,
+			Timestamp:            packet.Timestamp,
+			ReceivedAt:           receivedAt,
+			OpusBase64:           base64.StdEncoding.EncodeToString(packet.Opus),
 		})
 	}
 	if len(wirePackets) == 0 {
