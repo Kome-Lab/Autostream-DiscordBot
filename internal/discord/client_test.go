@@ -334,6 +334,7 @@ func TestForwardOpusForwardsSameBatchToBothTargetsWithSeparateTokens(t *testing.
 		CaptionAudioURL:   "https://worker.example.com/captions",
 		StreamIngestToken: "encoder-token",
 		CaptionAudioToken: "caption-token",
+		CaptionAudioFlushMS: 500, CaptionAudioMaxBatchPackets: 20,
 	}
 
 	runSyntheticForwardBatch(t, client, forwarder, job, 2)
@@ -390,6 +391,7 @@ func TestForwardOpusTargetFailuresAreIndependent(t *testing.T) {
 				CaptionAudioURL:   captionURL,
 				StreamIngestToken: "encoder-token",
 				CaptionAudioToken: "caption-token",
+				CaptionAudioFlushMS: 500, CaptionAudioMaxBatchPackets: 20,
 			}
 
 			runSyntheticForwardBatch(t, client, forwarder, job, 2)
