@@ -410,8 +410,18 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 	captionBatch := make([]audioforward.OpusPacket, 0, captionBatchMax)
 	lastEncoderFlush := time.Now().UTC()
 	lastCaptionFlush := lastEncoderFlush
+	var fallbackUserID string
+	var fallbackUserCheckedAt time.Time
 	unresolved := map[uint32][]audioforward.OpusPacket{}
 	unresolvedSince := map[uint32]time.Time{}
+	resolveFallbackUser := func(now time.Time) string {
+		if !fallbackUserCheckedAt.IsZero() && now.Sub(fallbackUserCheckedAt) < 250*time.Millisecond {
+			return fallbackUserID
+		}
+		fallbackUserCheckedAt = now
+		fallbackUserID = c.uniqueHumanVoiceParticipant(job)
+		return fallbackUserID
+	}
 	flush := func(isCaption bool) {
 		var batch []audioforward.OpusPacket
 		if isCaption {
@@ -466,8 +476,14 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 	flushExpiredUnresolved := func(now time.Time, force bool) {
 		for ssrc, buffered := range unresolved {
 			userID := c.userForSSRC(ssrc)
+			if userID == "" {
+				userID = resolveFallbackUser(now)
+			}
 			if userID == "" && !force && now.Sub(unresolvedSince[ssrc]) < unresolvedWindow {
 				continue
+			}
+			if userID != "" {
+				c.recordAudioSpeakerActivity(job, userID, now)
 			}
 			for _, packet := range buffered {
 				packet.UserID = userID
@@ -503,8 +519,15 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 			if packet == nil || len(packet.Opus) == 0 {
 				continue
 			}
-			userID := c.userForSSRC(packet.SSRC)
 			now := time.Now().UTC()
+			userID := c.userForSSRC(packet.SSRC)
+			if userID == "" {
+				// Discord can deliver Opus before the first SSRC speaking update.
+				// When the target VC has exactly one human participant, use that
+				// authoritative snapshot so Deepgram and the scene do not fall back
+				// to the synthetic MIC speaker.
+				userID = resolveFallbackUser(now)
+			}
 			c.recordAudioSpeakerActivity(job, userID, now)
 			c.mu.Lock()
 			c.status.AudioReceiving = true
@@ -610,6 +633,28 @@ func (c *RealClient) userForSSRC(ssrc uint32) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ssrcUsers[ssrc]
+}
+
+func (c *RealClient) uniqueHumanVoiceParticipant(job VoiceJob) string {
+	snapshot, ok := c.SnapshotVoiceParticipants(job)
+	if !ok {
+		return ""
+	}
+	userID := ""
+	for _, participant := range snapshot.Participants {
+		if participant.IsBot {
+			continue
+		}
+		candidate := strings.TrimSpace(participant.UserID)
+		if candidate == "" {
+			continue
+		}
+		if userID != "" {
+			return ""
+		}
+		userID = candidate
+	}
+	return userID
 }
 
 func (c *RealClient) Status() Status {

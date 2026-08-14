@@ -780,6 +780,33 @@ func TestVoiceParticipantSnapshotUsesDiscordDisplayNameAndGuildAvatar(t *testing
 	}
 }
 
+func TestUniqueHumanVoiceParticipantProvidesCaptionIdentityFallback(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.User = &discordgo.User{ID: "bot-self"}
+	if err := session.State.GuildAdd(&discordgo.Guild{
+		ID: "guild-01",
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot-self", GuildID: "guild-01", ChannelID: "voice-01"},
+			{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+			{UserID: "bot-other", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{User: &discordgo.User{ID: "bot-other", Bot: true}}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	client := &RealClient{session: session, job: job}
+	if got := client.uniqueHumanVoiceParticipant(job); got != "user-01" {
+		t.Fatalf("expected the only human participant as fallback, got %q", got)
+	}
+
+	if err := session.State.OnInterface(session, &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-02", GuildID: "guild-01", ChannelID: "voice-01"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.uniqueHumanVoiceParticipant(job); got != "" {
+		t.Fatalf("fallback must remain empty when multiple humans are present, got %q", got)
+	}
+}
+
 func TestReadyRestartsConnectedStateAndParticipantSnapshot(t *testing.T) {
 	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
 	session.State.User = &discordgo.User{ID: "bot-01"}
