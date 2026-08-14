@@ -972,32 +972,34 @@ func (m *Manager) autoStopWhenEmpty(streamID string, observation autoStopObserva
 	// gateway State cache is catching up. Re-read it after the normal empty-VC
 	// grace period before stopping. A missing snapshot is non-authoritative and
 	// must never be interpreted as proof that the channel is empty.
-	if source, ok := m.voice.(discord.ParticipantSnapshotSource); ok {
-		snapshot, known := source.SnapshotVoiceParticipants(job)
-		if !known {
-			m.mu.Lock()
-			if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
-				m.cancelAutoStopLocked(streamID)
+	if observation.source == "authoritative_snapshot" {
+		if source, ok := m.voice.(discord.ParticipantSnapshotSource); ok {
+			snapshot, known := source.SnapshotVoiceParticipants(job)
+			if !known {
+				m.mu.Lock()
+				if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
+					m.cancelAutoStopLocked(streamID)
+				}
+				m.mu.Unlock()
+				log.Printf("Discord VC auto-stop canceled: event=revalidation_unavailable stream_id=%s reason=participant_snapshot_unavailable reconnect_generation=%d auto_stop_generation=%d", streamID, reconnectGeneration, observation.autoStopGeneration)
+				return
 			}
-			m.mu.Unlock()
-			log.Printf("Discord VC auto-stop canceled: event=revalidation_unavailable stream_id=%s reason=participant_snapshot_unavailable reconnect_generation=%d auto_stop_generation=%d", streamID, reconnectGeneration, observation.autoStopGeneration)
-			return
-		}
-		if len(snapshot.Participants) > 0 {
-			m.participantsSynced(snapshot, participantSnapshotApplyOptions{
-				expectedGeneration:    reconnectGeneration,
-				requireGeneration:     true,
-				authoritativeReplay:   true,
-				expectedStateRevision: participantStateRevision,
-				requireStateRevision:  true,
-			})
-			m.mu.Lock()
-			if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
-				m.cancelAutoStopLocked(streamID)
+			if len(snapshot.Participants) > 0 {
+				m.participantsSynced(snapshot, participantSnapshotApplyOptions{
+					expectedGeneration:    reconnectGeneration,
+					requireGeneration:     true,
+					authoritativeReplay:   true,
+					expectedStateRevision: participantStateRevision,
+					requireStateRevision:  true,
+				})
+				m.mu.Lock()
+				if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
+					m.cancelAutoStopLocked(streamID)
+				}
+				m.mu.Unlock()
+				log.Printf("Discord VC auto-stop canceled: event=revalidation_nonempty stream_id=%s participant_count=%d snapshot_revision=%d reconnect_generation=%d auto_stop_generation=%d", streamID, len(snapshot.Participants), snapshot.Revision, reconnectGeneration, observation.autoStopGeneration)
+				return
 			}
-			m.mu.Unlock()
-			log.Printf("Discord VC auto-stop canceled: event=revalidation_nonempty stream_id=%s participant_count=%d snapshot_revision=%d reconnect_generation=%d auto_stop_generation=%d", streamID, len(snapshot.Participants), snapshot.Revision, reconnectGeneration, observation.autoStopGeneration)
-			return
 		}
 	}
 
