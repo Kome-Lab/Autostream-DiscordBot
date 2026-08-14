@@ -871,21 +871,25 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	if event.UserID == selfUserID {
 		return
 	}
-	if _, supportsSnapshots := sink.(ParticipantSnapshotSink); supportsSnapshots {
-		if event.ChannelID == job.VoiceChannelID || (event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID) {
-			c.syncVoiceParticipants(session, job)
-		}
-		return
-	}
+	// A VoiceStateUpdate is authoritative only for the user carried by that
+	// event. DiscordGo's guild VoiceStates cache can be temporarily incomplete
+	// while a guild is rebuilt, so replacing the entire participant set here can
+	// erase unrelated users and incorrectly trigger empty-VC auto-stop. Full
+	// snapshots remain the convergence path for startup, reconnect, and the
+	// bounded periodic sync loop.
 	if event.ChannelID == job.VoiceChannelID {
 		if currentVoiceStateKnown && currentVoiceChannelID != job.VoiceChannelID {
 			return
 		}
+		participant := voiceParticipantFromState(job.GuildID, event.VoiceState)
 		sink.ParticipantChanged(ParticipantEvent{
 			StreamID:       job.StreamID,
 			GuildID:        job.GuildID,
 			VoiceChannelID: job.VoiceChannelID,
 			UserID:         event.UserID,
+			Username:       participant.Username,
+			AvatarURL:      participant.AvatarURL,
+			IsBot:          participant.IsBot,
 			Present:        true,
 		})
 		return
@@ -1044,34 +1048,12 @@ func (c *RealClient) snapshotVoiceParticipantsLocked(session *discordgo.Session,
 			if voiceState == nil || voiceState.ChannelID != job.VoiceChannelID {
 				continue
 			}
-			userID := strings.TrimSpace(voiceState.UserID)
+			participant := voiceParticipantFromState(guild.ID, voiceState)
+			userID := participant.UserID
 			if userID == "" || userID == selfUserID {
 				continue
 			}
-			username := ""
-			avatarURL := ""
-			isBot := false
-			if voiceState.Member != nil && voiceState.Member.User != nil {
-				member := voiceState.Member
-				user := member.User
-				username = strings.TrimSpace(member.Nick)
-				if username == "" {
-					username = strings.TrimSpace(user.GlobalName)
-				}
-				if username == "" {
-					username = strings.TrimSpace(user.Username)
-				}
-				memberForAvatar := *member
-				if strings.TrimSpace(memberForAvatar.GuildID) == "" {
-					memberForAvatar.GuildID = guild.ID
-				}
-				avatarURL = strings.TrimSpace(memberForAvatar.AvatarURL("128"))
-				if avatarURL == "" {
-					avatarURL = strings.TrimSpace(user.AvatarURL("128"))
-				}
-				isBot = user.Bot
-			}
-			participants = append(participants, VoiceParticipant{UserID: userID, Username: username, AvatarURL: avatarURL, IsBot: isBot})
+			participants = append(participants, participant)
 		}
 		sort.Slice(participants, func(i, j int) bool {
 			return participants[i].UserID < participants[j].UserID
@@ -1088,10 +1070,40 @@ func (c *RealClient) snapshotVoiceParticipantsLocked(session *discordgo.Session,
 	return ParticipantSnapshot{}, false
 }
 
+func voiceParticipantFromState(guildID string, voiceState *discordgo.VoiceState) VoiceParticipant {
+	if voiceState == nil {
+		return VoiceParticipant{}
+	}
+	participant := VoiceParticipant{UserID: strings.TrimSpace(voiceState.UserID)}
+	if voiceState.Member == nil || voiceState.Member.User == nil {
+		return participant
+	}
+	member := voiceState.Member
+	user := member.User
+	participant.Username = strings.TrimSpace(member.Nick)
+	if participant.Username == "" {
+		participant.Username = strings.TrimSpace(user.GlobalName)
+	}
+	if participant.Username == "" {
+		participant.Username = strings.TrimSpace(user.Username)
+	}
+	memberForAvatar := *member
+	if strings.TrimSpace(memberForAvatar.GuildID) == "" {
+		memberForAvatar.GuildID = strings.TrimSpace(guildID)
+	}
+	participant.AvatarURL = strings.TrimSpace(memberForAvatar.AvatarURL("128"))
+	if participant.AvatarURL == "" {
+		participant.AvatarURL = strings.TrimSpace(user.AvatarURL("128"))
+	}
+	participant.IsBot = user.Bot
+	return participant
+}
+
 func sameVoiceJob(left, right VoiceJob) bool {
 	return strings.TrimSpace(left.StreamID) == strings.TrimSpace(right.StreamID) &&
 		strings.TrimSpace(left.GuildID) == strings.TrimSpace(right.GuildID) &&
-		strings.TrimSpace(left.VoiceChannelID) == strings.TrimSpace(right.VoiceChannelID)
+		strings.TrimSpace(left.VoiceChannelID) == strings.TrimSpace(right.VoiceChannelID) &&
+		left.JobGeneration == right.JobGeneration
 }
 
 func sessionUserID(session *discordgo.Session) string {

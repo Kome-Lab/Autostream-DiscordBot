@@ -46,6 +46,12 @@ type snapshotEventSink struct {
 	snapshots []ParticipantSnapshot
 }
 
+type participantStateSink struct {
+	fakeEventSink
+	snapshots        []ParticipantSnapshot
+	participantsByID map[string]bool
+}
+
 type activeSpeakerStateSink struct {
 	fakeEventSink
 	speaking []bool
@@ -59,6 +65,23 @@ func (f *activeSpeakerStateSink) ActiveSpeakerStateChanged(streamID, userID stri
 
 func (f *snapshotEventSink) ParticipantsSynced(snapshot ParticipantSnapshot) {
 	f.snapshots = append(f.snapshots, snapshot)
+}
+
+func (f *participantStateSink) ParticipantChanged(event ParticipantEvent) {
+	f.fakeEventSink.ParticipantChanged(event)
+	if event.Present {
+		f.participantsByID[event.UserID] = true
+		return
+	}
+	delete(f.participantsByID, event.UserID)
+}
+
+func (f *participantStateSink) ParticipantsSynced(snapshot ParticipantSnapshot) {
+	f.snapshots = append(f.snapshots, snapshot)
+	f.participantsByID = make(map[string]bool, len(snapshot.Participants))
+	for _, participant := range snapshot.Participants {
+		f.participantsByID[participant.UserID] = true
+	}
 }
 
 type fakeAudioForwarder struct {
@@ -713,9 +736,15 @@ func TestVoiceParticipantSnapshotsHydrateAndRecoverAuthoritatively(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 7}
 	sink := &snapshotEventSink{}
 	client := &RealClient{session: session, sink: sink, job: job}
+
+	staleJob := job
+	staleJob.JobGeneration = 6
+	if snapshot, known := client.SnapshotVoiceParticipants(staleJob); known {
+		t.Fatalf("old job generation received current participant snapshot: %#v", snapshot)
+	}
 
 	initial, known := client.SnapshotVoiceParticipants(job)
 	if !known || initial.Revision != 1 || len(initial.Participants) != 2 || initial.Participants[0].UserID != "user-a" || initial.Participants[1].UserID != "user-b" {
@@ -868,7 +897,7 @@ func TestReadyRestartsConnectedStateAndParticipantSnapshot(t *testing.T) {
 	}
 }
 
-func TestVoiceStateUpdateUsesSnapshotSinkForActiveTargetVC(t *testing.T) {
+func TestVoiceStateUpdateUsesDeltaForSnapshotAwareSink(t *testing.T) {
 	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
 	session.State.User = &discordgo.User{ID: "bot-01"}
 	if err := session.State.GuildAdd(&discordgo.Guild{ID: "guild-01", VoiceStates: []*discordgo.VoiceState{
@@ -885,15 +914,15 @@ func TestVoiceStateUpdateUsesSnapshotSinkForActiveTargetVC(t *testing.T) {
 	}
 	client.onVoiceStateUpdate(session, left)
 
-	if len(sink.snapshots) != 1 || len(sink.snapshots[0].Participants) != 0 {
-		t.Fatalf("target VC leave must deliver the current full snapshot: %#v", sink.snapshots)
+	if len(sink.snapshots) != 0 {
+		t.Fatalf("target VC leave must not replace the full participant set: %#v", sink.snapshots)
 	}
-	if len(sink.participants) != 0 {
-		t.Fatalf("snapshot-aware sink must not receive an unsafe delta first: %#v", sink.participants)
+	if len(sink.participants) != 1 || sink.participants[0].UserID != "user-01" || sink.participants[0].Present {
+		t.Fatalf("snapshot-aware sink must receive the departed user's delta: %#v", sink.participants)
 	}
 }
 
-func TestDelayedTargetLeaveUsesCurrentSnapshotNotStaleDelta(t *testing.T) {
+func TestDelayedTargetLeaveDeltaPreservesCurrentParticipant(t *testing.T) {
 	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
 	session.State.User = &discordgo.User{ID: "bot-01"}
 	if err := session.State.GuildAdd(&discordgo.Guild{ID: "guild-01", VoiceStates: []*discordgo.VoiceState{
@@ -903,7 +932,7 @@ func TestDelayedTargetLeaveUsesCurrentSnapshotNotStaleDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
-	sink := &snapshotEventSink{}
+	sink := &participantStateSink{participantsByID: map[string]bool{"user-current": true}}
 	client := &RealClient{session: session, sink: sink, job: job}
 
 	// DiscordGo applies State before it asynchronously invokes typed handlers.
@@ -915,11 +944,45 @@ func TestDelayedTargetLeaveUsesCurrentSnapshotNotStaleDelta(t *testing.T) {
 	}
 	client.onVoiceStateUpdate(session, delayedLeave)
 
-	if len(sink.snapshots) != 1 || len(sink.snapshots[0].Participants) != 1 || sink.snapshots[0].Participants[0].UserID != "user-current" {
-		t.Fatalf("delayed leave must publish the current full participant view, got %#v", sink.snapshots)
+	if !sink.participantsByID["user-current"] {
+		t.Fatalf("delayed leave erased the current participant: %#v", sink.participantsByID)
 	}
-	if len(sink.participants) != 0 {
-		t.Fatalf("delayed leave must not emit a stale participant delta: %#v", sink.participants)
+	if len(sink.snapshots) != 0 {
+		t.Fatalf("delayed leave must not replace the full participant set: %#v", sink.snapshots)
+	}
+	if len(sink.participants) != 1 || sink.participants[0].UserID != "user-old" || sink.participants[0].Present {
+		t.Fatalf("delayed leave must emit only the departed user's delta: %#v", sink.participants)
+	}
+}
+
+func TestVoiceStateUpdateDoesNotClearOtherParticipantsWhenStateCacheIsIncomplete(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.TrackVoice = true
+	session.State.User = &discordgo.User{ID: "bot-01"}
+	if err := session.State.GuildAdd(&discordgo.Guild{ID: "guild-01"}); err != nil {
+		t.Fatal(err)
+	}
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	sink := &participantStateSink{participantsByID: map[string]bool{"user-current": true}}
+	client := &RealClient{session: session, sink: sink, job: job}
+
+	// During a guild-state rebuild, Discord can dispatch one user's target-VC
+	// transition while the cached VoiceStates slice temporarily omits another
+	// participant. The event is authoritative only for user-old; replacing the
+	// whole participant set from that incomplete cache would erase user-current.
+	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
+		VoiceState:   &discordgo.VoiceState{UserID: "user-old", GuildID: "guild-01", ChannelID: ""},
+		BeforeUpdate: &discordgo.VoiceState{UserID: "user-old", GuildID: "guild-01", ChannelID: "voice-01"},
+	})
+
+	if !sink.participantsByID["user-current"] {
+		t.Fatalf("single-user transition erased another participant: %#v", sink.participantsByID)
+	}
+	if len(sink.snapshots) != 0 {
+		t.Fatalf("single-user transition must not publish a full cache snapshot: %#v", sink.snapshots)
+	}
+	if len(sink.participants) != 1 || sink.participants[0].UserID != "user-old" || sink.participants[0].Present {
+		t.Fatalf("expected only the departed user's delta, got %#v", sink.participants)
 	}
 }
 

@@ -301,6 +301,23 @@ func (f *sequenceSnapshotVoice) SnapshotVoiceParticipants(job discord.VoiceJob) 
 	return snapshot, true
 }
 
+func (f *sequenceSnapshotVoice) snapshotReadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.next
+}
+
+func waitForSequenceSnapshotReads(t *testing.T, voice *sequenceSnapshotVoice, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for voice.snapshotReadCount() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d participant snapshot reads; got %d", want, voice.snapshotReadCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func (f *blockingSnapshotVoice) SnapshotVoiceParticipants(job discord.VoiceJob) (discord.ParticipantSnapshot, bool) {
 	f.mu.Lock()
 	f.calls++
@@ -895,6 +912,7 @@ func TestStartHydratesExistingVoiceParticipantsBeforeLeave(t *testing.T) {
 	}
 	manager := NewManager(voice)
 	manager.autoStopDelay = 5 * time.Millisecond
+	manager.autoStopEmptyConfirmDelay = 5 * time.Millisecond
 	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
 	manager.SetStreamStopper(stopper)
 	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
@@ -914,6 +932,7 @@ func TestStartHydratesExistingVoiceParticipantsBeforeLeave(t *testing.T) {
 	case <-time.After(30 * time.Millisecond):
 	}
 
+	voice.snapshot = discord.ParticipantSnapshot{Revision: 2}
 	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-a", Present: false})
 	select {
 	case got := <-stopper.ch:
@@ -938,6 +957,7 @@ func TestStartDoesNotAutoStopOnTransientEmptyInitialSnapshot(t *testing.T) {
 	}
 	manager := NewManager(voice)
 	manager.autoStopDelay = 5 * time.Millisecond
+	manager.autoStopEmptyConfirmDelay = 5 * time.Millisecond
 	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
 	manager.SetStreamStopper(stopper)
 	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
@@ -1004,6 +1024,130 @@ func TestAuthoritativeEmptyAutoStopRevalidatesBeforeStop(t *testing.T) {
 	}
 	if len(participants) != 1 || participants[0].UserID != "user-01" {
 		t.Fatalf("revalidation did not restore the participant: %#v", participants)
+	}
+}
+
+func TestVoiceEventEmptyAutoStopRevalidatesBeforeStop(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+		{Revision: 2, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	manager.participantSyncDelays = nil
+	manager.participantSyncInterval = 0
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+
+	// A transient leave delta may race a newer gateway state. The stop path
+	// must re-read the authoritative participant view even when the empty state
+	// originated from a VoiceStateUpdate rather than a full snapshot.
+	manager.ParticipantChanged(discord.ParticipantEvent{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		UserID:         "user-01",
+		Present:        false,
+	})
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("transient voice-state leave stopped %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	participants, err := manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 1 || participants[0].UserID != "user-01" {
+		t.Fatalf("voice-event revalidation did not restore the participant: %#v", participants)
+	}
+}
+
+func TestVoiceEventEmptyAutoStopDoesNotTrustOneEmptyRevalidation(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+		{Revision: 2},
+		{Revision: 3, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	manager.autoStopEmptyConfirmDelay = 5 * time.Millisecond
+	manager.participantSyncDelays = nil
+	manager.participantSyncInterval = 0
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.ParticipantChanged(discord.ParticipantEvent{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		UserID:         "user-01",
+		Present:        false,
+	})
+	waitForSequenceSnapshotReads(t, voice, 3)
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("one transiently empty revalidation stopped %q", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	participants, err := manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 1 || participants[0].UserID != "user-01" {
+		t.Fatalf("second revalidation did not restore the participant: %#v", participants)
+	}
+}
+
+func TestVoiceEventPersistentEmptyAutoStopsAfterSecondRevalidation(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+		{Revision: 2},
+		{Revision: 3},
+	}}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	manager.autoStopEmptyConfirmDelay = 40 * time.Millisecond
+	manager.participantSyncDelays = nil
+	manager.participantSyncInterval = 0
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.ParticipantChanged(discord.ParticipantEvent{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		UserID:         "user-01",
+		Present:        false,
+	})
+	waitForSequenceSnapshotReads(t, voice, 2)
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("first empty revalidation stopped %q before the stability window", got)
+	default:
+	}
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("persistent empty state stopped %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("persistent empty state did not stop after the second revalidation")
+	}
+	if got := voice.snapshotReadCount(); got < 3 {
+		t.Fatalf("auto-stop used %d snapshot reads, want at least 3", got)
 	}
 }
 
@@ -1334,6 +1478,7 @@ func TestVoiceRejoinHydratesCurrentParticipants(t *testing.T) {
 	}
 	manager := NewManager(voice)
 	manager.autoStopDelay = 5 * time.Millisecond
+	manager.autoStopEmptyConfirmDelay = 5 * time.Millisecond
 	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
 	manager.SetStreamStopper(stopper)
 	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}

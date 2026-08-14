@@ -36,6 +36,7 @@ type Manager struct {
 	autoStartCooldown           time.Duration
 	autoStartRetryDelays        []time.Duration
 	autoStopDelay               time.Duration
+	autoStopEmptyConfirmDelay   time.Duration
 	autoStopRetryDelays         []time.Duration
 	autoStopCooldown            time.Duration
 	autoStartRefresher          func() error
@@ -141,6 +142,7 @@ type autoStopObservation struct {
 	participantStateRevision uint64
 	reconnectGeneration      int64
 	autoStopGeneration       uint64
+	emptyRevalidationPassed  bool
 }
 
 // autoStopRejoinIntent records a Discord VC join that happened while the
@@ -219,13 +221,14 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		// call may take its bounded timeout) before it persists a newly rearmed
 		// waiting stream. Keep a deliberately bounded, but operationally wider,
 		// reconciliation window so a VC rejoin is not lost in that gap.
-		rejoinReconcileDelay: []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second},
-		autoStartCooldown:    30 * time.Second,
-		autoStartRetryDelays: []time.Duration{500 * time.Millisecond, 2 * time.Second, 5 * time.Second},
-		autoStopDelay:        2 * time.Second,
-		autoStopRetryDelays:  []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second},
-		autoStopCooldown:     15 * time.Second,
-		autoStartRefreshWait: 5 * time.Second,
+		rejoinReconcileDelay:      []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second},
+		autoStartCooldown:         30 * time.Second,
+		autoStartRetryDelays:      []time.Duration{500 * time.Millisecond, 2 * time.Second, 5 * time.Second},
+		autoStopDelay:             2 * time.Second,
+		autoStopEmptyConfirmDelay: 15 * time.Second,
+		autoStopRetryDelays:       []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second},
+		autoStopCooldown:          15 * time.Second,
+		autoStartRefreshWait:      5 * time.Second,
 		// Discord's state cache may lag immediately after JoinVoice, while the
 		// Bot -> Worker -> Encoder event path can fail transiently during service
 		// restarts. Re-publish one authoritative full snapshot on a bounded warmup
@@ -966,41 +969,56 @@ func (m *Manager) autoStopWhenEmpty(streamID string, observation autoStopObserva
 	job := m.current
 	reconnectGeneration := m.reconnectGeneration
 	participantStateRevision := m.participantStateRevision
+	emptyConfirmDelay := m.autoStopEmptyConfirmDelay
 	m.mu.Unlock()
 
-	// An authoritative Discord snapshot can briefly be empty while the
-	// gateway State cache is catching up. Re-read it after the normal empty-VC
-	// grace period before stopping. A missing snapshot is non-authoritative and
-	// must never be interpreted as proof that the channel is empty.
-	if observation.source == "authoritative_snapshot" {
-		if source, ok := m.voice.(discord.ParticipantSnapshotSource); ok {
-			snapshot, known := source.SnapshotVoiceParticipants(job)
-			if !known {
-				m.mu.Lock()
-				if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
-					m.cancelAutoStopLocked(streamID)
-				}
-				m.mu.Unlock()
-				log.Printf("Discord VC auto-stop canceled: event=revalidation_unavailable stream_id=%s reason=participant_snapshot_unavailable reconnect_generation=%d auto_stop_generation=%d", streamID, reconnectGeneration, observation.autoStopGeneration)
-				return
+	// Discord's gateway State can briefly omit a participant during reconnects
+	// or voice-state churn. Re-read the current full view after the normal
+	// empty-VC grace period for both snapshot- and event-derived emptiness. A
+	// missing snapshot is non-authoritative and must never be treated as proof
+	// that the channel is empty.
+	if source, ok := m.voice.(discord.ParticipantSnapshotSource); ok {
+		snapshot, known := source.SnapshotVoiceParticipants(job)
+		if !known {
+			m.mu.Lock()
+			if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
+				m.cancelAutoStopLocked(streamID)
 			}
-			if len(snapshot.Participants) > 0 {
-				m.participantsSynced(snapshot, participantSnapshotApplyOptions{
-					expectedGeneration:    reconnectGeneration,
-					requireGeneration:     true,
-					authoritativeReplay:   true,
-					expectedStateRevision: participantStateRevision,
-					requireStateRevision:  true,
-				})
-				m.mu.Lock()
-				if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
-					m.cancelAutoStopLocked(streamID)
-				}
-				m.mu.Unlock()
-				log.Printf("Discord VC auto-stop canceled: event=revalidation_nonempty stream_id=%s participant_count=%d snapshot_revision=%d reconnect_generation=%d auto_stop_generation=%d", streamID, len(snapshot.Participants), snapshot.Revision, reconnectGeneration, observation.autoStopGeneration)
-				return
-			}
+			m.mu.Unlock()
+			log.Printf("Discord VC auto-stop canceled: event=revalidation_unavailable stream_id=%s reason=participant_snapshot_unavailable source=%s reconnect_generation=%d auto_stop_generation=%d", streamID, observation.source, reconnectGeneration, observation.autoStopGeneration)
+			return
 		}
+		if len(snapshot.Participants) > 0 {
+			m.participantsSynced(snapshot, participantSnapshotApplyOptions{
+				expectedGeneration:    reconnectGeneration,
+				requireGeneration:     true,
+				authoritativeReplay:   true,
+				expectedStateRevision: participantStateRevision,
+				requireStateRevision:  true,
+			})
+			m.mu.Lock()
+			if m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration) {
+				m.cancelAutoStopLocked(streamID)
+			}
+			m.mu.Unlock()
+			log.Printf("Discord VC auto-stop canceled: event=revalidation_nonempty stream_id=%s source=%s participant_count=%d snapshot_revision=%d reconnect_generation=%d auto_stop_generation=%d", streamID, observation.source, len(snapshot.Participants), snapshot.Revision, reconnectGeneration, observation.autoStopGeneration)
+			return
+		}
+		observation.snapshotRevision = snapshot.Revision
+		observation.participantStateRevision = participantStateRevision
+		m.mu.Lock()
+		stillValid := m.autoStopStillValidForJobLocked(streamID, observation.autoStopGeneration, job, reconnectGeneration)
+		m.mu.Unlock()
+		if !stillValid {
+			return
+		}
+		if !observation.emptyRevalidationPassed {
+			observation.emptyRevalidationPassed = true
+			log.Printf("Discord VC auto-stop deferred: event=revalidation_pending stream_id=%s source=%s participant_count=0 snapshot_revision=%d reconnect_generation=%d auto_stop_generation=%d next_delay_ms=%d", streamID, observation.source, snapshot.Revision, reconnectGeneration, observation.autoStopGeneration, emptyConfirmDelay.Milliseconds())
+			go m.autoStopWhenEmpty(streamID, observation, stopper, emptyConfirmDelay)
+			return
+		}
+		log.Printf("Discord VC auto-stop confirmed: event=revalidation_empty stream_id=%s source=%s participant_count=0 snapshot_revision=%d reconnect_generation=%d auto_stop_generation=%d", streamID, observation.source, snapshot.Revision, reconnectGeneration, observation.autoStopGeneration)
 	}
 
 	m.mu.Lock()
