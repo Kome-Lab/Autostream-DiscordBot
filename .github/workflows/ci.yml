@@ -5,9 +5,14 @@ on:
     branches: ['**']
   pull_request:
 
+concurrency:
+  group: autostream-discord-bot-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   go:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -15,7 +20,29 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+      - name: Resolve DAVE cache key
+        id: dave-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          vcpkg_root="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
+          echo "vcpkg_commit=$(git -C "$vcpkg_root" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache DAVE native build
+        id: dave-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            third_party/discordgo/dave/libdave/cpp/build
+            third_party/discordgo/dave/libdave/cpp/vcpkg/vcpkg
+            third_party/discordgo/dave/libdave/cpp/vcpkg/downloads
+            third_party/discordgo/dave/libdave/cpp/vcpkg/packages
+            third_party/discordgo/dave/libdave/cpp/vcpkg/installed
+          key: ${{ runner.os }}-${{ runner.arch }}-dave-${{ steps.dave-cache-key.outputs.vcpkg_commit }}-${{ hashFiles('third_party/discordgo/dave/libdave/cpp/CMakeLists.txt', 'third_party/discordgo/dave/libdave/cpp/Makefile', 'third_party/discordgo/dave/libdave/cpp/src/**', 'third_party/discordgo/dave/libdave/cpp/includes/**', 'third_party/discordgo/dave/libdave/cpp/vcpkg-alts/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-dave-${{ steps.dave-cache-key.outputs.vcpkg_commit }}-
       - name: Validate installer syntax
         shell: bash
         run: bash -n release/install-autostream-discord-bot
@@ -29,29 +56,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ make pkg-config autoconf automake libtool \
-            zip unzip tar
-          git -C third_party/discordgo/dave/libdave/cpp/vcpkg \
-            fetch --unshallow || \
-            git -C third_party/discordgo/dave/libdave/cpp/vcpkg fetch --all --tags
           vcpkg_root="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
           cpp_root="$PWD/third_party/discordgo/dave/libdave/cpp"
           build_dir="$cpp_root/build"
-          for bootstrap_attempt in 1 2 3; do
-            echo "Bootstrapping vcpkg (attempt ${bootstrap_attempt}/3)"
-            if "$vcpkg_root/bootstrap-vcpkg.sh" -disableMetrics; then
-              break
+          missing_tool=0
+          for tool in cmake ninja g++ make pkg-config autoconf automake libtool zip unzip tar; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing_tool=1
             fi
-            if [ "$bootstrap_attempt" -eq 3 ]; then
-              echo 'vcpkg bootstrap failed after 3 attempts' >&2
-              exit 1
-            fi
-            sleep $((bootstrap_attempt * 15))
           done
+          if [ "$missing_tool" -eq 1 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build g++ make pkg-config autoconf automake libtool \
+              zip unzip tar
+          fi
+          if [ ! -x "$vcpkg_root/vcpkg" ]; then
+            git -C "$vcpkg_root" fetch --unshallow || git -C "$vcpkg_root" fetch --all --tags
+            for bootstrap_attempt in 1 2 3; do
+              echo "Bootstrapping vcpkg (attempt ${bootstrap_attempt}/3)"
+              if "$vcpkg_root/bootstrap-vcpkg.sh" -disableMetrics; then
+                break
+              fi
+              if [ "$bootstrap_attempt" -eq 3 ]; then
+                echo 'vcpkg bootstrap failed after 3 attempts' >&2
+                exit 1
+              fi
+              sleep $((bootstrap_attempt * 15))
+            done
+          fi
           test -x "$vcpkg_root/vcpkg"
           export CC=gcc CXX=g++
+          cache_hit="${{ steps.dave-cache.outputs.cache-hit }}"
+          if [ "$cache_hit" = "true" ] && [ -f "$build_dir/libdave.a" ]; then
+            echo 'Using exact cached libdave build.'
+            exit 0
+          fi
           # Hosted-runner GitHub archive downloads can reset transiently; retain
           # completed vcpkg packages and retry the configure/build as a unit.
           # This is the explicit-CMake equivalent of:

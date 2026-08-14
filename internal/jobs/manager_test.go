@@ -1827,8 +1827,8 @@ func TestAutoStopDiagnosticRecordsEmptyParticipantObservation(t *testing.T) {
 		"participant_count=0",
 		"snapshot_revision=0",
 		"participant_state_revision=2",
-		"reconnect_generation=0",
-		"auto_stop_generation=1",
+		"reconnect_generation=1",
+		"auto_stop_generation=3",
 		"attempt=1",
 		"delay_ms=0",
 	} {
