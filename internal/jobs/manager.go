@@ -131,6 +131,16 @@ type autoStopInFlight struct {
 	job        discord.VoiceJob
 }
 
+type autoStopObservation struct {
+	reason                   string
+	source                   string
+	participantCount         int
+	snapshotRevision         uint64
+	participantStateRevision uint64
+	reconnectGeneration      int64
+	autoStopGeneration       uint64
+}
+
 // autoStopRejoinIntent records a Discord VC join that happened while the
 // empty-channel stop request was pending. A Panel stop can race with its
 // cancellation, so this intent is retained until the freshly rearmed waiting
@@ -586,14 +596,16 @@ func (m *Manager) ParticipantChanged(event discord.ParticipantEvent) {
 	reconnectGeneration := m.reconnectGeneration
 	job := m.current
 	participants := m.participantsSnapshotLocked()
-	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
+	stopper, shouldAutoStop, autoStopObservation := m.updateAutoStopForParticipantSetLocked(job, now, "voice_event", m.participantSnapshotRevision)
+	autoStopDelay := m.autoStopDelay
 	m.mu.Unlock()
 	m.reportParticipantsIfCurrent(job, participants, participantStateRevision, reconnectGeneration, true)
 	if speakerStopped {
 		m.reportActiveSpeakerIfCurrent(job, event.UserID, speakerDisplayName, false, participantStateRevision, reconnectGeneration)
 	}
 	if shouldAutoStop {
-		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
+		logAutoStopObservation("scheduled", job.StreamID, autoStopObservation, autoStopDelay, 0)
+		go m.autoStopWhenEmpty(job.StreamID, autoStopObservation, stopper, autoStopDelay)
 	}
 }
 
@@ -689,12 +701,14 @@ func (m *Manager) participantsSynced(snapshot discord.ParticipantSnapshot, optio
 	stateRevision := m.participantStateRevision
 	participants := m.participantsSnapshotLocked()
 	reportGeneration := m.reconnectGeneration
-	stopper, shouldAutoStop, autoStopGeneration := m.updateAutoStopForParticipantSetLocked(job, now)
+	stopper, shouldAutoStop, autoStopObservation := m.updateAutoStopForParticipantSetLocked(job, now, "authoritative_snapshot", snapshot.Revision)
+	autoStopDelay := m.autoStopDelay
 	m.mu.Unlock()
 
 	m.reportParticipantsIfCurrent(job, participants, stateRevision, reportGeneration, true)
 	if shouldAutoStop {
-		go m.autoStopWhenEmpty(job.StreamID, autoStopGeneration, stopper, m.autoStopDelay)
+		logAutoStopObservation("scheduled", job.StreamID, autoStopObservation, autoStopDelay, 0)
+		go m.autoStopWhenEmpty(job.StreamID, autoStopObservation, stopper, autoStopDelay)
 	}
 	return true
 }
@@ -874,30 +888,38 @@ func waitForParticipantSync(ctx context.Context, delay time.Duration) bool {
 // updateAutoStopForParticipantSetLocked applies the single empty/non-empty
 // policy to both transition events and authoritative snapshot replacement.
 // The caller must hold m.mu.
-func (m *Manager) updateAutoStopForParticipantSetLocked(job discord.VoiceJob, now time.Time) (StreamStopper, bool, uint64) {
+func (m *Manager) updateAutoStopForParticipantSetLocked(job discord.VoiceJob, now time.Time, source string, snapshotRevision uint64) (StreamStopper, bool, autoStopObservation) {
 	stopper := m.streamStopper
 	if len(m.participants) > 0 {
 		if m.hasAutoStopInFlightLocked(job.StreamID) {
 			m.recordAutoStopRejoinIntentLocked(job.StreamID, job.GuildID, job.VoiceChannelID)
 		}
 		m.cancelAutoStopLocked(job.StreamID)
-		return stopper, false, 0
+		return stopper, false, autoStopObservation{}
 	}
 	if stopper == nil {
-		return nil, false, 0
+		return nil, false, autoStopObservation{}
 	}
 	lastAttempt := m.autoStopLastAttempt[job.StreamID]
 	if m.autoStopPending[job.StreamID] || (!lastAttempt.IsZero() && now.Sub(lastAttempt) < m.autoStopCooldown) {
-		return stopper, false, 0
+		return stopper, false, autoStopObservation{}
 	}
 	m.autoStopPending[job.StreamID] = true
 	m.autoStopGeneration[job.StreamID]++
 	autoStopGeneration := m.autoStopGeneration[job.StreamID]
 	m.autoStopAttempts[job.StreamID] = 0
-	return stopper, true, autoStopGeneration
+	return stopper, true, autoStopObservation{
+		reason:                   "empty_participants",
+		source:                   source,
+		participantCount:         len(m.participants),
+		snapshotRevision:         snapshotRevision,
+		participantStateRevision: m.participantStateRevision,
+		reconnectGeneration:      m.reconnectGeneration,
+		autoStopGeneration:       autoStopGeneration,
+	}
 }
 
-func (m *Manager) autoStopWhenEmpty(streamID string, generation uint64, stopper StreamStopper, delay time.Duration) {
+func (m *Manager) autoStopWhenEmpty(streamID string, observation autoStopObservation, stopper StreamStopper, delay time.Duration) {
 	if delay < 0 {
 		delay = 0
 	}
@@ -906,19 +928,21 @@ func (m *Manager) autoStopWhenEmpty(streamID string, generation uint64, stopper 
 	<-timer.C
 
 	m.mu.Lock()
-	if !m.autoStopStillValidLocked(streamID, generation) {
+	if !m.autoStopStillValidLocked(streamID, observation.autoStopGeneration) {
 		m.mu.Unlock()
 		return
 	}
 	m.autoStopLastAttempt[streamID] = time.Now().UTC()
+	attempt := m.autoStopAttempts[streamID] + 1
 	ctx, cancel := context.WithCancel(context.Background())
-	m.autoStopInFlight[streamID] = autoStopInFlight{generation: generation, cancel: cancel, job: m.current}
+	m.autoStopInFlight[streamID] = autoStopInFlight{generation: observation.autoStopGeneration, cancel: cancel, job: m.current}
 	m.mu.Unlock()
+	logAutoStopObservation("requested", streamID, observation, delay, attempt)
 
 	err := stopStreamWithContext(ctx, stopper, streamID)
 	m.mu.Lock()
-	m.clearAutoStopInFlightLocked(streamID, generation)
-	stillValid := m.autoStopStillValidLocked(streamID, generation)
+	m.clearAutoStopInFlightLocked(streamID, observation.autoStopGeneration)
+	stillValid := m.autoStopStillValidLocked(streamID, observation.autoStopGeneration)
 	reconcileRejoin := !stillValid && m.hasAutoStopRejoinIntentForStreamLocked(streamID)
 	m.mu.Unlock()
 	if reconcileRejoin {
@@ -929,14 +953,14 @@ func (m *Manager) autoStopWhenEmpty(streamID string, generation uint64, stopper 
 			return
 		}
 		log.Printf("Discord VC auto-stop request failed for stream=%s: %v", streamID, err)
-		m.scheduleAutoStopRetry(streamID, generation, stopper, err)
+		m.scheduleAutoStopRetry(streamID, observation.autoStopGeneration, stopper, err, observation)
 		return
 	}
 	if !stillValid {
 		return
 	}
 	m.mu.Lock()
-	m.finishAutoStopLocked(streamID, generation)
+	m.finishAutoStopLocked(streamID, observation.autoStopGeneration)
 	m.mu.Unlock()
 }
 
@@ -947,7 +971,7 @@ func stopStreamWithContext(ctx context.Context, stopper StreamStopper, streamID 
 	return stopper.StopStream(streamID)
 }
 
-func (m *Manager) scheduleAutoStopRetry(streamID string, generation uint64, stopper StreamStopper, err error) {
+func (m *Manager) scheduleAutoStopRetry(streamID string, generation uint64, stopper StreamStopper, err error, observation autoStopObservation) {
 	if !shouldRetryAutoStop(err) {
 		m.mu.Lock()
 		m.finishAutoStopLocked(streamID, generation)
@@ -972,7 +996,24 @@ func (m *Manager) scheduleAutoStopRetry(streamID string, generation uint64, stop
 	m.mu.Unlock()
 
 	log.Printf("Discord VC auto-stop retry scheduled for stream=%s attempt=%d delay=%s", streamID, attempt+1, delay)
-	go m.autoStopWhenEmpty(streamID, generation, stopper, delay)
+	go m.autoStopWhenEmpty(streamID, observation, stopper, delay)
+}
+
+func logAutoStopObservation(event, streamID string, observation autoStopObservation, delay time.Duration, attempt int) {
+	log.Printf(
+		"Discord VC auto-stop: event=%s stream_id=%s reason=%s source=%s participant_count=%d snapshot_revision=%d participant_state_revision=%d reconnect_generation=%d auto_stop_generation=%d attempt=%d delay_ms=%d",
+		event,
+		streamID,
+		observation.reason,
+		observation.source,
+		observation.participantCount,
+		observation.snapshotRevision,
+		observation.participantStateRevision,
+		observation.reconnectGeneration,
+		observation.autoStopGeneration,
+		attempt,
+		delay.Milliseconds(),
+	)
 }
 
 func (m *Manager) autoStopStillValidLocked(streamID string, generation uint64) bool {

@@ -1787,6 +1787,60 @@ func TestStartAndStopCancelScheduledAutoStop(t *testing.T) {
 	})
 }
 
+func TestAutoStopDiagnosticRecordsEmptyParticipantObservation(t *testing.T) {
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+
+	manager := NewManager(&fakeVoice{})
+	manager.autoStopDelay = 0
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Present: true})
+	manager.ParticipantChanged(discord.ParticipantEvent{StreamID: job.StreamID, UserID: "user-01", Present: false})
+
+	select {
+	case got := <-stopper.ch:
+		if got != job.StreamID {
+			t.Fatalf("auto-stop stream = %q, want %q", got, job.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for auto-stop request")
+	}
+
+	got := output.String()
+	for _, expected := range []string{
+		"event=scheduled",
+		"event=requested",
+		"reason=empty_participants",
+		"source=voice_event",
+		"participant_count=0",
+		"snapshot_revision=0",
+		"participant_state_revision=2",
+		"reconnect_generation=0",
+		"auto_stop_generation=1",
+		"attempt=1",
+		"delay_ms=0",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("auto-stop diagnostic missing %q: %q", expected, got)
+		}
+	}
+	if strings.Contains(got, "user-01") {
+		t.Fatalf("auto-stop diagnostic leaked a participant ID: %q", got)
+	}
+}
+
 func TestManagerRecordsWorkerEventPublishFailures(t *testing.T) {
 	reporter := &fakeReporter{err: errors.New("worker unavailable")}
 	manager := NewManagerWithReporter(&fakeVoice{}, reporter)
