@@ -968,6 +968,45 @@ func TestStartDoesNotAutoStopOnTransientEmptyInitialSnapshot(t *testing.T) {
 	}
 }
 
+func TestAuthoritativeEmptyAutoStopRevalidatesBeforeStop(t *testing.T) {
+	voice := &sequenceSnapshotVoice{snapshots: []discord.ParticipantSnapshot{
+		{Revision: 1, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+		{Revision: 3, Participants: []discord.VoiceParticipant{{UserID: "user-01", Username: "alice"}}},
+	}}
+	manager := NewManager(voice)
+	manager.autoStopDelay = 5 * time.Millisecond
+	manager.participantSyncDelays = nil
+	manager.participantSyncInterval = 0
+	stopper := &fakeStreamStopper{ch: make(chan string, 1)}
+	manager.SetStreamStopper(stopper)
+	job := discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
+	if err := manager.Start(job); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first authoritative empty snapshot is a stale cache view. The
+	// revalidation read returns the participant before the stop request is
+	// created, so the stream must remain alive.
+	manager.ParticipantsSynced(discord.ParticipantSnapshot{
+		StreamID:       job.StreamID,
+		GuildID:        job.GuildID,
+		VoiceChannelID: job.VoiceChannelID,
+		Revision:       2,
+	})
+	select {
+	case got := <-stopper.ch:
+		t.Fatalf("stale authoritative empty snapshot stopped %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	participants, err := manager.Participants(job.StreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 1 || participants[0].UserID != "user-01" {
+		t.Fatalf("revalidation did not restore the participant: %#v", participants)
+	}
+}
+
 func TestParticipantsSyncedReplacesStaleMemberAfterGatewayRecovery(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	manager.autoStopDelay = 5 * time.Millisecond
