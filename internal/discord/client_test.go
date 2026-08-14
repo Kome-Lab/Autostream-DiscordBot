@@ -18,6 +18,7 @@ type fakeEventSink struct {
 	activeStreamID string
 	activeUserID   string
 	voiceJoin      VoiceJoinEvent
+	voiceJoins     []VoiceJoinEvent
 	participants   []ParticipantEvent
 	chatMessage    ChatMessageEvent
 	connectedCount int
@@ -25,6 +26,7 @@ type fakeEventSink struct {
 
 func (f *fakeEventSink) VoiceUserJoined(event VoiceJoinEvent) {
 	f.voiceJoin = event
+	f.voiceJoins = append(f.voiceJoins, event)
 }
 func (f *fakeEventSink) ParticipantChanged(event ParticipantEvent) {
 	f.participants = append(f.participants, event)
@@ -736,6 +738,37 @@ func TestVoiceParticipantSnapshotsHydrateAndRecoverAuthoritatively(t *testing.T)
 	client.onGuildCreate(session, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "guild-01"}})
 	if len(sink.snapshots) != 2 || sink.snapshots[1].Revision != 3 || len(sink.snapshots[1].Participants) != 0 {
 		t.Fatalf("full reconnect guild sync must publish an authoritative empty VC: %#v", sink.snapshots)
+	}
+}
+
+func TestAutoStartPresenceSyncEmitsExistingHumanParticipant(t *testing.T) {
+	session := &discordgo.Session{State: discordgo.NewState(), StateEnabled: true}
+	session.State.TrackVoice = true
+	session.State.User = &discordgo.User{ID: "bot-01", Bot: true}
+	if err := session.State.GuildAdd(&discordgo.Guild{
+		ID: "guild-01",
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{User: &discordgo.User{ID: "bot-01", Bot: true}}},
+			{UserID: "bot-other", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{User: &discordgo.User{ID: "bot-other", Bot: true}}},
+			{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{Nick: "Alice", User: &discordgo.User{ID: "user-01", Username: "alice"}}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sink := &fakeEventSink{}
+	client := &RealClient{session: session, sink: sink}
+
+	client.SetAutoStartVoiceTargets([]AutoStartVoiceTarget{{
+		StreamID:       "stream-01",
+		GuildID:        "guild-01",
+		VoiceChannelID: "voice-01",
+	}})
+
+	if len(sink.voiceJoins) != 1 {
+		t.Fatalf("expected one synthetic auto-start join, got %#v", sink.voiceJoins)
+	}
+	if got := sink.voiceJoins[0]; got.GuildID != "guild-01" || got.VoiceChannelID != "voice-01" || got.UserID != "user-01" || got.Username != "Alice" {
+		t.Fatalf("unexpected existing participant join event: %#v", got)
 	}
 }
 

@@ -29,6 +29,18 @@ type fakeVoice struct {
 	sendRelease   chan struct{}
 }
 
+type autoStartTargetVoice struct {
+	fakeVoice
+	mu      sync.Mutex
+	targets []discord.AutoStartVoiceTarget
+}
+
+func (f *autoStartTargetVoice) SetAutoStartVoiceTargets(targets []discord.AutoStartVoiceTarget) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.targets = append([]discord.AutoStartVoiceTarget(nil), targets...)
+}
+
 type snapshotVoice struct {
 	fakeVoice
 	snapshot discord.ParticipantSnapshot
@@ -584,6 +596,23 @@ func TestManagerStartAppliesStreamVoiceDefaults(t *testing.T) {
 	}
 	if voice.joined.GuildID != "guild-stream" || voice.joined.VoiceChannelID != "voice-stream" || voice.joined.TextChannelID != "text-stream" || voice.joined.CaptionAudioURL != "" {
 		t.Fatalf("stream voice defaults were not applied: %#v", voice.joined)
+	}
+}
+
+func TestSetStreamVoiceDefaultsPublishesAutoStartTargets(t *testing.T) {
+	voice := &autoStartTargetVoice{}
+	manager := NewManager(voice)
+
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-auto":   {GuildID: "guild-auto", VoiceChannelID: "voice-auto", AutoStartEnabled: true},
+		"stream-manual": {GuildID: "guild-manual", VoiceChannelID: "voice-manual", AutoStartEnabled: false},
+	})
+
+	voice.mu.Lock()
+	targets := append([]discord.AutoStartVoiceTarget(nil), voice.targets...)
+	voice.mu.Unlock()
+	if len(targets) != 1 || targets[0].StreamID != "stream-auto" || targets[0].GuildID != "guild-auto" || targets[0].VoiceChannelID != "voice-auto" {
+		t.Fatalf("unexpected auto-start targets: %#v", targets)
 	}
 }
 

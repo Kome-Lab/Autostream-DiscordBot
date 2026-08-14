@@ -105,6 +105,23 @@ type EventSource interface {
 	SetEventSink(sink EventSink)
 }
 
+// AutoStartVoiceTarget identifies a waiting stream whose Discord VC should be
+// checked when the Gateway state becomes available. The normal VoiceStateUpdate
+// event is not emitted for users who were already in the VC before the stream
+// configuration was loaded, so the client must also be able to inspect the
+// cached guild state.
+type AutoStartVoiceTarget struct {
+	StreamID       string
+	GuildID        string
+	VoiceChannelID string
+}
+
+// AutoStartVoiceTargetSetter is an optional extension used by the job manager
+// when Control Panel runtime configuration is refreshed.
+type AutoStartVoiceTargetSetter interface {
+	SetAutoStartVoiceTargets(targets []AutoStartVoiceTarget)
+}
+
 // ParticipantSnapshotSink is implemented by consumers that can replace their
 // participant state from an authoritative Discord State snapshot. EventSink is
 // intentionally kept backward-compatible for lightweight consumers that only
@@ -176,16 +193,17 @@ func (c Config) Validate() error {
 }
 
 type RealClient struct {
-	cfg           Config
-	session       *discordgo.Session
-	voice         *discordgo.VoiceConnection
-	sink          EventSink
-	forward       AudioForwarder
-	source        string
-	audioStop     chan struct{}
-	ssrcUsers     map[uint32]string
-	audioSpeakers map[string]time.Time
-	mu            sync.Mutex
+	cfg              Config
+	session          *discordgo.Session
+	voice            *discordgo.VoiceConnection
+	sink             EventSink
+	autoStartTargets []AutoStartVoiceTarget
+	forward          AudioForwarder
+	source           string
+	audioStop        chan struct{}
+	ssrcUsers        map[uint32]string
+	audioSpeakers    map[string]time.Time
+	mu               sync.Mutex
 	// participantSyncMu serializes snapshot creation and delivery. DiscordGo
 	// invokes typed handlers asynchronously, so an older handler must always
 	// re-read the latest State while holding this gate before it can publish.
@@ -222,6 +240,31 @@ func (c *RealClient) SetEventSink(sink EventSink) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sink = sink
+}
+
+func (c *RealClient) SetAutoStartVoiceTargets(targets []AutoStartVoiceTarget) {
+	normalized := make([]AutoStartVoiceTarget, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		target.StreamID = strings.TrimSpace(target.StreamID)
+		target.GuildID = strings.TrimSpace(target.GuildID)
+		target.VoiceChannelID = strings.TrimSpace(target.VoiceChannelID)
+		if target.StreamID == "" || target.GuildID == "" || target.VoiceChannelID == "" {
+			continue
+		}
+		key := target.StreamID + "\x00" + target.GuildID + "\x00" + target.VoiceChannelID
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, target)
+	}
+
+	c.mu.Lock()
+	c.autoStartTargets = normalized
+	session := c.session
+	c.mu.Unlock()
+	c.syncAutoStartVoiceMembers(session)
 }
 
 func (c *RealClient) SetAudioForwarder(forwarder AudioForwarder, source string) {
@@ -686,6 +729,7 @@ func (c *RealClient) onReady(session *discordgo.Session, _ *discordgo.Ready) {
 	// cache may still be filling, so this best-effort snapshot is followed by
 	// the authoritative GUILD_CREATE path below.
 	c.syncCurrentVoiceParticipants(session)
+	c.syncAutoStartVoiceMembers(session)
 }
 
 func (c *RealClient) onGatewayResumed(session *discordgo.Session, _ *discordgo.Resumed) {
@@ -699,6 +743,7 @@ func (c *RealClient) onGatewayResumed(session *discordgo.Session, _ *discordgo.R
 		sink.DiscordConnected()
 	}
 	c.syncCurrentVoiceParticipants(session)
+	c.syncAutoStartVoiceMembers(session)
 }
 
 // onGuildCreate is also emitted while DiscordGo is rebuilding State after a
@@ -709,6 +754,7 @@ func (c *RealClient) onGuildCreate(session *discordgo.Session, event *discordgo.
 	if event == nil || event.Guild == nil {
 		return
 	}
+	c.syncAutoStartVoiceMembers(session)
 	c.mu.Lock()
 	job := c.job
 	c.mu.Unlock()
@@ -716,6 +762,74 @@ func (c *RealClient) onGuildCreate(session *discordgo.Session, event *discordgo.
 		return
 	}
 	c.syncVoiceParticipants(session, job)
+}
+
+// syncAutoStartVoiceMembers emits at most one synthetic join event per
+// configured target when a human is already present in that VC. It never calls
+// the event sink while DiscordGo's State lock is held, and the manager's
+// existing pending/start fences make a repeated Gateway or runtime refresh
+// harmless.
+func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
+	c.mu.Lock()
+	targets := append([]AutoStartVoiceTarget(nil), c.autoStartTargets...)
+	sink := c.sink
+	if session == nil {
+		session = c.session
+	}
+	c.mu.Unlock()
+	if sink == nil || session == nil || session.State == nil || !session.State.TrackVoice || len(targets) == 0 {
+		return
+	}
+
+	selfUserID := sessionUserID(session)
+	if selfUserID == "" {
+		return
+	}
+	events := make([]VoiceJoinEvent, 0, len(targets))
+	state := session.State
+	state.RLock()
+	for _, target := range targets {
+		for _, guild := range state.Guilds {
+			if guild == nil || guild.ID != target.GuildID {
+				continue
+			}
+			for _, voiceState := range guild.VoiceStates {
+				if voiceState == nil || voiceState.ChannelID != target.VoiceChannelID {
+					continue
+				}
+				userID := strings.TrimSpace(voiceState.UserID)
+				if userID == "" || userID == selfUserID {
+					continue
+				}
+				if voiceState.Member != nil && voiceState.Member.User != nil && voiceState.Member.User.Bot {
+					continue
+				}
+				username := ""
+				if voiceState.Member != nil && voiceState.Member.User != nil {
+					username = strings.TrimSpace(voiceState.Member.Nick)
+					if username == "" {
+						username = strings.TrimSpace(voiceState.Member.User.GlobalName)
+					}
+					if username == "" {
+						username = strings.TrimSpace(voiceState.Member.User.Username)
+					}
+				}
+				events = append(events, VoiceJoinEvent{
+					GuildID:        target.GuildID,
+					VoiceChannelID: target.VoiceChannelID,
+					UserID:         userID,
+					Username:       username,
+				})
+				break
+			}
+			break
+		}
+	}
+	state.RUnlock()
+
+	for _, event := range events {
+		sink.VoiceUserJoined(event)
+	}
 }
 
 func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateUpdate) {

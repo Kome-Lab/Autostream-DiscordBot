@@ -341,8 +341,8 @@ func (m *Manager) SetVoiceDefaults(defaults VoiceDefaults) {
 
 func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.streamDefaults = map[string]VoiceDefaults{}
+	targets := make([]discord.AutoStartVoiceTarget, 0, len(defaults))
 	for streamID, item := range defaults {
 		streamID = strings.TrimSpace(streamID)
 		if streamID == "" {
@@ -354,6 +354,18 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 			TextChannelID:    strings.TrimSpace(item.TextChannelID),
 			AutoStartEnabled: item.AutoStartEnabled,
 		}
+		if item.AutoStartEnabled {
+			targets = append(targets, discord.AutoStartVoiceTarget{
+				StreamID:       streamID,
+				GuildID:        strings.TrimSpace(item.GuildID),
+				VoiceChannelID: strings.TrimSpace(item.VoiceChannelID),
+			})
+		}
+	}
+	voice := m.voice
+	m.mu.Unlock()
+	if setter, ok := voice.(discord.AutoStartVoiceTargetSetter); ok {
+		setter.SetAutoStartVoiceTargets(targets)
 	}
 }
 
