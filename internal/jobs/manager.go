@@ -23,6 +23,7 @@ type Manager struct {
 	defaults                    VoiceDefaults
 	streamDefaults              map[string]VoiceDefaults
 	autoStartPending            map[string]time.Time
+	autoStartRetries            map[string]*autoStartRetry
 	autoStopPending             map[string]bool
 	autoStopGeneration          map[string]uint64
 	autoStopAttempts            map[string]int
@@ -33,6 +34,7 @@ type Manager struct {
 	rejoinReconcileRun          map[string]bool
 	rejoinReconcileDelay        []time.Duration
 	autoStartCooldown           time.Duration
+	autoStartRetryDelays        []time.Duration
 	autoStopDelay               time.Duration
 	autoStopRetryDelays         []time.Duration
 	autoStopCooldown            time.Duration
@@ -152,6 +154,13 @@ type autoStopRejoinIntent struct {
 	Sequence       uint64
 }
 
+type autoStartRetry struct {
+	cancel              context.CancelFunc
+	reconnectGeneration int64
+	guildID             string
+	voiceChannelID      string
+}
+
 type Participant struct {
 	UserID    string    `json:"user_id"`
 	Username  string    `json:"username,omitempty"`
@@ -198,6 +207,7 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		activeSpeakers:      map[string]bool{},
 		streamDefaults:      map[string]VoiceDefaults{},
 		autoStartPending:    map[string]time.Time{},
+		autoStartRetries:    map[string]*autoStartRetry{},
 		autoStopPending:     map[string]bool{},
 		autoStopGeneration:  map[string]uint64{},
 		autoStopAttempts:    map[string]int{},
@@ -211,6 +221,7 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		// reconciliation window so a VC rejoin is not lost in that gap.
 		rejoinReconcileDelay: []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second},
 		autoStartCooldown:    30 * time.Second,
+		autoStartRetryDelays: []time.Duration{500 * time.Millisecond, 2 * time.Second, 5 * time.Second},
 		autoStopDelay:        2 * time.Second,
 		autoStopRetryDelays:  []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second},
 		autoStopCooldown:     15 * time.Second,
@@ -273,6 +284,7 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	m.activeSpeaker = ""
 	m.activeSpeakers = map[string]bool{}
 	delete(m.autoStartPending, job.StreamID)
+	m.cancelAllAutoStartRetriesLocked()
 	m.mu.Unlock()
 	if previousWorkerRetry != nil {
 		previousWorkerRetry.stopAndWait()
@@ -362,6 +374,12 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 			})
 		}
 	}
+	for streamID := range m.autoStartRetries {
+		item, ok := m.streamDefaults[streamID]
+		if !ok || !item.AutoStartEnabled {
+			m.cancelAutoStartRetryLocked(streamID)
+		}
+	}
 	voice := m.voice
 	m.mu.Unlock()
 	if setter, ok := voice.(discord.AutoStartVoiceTargetSetter); ok {
@@ -406,6 +424,7 @@ func mergeVoiceDefaults(base, override VoiceDefaults) VoiceDefaults {
 
 func (m *Manager) Stop(streamID string) error {
 	m.mu.Lock()
+	m.cancelAllAutoStartRetriesLocked()
 	currentStreamID := m.current.StreamID
 	if currentStreamID == "" {
 		m.mu.Unlock()
@@ -1339,17 +1358,31 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	}
 	m.autoStartPending[streamID] = now
 	starter := m.streamStarter
+	retryCtx, retryCancel := context.WithCancel(context.Background())
+	retry := &autoStartRetry{
+		cancel:              retryCancel,
+		reconnectGeneration: m.reconnectGeneration,
+		guildID:             event.GuildID,
+		voiceChannelID:      event.VoiceChannelID,
+	}
+	m.autoStartRetries[streamID] = retry
 	m.lastEventAt = now
 	m.mu.Unlock()
 
 	go func() {
+		defer m.finishAutoStartRetry(streamID, retry)
 		if err := starter.StartStream(streamID); err != nil {
-			log.Printf("Discord VC auto-start request failed for stream=%s: %v", streamID, err)
+			if isRetryableAutoStartError(err) {
+				logAutoStartRetryFailure(streamID, 1, err, true)
+				m.retryAutoStart(retryCtx, retry, starter, streamID)
+				return
+			}
+			logAutoStartRetryFailure(streamID, 1, err, false)
 			if !isStaleAutoStartError(err) || refresher == nil {
 				return
 			}
 			if refreshErr := refresher(); refreshErr != nil {
-				log.Printf("Discord VC auto-start stale-stream refresh failed for stream=%s: %v", streamID, refreshErr)
+				log.Printf("Discord VC auto-start stale-stream refresh failed: stream=%s error_class=refresh_failed", streamID)
 				return
 			}
 			m.mu.Lock()
@@ -1367,7 +1400,7 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 				return
 			}
 			if retryErr := starter.StartStream(successor); retryErr != nil {
-				log.Printf("Discord VC auto-start successor request failed for stream=%s (old_stream=%s): %v", successor, streamID, retryErr)
+				logAutoStartRetryFailure(successor, 1, retryErr, false)
 			} else {
 				log.Printf("Discord VC auto-start successor accepted by control panel for stream=%s (old_stream=%s)", successor, streamID)
 			}
@@ -1385,6 +1418,95 @@ func isStaleAutoStartError(err error) bool {
 		return false
 	}
 	return classified.HTTPStatusCode() == 404 && classified.ControlPanelCode() == "not_found"
+}
+
+func isRetryableAutoStartError(err error) bool {
+	var classified staleAutoStartError
+	if !errors.As(err, &classified) {
+		return false
+	}
+	return classified.HTTPStatusCode() == 409 && classified.ControlPanelCode() == "service_update_in_progress"
+}
+
+func logAutoStartRetryFailure(streamID string, retryCount int, err error, retryable bool) {
+	statusCode := 0
+	code := ""
+	var classified staleAutoStartError
+	if errors.As(err, &classified) {
+		statusCode = classified.HTTPStatusCode()
+		code = classified.ControlPanelCode()
+	}
+	if code != "" {
+		log.Printf("Discord VC auto-start request failed: stream=%s error_class=http_status http_status=%d code=%s retryable=%t retry_count=%d", streamID, statusCode, code, retryable, retryCount)
+		return
+	}
+	log.Printf("Discord VC auto-start request failed: stream=%s error_class=transport_or_unknown retryable=%t retry_count=%d", streamID, retryable, retryCount)
+}
+
+func (m *Manager) retryAutoStart(ctx context.Context, retry *autoStartRetry, starter StreamStarter, streamID string) {
+	m.mu.Lock()
+	delays := append([]time.Duration(nil), m.autoStartRetryDelays...)
+	m.mu.Unlock()
+	for index, delay := range delays {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+		if !m.autoStartRetryStillValid(streamID, retry) {
+			return
+		}
+		attempt := index + 2
+		err := starter.StartStream(streamID)
+		if err == nil {
+			log.Printf("Discord VC auto-start retry accepted by control panel: stream=%s retry_count=%d", streamID, attempt)
+			return
+		}
+		retryable := isRetryableAutoStartError(err)
+		logAutoStartRetryFailure(streamID, attempt, err, retryable)
+		if !retryable {
+			return
+		}
+	}
+	log.Printf("Discord VC auto-start retry exhausted: stream=%s retry_count=%d", streamID, len(delays)+1)
+}
+
+func (m *Manager) autoStartRetryStillValid(streamID string, retry *autoStartRetry) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.autoStartRetries[streamID] != retry || m.current.StreamID != "" || m.reconnectGeneration != retry.reconnectGeneration {
+		return false
+	}
+	return m.matchingAutoStartStreamLocked(retry.guildID, retry.voiceChannelID) == streamID
+}
+
+func (m *Manager) finishAutoStartRetry(streamID string, retry *autoStartRetry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.autoStartRetries[streamID] == retry {
+		delete(m.autoStartRetries, streamID)
+	}
+	retry.cancel()
+}
+
+func (m *Manager) cancelAutoStartRetryLocked(streamID string) {
+	if retry := m.autoStartRetries[streamID]; retry != nil {
+		retry.cancel()
+		delete(m.autoStartRetries, streamID)
+	}
+}
+
+func (m *Manager) cancelAllAutoStartRetriesLocked() {
+	for streamID := range m.autoStartRetries {
+		m.cancelAutoStartRetryLocked(streamID)
+	}
 }
 
 func (m *Manager) shouldLogAutoStartLocked(key string, now time.Time) bool {
@@ -1526,6 +1648,7 @@ func (m *Manager) DiscordConnected() {
 
 func (m *Manager) DiscordDisconnected(reason string) {
 	m.mu.Lock()
+	m.cancelAllAutoStartRetriesLocked()
 	m.lastEventAt = time.Now().UTC()
 	job := m.current
 	policy := m.reconnectPolicy

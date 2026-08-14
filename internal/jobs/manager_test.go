@@ -643,6 +643,61 @@ func TestVoiceUserJoinedStartsMatchingConfiguredStream(t *testing.T) {
 	}
 }
 
+func TestVoiceUserJoinedRetriesServiceUpdateInProgress(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.autoStartRetryDelays = []time.Duration{10 * time.Millisecond, 10 * time.Millisecond}
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
+	})
+	starter := &fakeStreamStarter{
+		ch:   make(chan string, 3),
+		errs: []error{control.ControlPanelError{StatusCode: 409, Code: "service_update_in_progress"}, control.ControlPanelError{StatusCode: 409, Code: "service_update_in_progress"}, nil},
+	}
+	manager.SetStreamStarter(starter)
+
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-01"})
+	for attempt := 1; attempt <= 3; attempt++ {
+		select {
+		case got := <-starter.ch:
+			if got != "stream-01" {
+				t.Fatalf("attempt %d started unexpected stream %q", attempt, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for bounded start retry %d", attempt)
+		}
+	}
+	select {
+	case got := <-starter.ch:
+		t.Fatalf("retry continued past success: %q", got)
+	case <-time.After(80 * time.Millisecond):
+	}
+}
+
+func TestVoiceUserJoinedCancelsStartRetryOnDisconnect(t *testing.T) {
+	manager := NewManager(&fakeVoice{})
+	manager.autoStartRetryDelays = []time.Duration{100 * time.Millisecond}
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"stream-01": {GuildID: "guild-01", VoiceChannelID: "voice-01", AutoStartEnabled: true},
+	})
+	starter := &fakeStreamStarter{
+		ch:   make(chan string, 2),
+		errs: []error{control.ControlPanelError{StatusCode: 409, Code: "service_update_in_progress"}, nil},
+	}
+	manager.SetStreamStarter(starter)
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: "guild-01", VoiceChannelID: "voice-01", UserID: "user-01"})
+	select {
+	case <-starter.ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial start attempt")
+	}
+	manager.DiscordDisconnected("gateway_disconnect")
+	select {
+	case got := <-starter.ch:
+		t.Fatalf("disconnected retry reached Control Panel: %q", got)
+	case <-time.After(180 * time.Millisecond):
+	}
+}
+
 func TestVoiceUserJoinedRefreshesDefaultsBeforeMatching(t *testing.T) {
 	manager := NewManager(&fakeVoice{})
 	starter := &fakeStreamStarter{ch: make(chan string, 1)}
