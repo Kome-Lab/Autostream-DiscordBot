@@ -361,6 +361,34 @@ func TestControlPanelErrorClassifiesAutoStopRetryability(t *testing.T) {
 	}
 }
 
+func TestControlPanelErrorClassifiesAutoStartRetryability(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		code       string
+		want       bool
+	}{
+		{name: "request timeout", statusCode: http.StatusRequestTimeout, want: true},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, want: true},
+		{name: "bad gateway", statusCode: http.StatusBadGateway, want: true},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, want: true},
+		{name: "service update in progress", statusCode: http.StatusConflict, code: "service_update_in_progress", want: true},
+		{name: "other conflict", statusCode: http.StatusConflict, code: "stream_status_not_startable", want: false},
+		{name: "bad request", statusCode: http.StatusBadRequest, want: false},
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, want: false},
+		{name: "forbidden", statusCode: http.StatusForbidden, want: false},
+		{name: "not found", statusCode: http.StatusNotFound, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (ControlPanelError{StatusCode: tt.statusCode, Code: tt.code}).RetryableAutoStart(); got != tt.want {
+				t.Fatalf("RetryableAutoStart() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStopStreamWrapsTransportFailureForAutoStopRetry(t *testing.T) {
 	transportErr := errors.New("connection reset")
 	client := Client{

@@ -94,6 +94,16 @@ func (e ControlPanelError) RetryableAutoStop() bool {
 	return e.StatusCode == http.StatusTooManyRequests || (e.StatusCode >= http.StatusInternalServerError && e.StatusCode < 600)
 }
 
+// RetryableAutoStart reports whether a voice-triggered start may be retried.
+// Ordinary conflicts are terminal, while the updater's explicit transition
+// conflict, request timeouts, rate limiting, and server failures are transient.
+func (e ControlPanelError) RetryableAutoStart() bool {
+	return (e.StatusCode == http.StatusConflict && e.Code == "service_update_in_progress") ||
+		e.StatusCode == http.StatusRequestTimeout ||
+		e.StatusCode == http.StatusTooManyRequests ||
+		(e.StatusCode >= http.StatusInternalServerError && e.StatusCode < 600)
+}
+
 type Config struct {
 	ControlPanelURL  string
 	Token            string

@@ -117,6 +117,10 @@ type staleAutoStartError interface {
 	HTTPStatusCode() int
 }
 
+type retryableAutoStartError interface {
+	RetryableAutoStart() bool
+}
+
 type StreamStopper interface {
 	StopStream(streamID string) error
 }
@@ -1490,11 +1494,11 @@ func isStaleAutoStartError(err error) bool {
 }
 
 func isRetryableAutoStartError(err error) bool {
-	var classified staleAutoStartError
+	var classified retryableAutoStartError
 	if !errors.As(err, &classified) {
 		return false
 	}
-	return classified.HTTPStatusCode() == 409 && classified.ControlPanelCode() == "service_update_in_progress"
+	return classified.RetryableAutoStart()
 }
 
 func logAutoStartRetryFailure(streamID string, retryCount int, err error, retryable bool) {
@@ -1505,8 +1509,12 @@ func logAutoStartRetryFailure(streamID string, retryCount int, err error, retrya
 		statusCode = classified.HTTPStatusCode()
 		code = classified.ControlPanelCode()
 	}
-	if code != "" {
-		log.Printf("Discord VC auto-start request failed: stream=%s error_class=http_status http_status=%d code=%s retryable=%t retry_count=%d", streamID, statusCode, code, retryable, retryCount)
+	if statusCode > 0 {
+		if code != "" {
+			log.Printf("Discord VC auto-start request failed: stream=%s error_class=http_status http_status=%d code=%s retryable=%t retry_count=%d", streamID, statusCode, code, retryable, retryCount)
+			return
+		}
+		log.Printf("Discord VC auto-start request failed: stream=%s error_class=http_status http_status=%d retryable=%t retry_count=%d", streamID, statusCode, retryable, retryCount)
 		return
 	}
 	log.Printf("Discord VC auto-start request failed: stream=%s error_class=transport_or_unknown retryable=%t retry_count=%d", streamID, retryable, retryCount)
