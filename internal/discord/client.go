@@ -3,6 +3,7 @@ package discord
 import (
 	"context"
 	"errors"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -710,7 +711,10 @@ func (c *RealClient) onGatewayDisconnect(_ *discordgo.Session, _ *discordgo.Disc
 	c.mu.Lock()
 	c.status.Connected = false
 	sink := c.sink
+	job := c.job
+	voiceGeneration := c.voiceGeneration
 	c.mu.Unlock()
+	logGatewayDiagnostic("disconnect", job, voiceGeneration)
 	if sink != nil {
 		sink.DiscordDisconnected("gateway_disconnect")
 	}
@@ -721,7 +725,10 @@ func (c *RealClient) onReady(session *discordgo.Session, _ *discordgo.Ready) {
 	c.status.Connected = true
 	c.status.LastError = ""
 	sink := c.sink
+	job := c.job
+	voiceGeneration := c.voiceGeneration
 	c.mu.Unlock()
+	logGatewayDiagnostic("ready", job, voiceGeneration)
 	if sink != nil {
 		sink.DiscordConnected()
 	}
@@ -738,7 +745,10 @@ func (c *RealClient) onGatewayResumed(session *discordgo.Session, _ *discordgo.R
 	c.status.GatewayReconnectCount++
 	c.status.LastError = ""
 	sink := c.sink
+	job := c.job
+	voiceGeneration := c.voiceGeneration
 	c.mu.Unlock()
+	logGatewayDiagnostic("resumed", job, voiceGeneration)
 	if sink != nil {
 		sink.DiscordConnected()
 	}
@@ -840,7 +850,12 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	c.mu.Lock()
 	job := c.job
 	sink := c.sink
+	voiceGeneration := c.voiceGeneration
 	c.mu.Unlock()
+	decision := "ignored"
+	defer func() {
+		logVoiceStateDiagnostic(job, event, currentVoiceChannelID, currentVoiceStateKnown, voiceGeneration, decision)
+	}()
 	selfUserID := sessionUserID(session)
 	// While no job is active, this event is the auto-start trigger itself. The
 	// DiscordGo state cache can still be one update behind (or briefly omit the
@@ -850,6 +865,9 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	// participant that has already left.
 	currentStateAcceptsJoin := job.StreamID == "" || !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
 	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && currentStateAcceptsJoin {
+		if job.StreamID != "" {
+			decision = "auto_start_join_candidate"
+		}
 		sink.VoiceUserJoined(VoiceJoinEvent{
 			GuildID:        event.GuildID,
 			VoiceChannelID: event.ChannelID,
@@ -860,15 +878,18 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 		return
 	}
 	if event.UserID == selfUserID && event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID && event.ChannelID != job.VoiceChannelID && (!currentVoiceStateKnown || currentVoiceChannelID != job.VoiceChannelID) {
+		decision = "self_voice_disconnect"
 		c.markVoiceDisconnected("voice_state_disconnected", true)
 		return
 	}
 	if sink == nil {
+		decision = "ignored_no_sink"
 		return
 	}
 	// The bot itself is present in its voice channel, but must never count as
 	// a participant. Counting it prevents the empty-channel auto-stop path.
 	if event.UserID == selfUserID {
+		decision = "ignored_self"
 		return
 	}
 	// A VoiceStateUpdate is authoritative only for the user carried by that
@@ -879,9 +900,11 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	// bounded periodic sync loop.
 	if event.ChannelID == job.VoiceChannelID {
 		if currentVoiceStateKnown && currentVoiceChannelID != job.VoiceChannelID {
+			decision = "ignored_current_state_fence"
 			return
 		}
 		participant := voiceParticipantFromState(job.GuildID, event.VoiceState)
+		decision = "participant_join_published"
 		sink.ParticipantChanged(ParticipantEvent{
 			StreamID:       job.StreamID,
 			GuildID:        job.GuildID,
@@ -896,8 +919,10 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	}
 	if event.BeforeUpdate != nil && event.BeforeUpdate.ChannelID == job.VoiceChannelID {
 		if currentVoiceStateKnown && currentVoiceChannelID == job.VoiceChannelID {
+			decision = "ignored_current_state_fence"
 			return
 		}
+		decision = "participant_leave_published"
 		sink.ParticipantChanged(ParticipantEvent{
 			StreamID:       job.StreamID,
 			GuildID:        job.GuildID,
@@ -905,7 +930,33 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 			UserID:         event.UserID,
 			Present:        false,
 		})
+		return
 	}
+	decision = "ignored_not_target_transition"
+}
+
+// logVoiceStateDiagnostic records only Discord identifiers and state fences.
+// It intentionally excludes member payloads, URLs, tokens, and authorization
+// data so a false empty-participant transition can be reconstructed safely.
+func logVoiceStateDiagnostic(job VoiceJob, event *discordgo.VoiceStateUpdate, currentChannelID string, currentStateKnown bool, voiceGeneration uint64, decision string) {
+	if event == nil || strings.TrimSpace(job.StreamID) == "" || strings.TrimSpace(job.GuildID) == "" || event.GuildID != job.GuildID {
+		return
+	}
+	beforeChannelID := ""
+	if event.BeforeUpdate != nil {
+		beforeChannelID = strings.TrimSpace(event.BeforeUpdate.ChannelID)
+	}
+	if beforeChannelID != strings.TrimSpace(job.VoiceChannelID) && event.ChannelID != strings.TrimSpace(job.VoiceChannelID) {
+		return
+	}
+	if strings.TrimSpace(decision) == "" {
+		decision = "unknown"
+	}
+	log.Printf("Discord voice state diagnostic: event=voice_state_update stream_id=%s job_generation=%d voice_generation=%d guild_id=%s user_id=%s before_channel_id=%s event_channel_id=%s current_channel_id=%s current_state_known=%t target_channel_id=%s decision=%s", strings.TrimSpace(job.StreamID), job.JobGeneration, voiceGeneration, strings.TrimSpace(event.GuildID), strings.TrimSpace(event.UserID), beforeChannelID, strings.TrimSpace(event.ChannelID), strings.TrimSpace(currentChannelID), currentStateKnown, strings.TrimSpace(job.VoiceChannelID), decision)
+}
+
+func logGatewayDiagnostic(event string, job VoiceJob, voiceGeneration uint64) {
+	log.Printf("Discord gateway diagnostic: event=%s stream_id=%s job_generation=%d voice_generation=%d", strings.TrimSpace(event), strings.TrimSpace(job.StreamID), job.JobGeneration, voiceGeneration)
 }
 
 func (c *RealClient) onMessageCreate(session *discordgo.Session, event *discordgo.MessageCreate) {
@@ -1152,6 +1203,8 @@ func currentTrackedVoiceChannel(session *discordgo.Session, guildID, userID stri
 func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {
 	c.mu.Lock()
 	wasConnected := c.status.VoiceConnected
+	job := c.job
+	voiceGeneration := c.voiceGeneration
 	if closeAudioStop && c.audioStop != nil {
 		close(c.audioStop)
 		c.audioStop = nil
@@ -1170,6 +1223,9 @@ func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {
 	}
 	sink := c.sink
 	c.mu.Unlock()
+	if wasConnected {
+		log.Printf("Discord voice diagnostic: event=voice_disconnected reason=%s stream_id=%s job_generation=%d voice_generation=%d", strings.TrimSpace(reason), strings.TrimSpace(job.StreamID), job.JobGeneration, voiceGeneration)
+	}
 	if wasConnected && sink != nil {
 		sink.DiscordDisconnected(reason)
 	}

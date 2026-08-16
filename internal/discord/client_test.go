@@ -1,9 +1,11 @@
 package discord
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"reflect"
 	"strings"
 	"sync"
@@ -546,6 +548,51 @@ func TestGatewayReconnectStatus(t *testing.T) {
 	status = client.Status()
 	if !status.Connected || status.GatewayReconnectCount != 1 {
 		t.Fatalf("expected resumed status and reconnect count: %#v", status)
+	}
+}
+
+func TestLogVoiceStateDiagnosticRecordsSafeTransitionFields(t *testing.T) {
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+
+	logVoiceStateDiagnostic(
+		VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 7},
+		&discordgo.VoiceStateUpdate{
+			VoiceState:   &discordgo.VoiceState{GuildID: "guild-01", UserID: "user-01", ChannelID: ""},
+			BeforeUpdate: &discordgo.VoiceState{GuildID: "guild-01", UserID: "user-01", ChannelID: "voice-01"},
+		},
+		"",
+		true,
+		3,
+		"participant_leave_published",
+	)
+
+	got := output.String()
+	for _, marker := range []string{
+		"event=voice_state_update",
+		"stream_id=stream-01",
+		"job_generation=7",
+		"voice_generation=3",
+		"before_channel_id=voice-01",
+		"event_channel_id=",
+		"current_state_known=true",
+		"decision=participant_leave_published",
+	} {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("diagnostic log missing %q: %q", marker, got)
+		}
+	}
+	for _, forbidden := range []string{"authorization", "bearer", "token", "avatar_url", "https://"} {
+		if strings.Contains(strings.ToLower(got), forbidden) {
+			t.Fatalf("diagnostic log contains forbidden sensitive marker %q: %q", forbidden, got)
+		}
 	}
 }
 
