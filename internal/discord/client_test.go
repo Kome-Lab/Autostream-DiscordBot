@@ -59,10 +59,26 @@ type activeSpeakerStateSink struct {
 	speaking []bool
 }
 
+type reentrantStatusSpeakerSink struct {
+	fakeEventSink
+	client *RealClient
+	called chan struct{}
+}
+
 func (f *activeSpeakerStateSink) ActiveSpeakerStateChanged(streamID, userID string, speaking bool) {
 	f.activeStreamID = streamID
 	f.activeUserID = userID
 	f.speaking = append(f.speaking, speaking)
+}
+
+func (f *reentrantStatusSpeakerSink) ActiveSpeakerStateChanged(streamID, userID string, speaking bool) {
+	_ = f.client.Status()
+	f.activeStreamID = streamID
+	f.activeUserID = userID
+	select {
+	case f.called <- struct{}{}:
+	default:
+	}
 }
 
 func (f *snapshotEventSink) ParticipantsSynced(snapshot ParticipantSnapshot) {
@@ -104,6 +120,31 @@ type fakeAudioForwardCall struct {
 	source        string
 	tokenOverride string
 	packets       []audioforward.OpusPacket
+}
+
+type blockingCaptionForwarder struct {
+	captionURL     string
+	captionStarted chan struct{}
+	captionRelease chan struct{}
+	encoderCalls   chan []audioforward.OpusPacket
+	startOnce      sync.Once
+}
+
+func (f *blockingCaptionForwarder) ForwardOpus(ctx context.Context, targetURL, _ string, _ string, _ string, packets []audioforward.OpusPacket) error {
+	if targetURL == f.captionURL {
+		f.startOnce.Do(func() { close(f.captionStarted) })
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-f.captionRelease:
+			return nil
+		}
+	}
+	select {
+	case f.encoderCalls <- append([]audioforward.OpusPacket(nil), packets...):
+	default:
+	}
+	return nil
 }
 
 func newFakeAudioForwarder() *fakeAudioForwarder {
@@ -159,14 +200,60 @@ func (f *fakeAudioForwarder) failURL(targetURL string, err error) {
 	f.errorsByURL[targetURL] = err
 }
 
+func (f *fakeAudioForwarder) failsURL(targetURL string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.errorsByURL[targetURL] != nil
+}
+
+func forwardResultsSettled(client *RealClient, forwarder *fakeAudioForwarder, job VoiceJob) bool {
+	status := client.Status()
+	if strings.TrimSpace(job.EncoderAudioURL) != "" {
+		if forwarder.failsURL(job.EncoderAudioURL) {
+			if status.AudioForwardErrors < 1 {
+				return false
+			}
+		} else if status.AudioPacketsForwarded < 20 {
+			return false
+		}
+	}
+	if strings.TrimSpace(job.CaptionAudioURL) != "" {
+		batchSize := job.CaptionAudioMaxBatchPackets
+		if batchSize <= 0 {
+			batchSize = 5
+		}
+		captionCalls := int64((20 + batchSize - 1) / batchSize)
+		if forwarder.failsURL(job.CaptionAudioURL) {
+			if status.CaptionForwardErrors < captionCalls {
+				return false
+			}
+		} else if status.CaptionPacketsForwarded < 20 {
+			return false
+		}
+	}
+	return true
+}
+
+func activateVoiceJobForTest(client *RealClient, job VoiceJob, voiceGeneration uint64) {
+	client.mu.Lock()
+	client.job = job
+	client.voiceGeneration = voiceGeneration
+	client.status.VoiceConnected = true
+	if client.ssrcUsers == nil {
+		client.ssrcUsers = map[uint32]string{}
+	}
+	client.mu.Unlock()
+}
+
 func runSyntheticForwardBatch(t *testing.T, client *RealClient, forwarder *fakeAudioForwarder, job VoiceJob, expectedCalls int) {
 	t.Helper()
+	activateVoiceJobForTest(client, job, 1)
 	packets := make(chan *discordgo.Packet, 20)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		client.forwardOpus(job, packets, stop, forwarder, "discord-bot-01")
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
 	}()
 	for i := 0; i < 20; i++ {
 		packets <- &discordgo.Packet{
@@ -182,6 +269,13 @@ func runSyntheticForwardBatch(t *testing.T, client *RealClient, forwarder *fakeA
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for opus forward call %d of %d", i+1, expectedCalls)
 		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !forwardResultsSettled(client, forwarder, job) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !forwardResultsSettled(client, forwarder, job) {
+		t.Fatalf("forward result callback did not settle before Stop: %#v", client.Status())
 	}
 	close(stop)
 	select {
@@ -235,8 +329,8 @@ func TestVoiceSpeakingUpdateReportsActiveSpeaker(t *testing.T) {
 	sink := &fakeEventSink{}
 	client := &RealClient{
 		sink: sink,
-		job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
 	}
+	activateVoiceJobForTest(client, VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}, 1)
 
 	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
 
@@ -248,10 +342,33 @@ func TestVoiceSpeakingUpdateReportsActiveSpeaker(t *testing.T) {
 	}
 }
 
+func TestActiveSpeakerCallbackMayReadClientStatusWithoutDeadlock(t *testing.T) {
+	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 7}
+	client := &RealClient{}
+	sink := &reentrantStatusSpeakerSink{client: client, called: make(chan struct{}, 1)}
+	client.sink = sink
+	activateVoiceJobForTest(client, job, 3)
+
+	done := make(chan struct{})
+	go func() {
+		client.recordAudioSpeakerActivity(job, 3, "user-01", time.Now().UTC())
+		close(done)
+	}()
+	select {
+	case <-sink.called:
+	case <-time.After(time.Second):
+		t.Fatal("active speaker callback deadlocked while reading Discord status")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("active speaker dispatch did not return")
+	}
+}
+
 func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
-	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
 	packets := make(chan *discordgo.Packet, 20)
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -262,9 +379,11 @@ func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
 		EncoderAudioURL:   "https://encoder.example.com/streams/stream-01/audio/opus",
 		StreamIngestToken: "job-ingest-token",
 	}
+	activateVoiceJobForTest(client, job, 1)
+	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
 	go func() {
 		defer close(done)
-		client.forwardOpus(job, packets, stop, forwarder, "discord-bot-01")
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
 	}()
 	for i := 0; i < 20; i++ {
 		packets <- &discordgo.Packet{
@@ -313,7 +432,6 @@ func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
 func TestForwardOpusForwardsCaptionOnly(t *testing.T) {
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
-	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
 	job := VoiceJob{
 		StreamID:          "stream-01",
 		GuildID:           "guild-01",
@@ -321,6 +439,8 @@ func TestForwardOpusForwardsCaptionOnly(t *testing.T) {
 		CaptionAudioURL:   "https://worker.example.com/captions",
 		CaptionAudioToken: "caption-token",
 	}
+	activateVoiceJobForTest(client, job, 1)
+	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
 
 	runSyntheticForwardBatch(t, client, forwarder, job, 4)
 
@@ -360,13 +480,13 @@ func TestForwardOpusForwardsSameBatchToBothTargetsWithSeparateTokens(t *testing.
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
 	job := VoiceJob{
-		StreamID:          "stream-01",
-		GuildID:           "guild-01",
-		VoiceChannelID:    "voice-01",
-		EncoderAudioURL:   "https://encoder.example.com/audio",
-		CaptionAudioURL:   "https://worker.example.com/captions",
-		StreamIngestToken: "encoder-token",
-		CaptionAudioToken: "caption-token",
+		StreamID:            "stream-01",
+		GuildID:             "guild-01",
+		VoiceChannelID:      "voice-01",
+		EncoderAudioURL:     "https://encoder.example.com/audio",
+		CaptionAudioURL:     "https://worker.example.com/captions",
+		StreamIngestToken:   "encoder-token",
+		CaptionAudioToken:   "caption-token",
 		CaptionAudioFlushMS: 500, CaptionAudioMaxBatchPackets: 20,
 	}
 
@@ -417,13 +537,13 @@ func TestForwardOpusTargetFailuresAreIndependent(t *testing.T) {
 			forwarder.failURL(tt.failedURL, errors.New("target unavailable"))
 			client := &RealClient{}
 			job := VoiceJob{
-				StreamID:          "stream-01",
-				GuildID:           "guild-01",
-				VoiceChannelID:    "voice-01",
-				EncoderAudioURL:   encoderURL,
-				CaptionAudioURL:   captionURL,
-				StreamIngestToken: "encoder-token",
-				CaptionAudioToken: "caption-token",
+				StreamID:            "stream-01",
+				GuildID:             "guild-01",
+				VoiceChannelID:      "voice-01",
+				EncoderAudioURL:     encoderURL,
+				CaptionAudioURL:     captionURL,
+				StreamIngestToken:   "encoder-token",
+				CaptionAudioToken:   "caption-token",
 				CaptionAudioFlushMS: 500, CaptionAudioMaxBatchPackets: 20,
 			}
 
@@ -440,6 +560,245 @@ func TestForwardOpusTargetFailuresAreIndependent(t *testing.T) {
 	}
 }
 
+func TestForwardOpusCaptionBackpressureDoesNotBlockEncoder(t *testing.T) {
+	captionURL := "https://worker.example.com/captions"
+	forwarder := &blockingCaptionForwarder{
+		captionURL:     captionURL,
+		captionStarted: make(chan struct{}),
+		captionRelease: make(chan struct{}),
+		encoderCalls:   make(chan []audioforward.OpusPacket, 1),
+	}
+	client := &RealClient{}
+	job := VoiceJob{
+		StreamID:                    "stream-01",
+		GuildID:                     "guild-01",
+		VoiceChannelID:              "voice-01",
+		EncoderAudioURL:             "https://encoder.example.com/audio",
+		CaptionAudioURL:             captionURL,
+		StreamIngestToken:           "encoder-token",
+		CaptionAudioToken:           "caption-token",
+		CaptionAudioFlushMS:         100,
+		CaptionAudioMaxBatchPackets: 5,
+	}
+	activateVoiceJobForTest(client, job, 1)
+	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
+	packets := make(chan *discordgo.Packet, 64)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		select {
+		case <-forwarder.captionRelease:
+		default:
+			close(forwarder.captionRelease)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	})
+
+	for i := 0; i < 5; i++ {
+		packets <- &discordgo.Packet{SSRC: 42, Sequence: uint16(i), Timestamp: uint32(960 * i), Opus: []byte{0x01}}
+	}
+	select {
+	case <-forwarder.captionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("caption forward did not enter the blocking request")
+	}
+	for i := 5; i < 25; i++ {
+		packets <- &discordgo.Packet{SSRC: 42, Sequence: uint16(i), Timestamp: uint32(960 * i), Opus: []byte{0x01}}
+	}
+
+	select {
+	case batch := <-forwarder.encoderCalls:
+		if len(batch) == 0 {
+			t.Fatal("encoder received an empty packet batch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caption backpressure blocked encoder audio forwarding")
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stopping the stream did not cancel the blocked caption request")
+	}
+}
+
+func TestForwardOpusCaptionQueueIsBoundedAndCanceledOnStop(t *testing.T) {
+	captionURL := "https://worker.example.com/captions"
+	forwarder := &blockingCaptionForwarder{
+		captionURL:     captionURL,
+		captionStarted: make(chan struct{}),
+		captionRelease: make(chan struct{}),
+		encoderCalls:   make(chan []audioforward.OpusPacket, 1),
+	}
+	client := &RealClient{}
+	job := VoiceJob{
+		StreamID:                    "stream-01",
+		GuildID:                     "guild-01",
+		VoiceChannelID:              "voice-01",
+		CaptionAudioURL:             captionURL,
+		CaptionAudioToken:           "caption-token",
+		CaptionAudioFlushMS:         1000,
+		CaptionAudioMaxBatchPackets: 1,
+	}
+	activateVoiceJobForTest(client, job, 1)
+	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
+	packets := make(chan *discordgo.Packet, opusForwardQueueBatches+2)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		select {
+		case <-forwarder.captionRelease:
+		default:
+			close(forwarder.captionRelease)
+		}
+	})
+
+	packets <- &discordgo.Packet{SSRC: 42, Sequence: 1, Opus: []byte{0x01}}
+	select {
+	case <-forwarder.captionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("caption forward did not enter the blocking request")
+	}
+	for i := 0; i < opusForwardQueueBatches+1; i++ {
+		packets <- &discordgo.Packet{SSRC: 42, Sequence: uint16(i + 2), Opus: []byte{0x01}}
+	}
+	deadline := time.Now().Add(time.Second)
+	for client.Status().CaptionForwardErrors == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status := client.Status(); status.CaptionForwardErrors == 0 || status.CaptionForwardQueueDrops == 0 {
+		t.Fatalf("caption queue overflow was not bounded: %#v", status)
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not cancel the blocked bounded caption queue")
+	}
+}
+
+func TestForwardOpusOldReceiveClosureDoesNotDisconnectRearmedJob(t *testing.T) {
+	oldJob := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 7}
+	newJob := oldJob
+	newJob.JobGeneration = 8
+	client := &RealClient{
+		job:             newJob,
+		voiceGeneration: 4,
+		status: Status{
+			VoiceConnected: true,
+			CurrentGuildID: newJob.GuildID,
+			CurrentVoiceID: newJob.VoiceChannelID,
+		},
+	}
+	packets := make(chan *discordgo.Packet)
+	close(packets)
+
+	client.forwardOpus(oldJob, 3, packets, make(chan struct{}), nil, "discord-bot-01")
+
+	status := client.Status()
+	if !status.VoiceConnected || status.CurrentGuildID != newJob.GuildID || status.CurrentVoiceID != newJob.VoiceChannelID || status.VoiceDisconnectCount != 0 {
+		t.Fatalf("old receive loop changed the rearmed voice state: %#v", status)
+	}
+	if got := client.connectionGenerationForJob(oldJob, 3); got != 0 {
+		t.Fatalf("old job observed the new connection generation: %d", got)
+	}
+	if got := client.connectionGenerationForJob(newJob, 4); got != 4 {
+		t.Fatalf("current job did not observe its connection generation: %d", got)
+	}
+}
+
+func TestForwardOpusStaleReconnectPacketCannotMutateCurrentState(t *testing.T) {
+	job := VoiceJob{
+		StreamID:       "stream-01",
+		GuildID:        "guild-01",
+		VoiceChannelID: "voice-01",
+		JobGeneration:  7,
+	}
+	sink := &activeSpeakerStateSink{}
+	client := &RealClient{
+		sink:            sink,
+		job:             job,
+		voiceGeneration: 4,
+		ssrcUsers:       map[uint32]string{42: "user-01"},
+		audioSpeakers:   map[string]time.Time{},
+		status:          Status{VoiceConnected: true},
+	}
+	packets := make(chan *discordgo.Packet, 1)
+	packets <- &discordgo.Packet{SSRC: 42, Sequence: 1, Opus: []byte{0x01}}
+	close(packets)
+
+	client.forwardOpus(job, 3, packets, make(chan struct{}), nil, "discord-bot-01")
+
+	status := client.Status()
+	if status.AudioReceiving || status.AudioPacketsReceived != 0 || status.VoiceDisconnectCount != 0 {
+		t.Fatalf("stale reconnect loop mutated current status: %#v", status)
+	}
+	if len(sink.speaking) != 0 || sink.activeUserID != "" {
+		t.Fatalf("stale reconnect loop mutated current speaker state: %#v", sink)
+	}
+}
+
+func TestLeaveVoiceWaitsForAudioForwardLoopCancellation(t *testing.T) {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	stopObserved := make(chan struct{})
+	go func() {
+		<-stop
+		close(stopObserved)
+	}()
+	client := &RealClient{
+		job:       VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", JobGeneration: 3},
+		audioStop: stop,
+		audioDone: done,
+		status:    Status{VoiceConnected: true},
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- client.LeaveVoice("stream-01")
+	}()
+
+	select {
+	case <-stopObserved:
+	case <-time.After(time.Second):
+		t.Fatal("LeaveVoice did not cancel the audio loop")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("LeaveVoice returned before the audio loop stopped: %v", err)
+	default:
+	}
+	close(done)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LeaveVoice did not return after the audio loop stopped")
+	}
+}
+
 func TestForwardOpusCaptionDoesNotUseEncoderTokenFallback(t *testing.T) {
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
@@ -449,12 +808,13 @@ func TestForwardOpusCaptionDoesNotUseEncoderTokenFallback(t *testing.T) {
 		VoiceChannelID:  "voice-01",
 		CaptionAudioURL: "https://worker.example.com/captions",
 	}
+	activateVoiceJobForTest(client, job, 1)
 	packets := make(chan *discordgo.Packet, 20)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		client.forwardOpus(job, packets, stop, forwarder, "discord-bot-01")
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
 	}()
 	for i := 0; i < 20; i++ {
 		packets <- &discordgo.Packet{SSRC: 42, Sequence: uint16(i), Opus: []byte{0x01}}
@@ -480,10 +840,8 @@ func TestForwardOpusCaptionDoesNotUseEncoderTokenFallback(t *testing.T) {
 
 func TestVoiceSpeakingUpdateIgnoresStopSpeaking(t *testing.T) {
 	sink := &fakeEventSink{}
-	client := &RealClient{
-		sink: sink,
-		job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
-	}
+	client := &RealClient{sink: sink}
+	activateVoiceJobForTest(client, VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}, 1)
 
 	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: false})
 
@@ -494,10 +852,8 @@ func TestVoiceSpeakingUpdateIgnoresStopSpeaking(t *testing.T) {
 
 func TestVoiceSpeakingUpdateReportsStopToStateSink(t *testing.T) {
 	sink := &activeSpeakerStateSink{}
-	client := &RealClient{
-		sink: sink,
-		job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
-	}
+	client := &RealClient{sink: sink}
+	activateVoiceJobForTest(client, VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}, 1)
 
 	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
 	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: false})
@@ -510,11 +866,12 @@ func TestVoiceSpeakingUpdateReportsStopToStateSink(t *testing.T) {
 func TestAudioActivityExpiresMissingSpeakerStop(t *testing.T) {
 	sink := &activeSpeakerStateSink{}
 	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
-	client := &RealClient{sink: sink, job: job}
+	client := &RealClient{sink: sink}
+	activateVoiceJobForTest(client, job, 0)
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 
-	client.recordAudioSpeakerActivity(job, "user-01", now)
-	client.expireIdleAudioSpeakers(job, now.Add(audioSpeakerIdleTimeout))
+	client.recordAudioSpeakerActivity(job, 0, "user-01", now)
+	client.expireIdleAudioSpeakers(job, 0, now.Add(audioSpeakerIdleTimeout))
 
 	if !reflect.DeepEqual(sink.speaking, []bool{true, false}) || sink.activeUserID != "user-01" {
 		t.Fatalf("audio activity did not converge a missing Discord speaking stop: %#v", sink)
@@ -524,12 +881,13 @@ func TestAudioActivityExpiresMissingSpeakerStop(t *testing.T) {
 func TestAudioActivityRefreshKeepsCurrentSpeakerHighlighted(t *testing.T) {
 	sink := &activeSpeakerStateSink{}
 	job := VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}
-	client := &RealClient{sink: sink, job: job}
+	client := &RealClient{sink: sink}
+	activateVoiceJobForTest(client, job, 0)
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 
-	client.recordAudioSpeakerActivity(job, "user-01", now)
-	client.recordAudioSpeakerActivity(job, "user-01", now.Add(audioSpeakerIdleTimeout/2))
-	client.expireIdleAudioSpeakers(job, now.Add(audioSpeakerIdleTimeout))
+	client.recordAudioSpeakerActivity(job, 0, "user-01", now)
+	client.recordAudioSpeakerActivity(job, 0, "user-01", now.Add(audioSpeakerIdleTimeout/2))
+	client.expireIdleAudioSpeakers(job, 0, now.Add(audioSpeakerIdleTimeout))
 
 	if !reflect.DeepEqual(sink.speaking, []bool{true}) {
 		t.Fatalf("active audio was cleared before the idle timeout: %#v", sink.speaking)

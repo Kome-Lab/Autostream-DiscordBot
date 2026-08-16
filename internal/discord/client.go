@@ -168,8 +168,10 @@ type Status struct {
 	AudioPacketsReceived      int64   `json:"audio_packets_received"`
 	AudioPacketsForwarded     int64   `json:"audio_packets_forwarded"`
 	AudioForwardErrors        int64   `json:"audio_forward_errors"`
+	AudioForwardQueueDrops    int64   `json:"audio_forward_queue_drops"`
 	CaptionPacketsForwarded   int64   `json:"caption_packets_forwarded"`
 	CaptionForwardErrors      int64   `json:"caption_forward_errors"`
+	CaptionForwardQueueDrops  int64   `json:"caption_forward_queue_drops"`
 	GatewayReconnectCount     int64   `json:"gateway_reconnect_count"`
 	VoiceDisconnectCount      int64   `json:"voice_disconnect_count"`
 	DAVEInitialized           bool    `json:"dave_initialized"`
@@ -211,10 +213,16 @@ type RealClient struct {
 	forward          AudioForwarder
 	source           string
 	audioStop        chan struct{}
+	audioDone        chan struct{}
 	daveCancel       context.CancelFunc
 	ssrcUsers        map[uint32]string
 	audioSpeakers    map[string]time.Time
 	mu               sync.Mutex
+	// speakerDispatchMu serializes active-speaker callbacks with voice job
+	// transitions. Callers must never hold mu while acquiring this gate or
+	// invoking the external sink; Manager.Status takes the inverse Manager ->
+	// RealClient lock path.
+	speakerDispatchMu sync.Mutex
 	// participantSyncMu serializes snapshot creation and delivery. DiscordGo
 	// invokes typed handlers asynchronously, so an older handler must always
 	// re-read the latest State while holding this gate before it can publish.
@@ -324,10 +332,10 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 		voice.OpusRecv = make(chan *discordgo.Packet, 32)
 	}
 	voice.AddHandler(c.onVoiceSpeakingUpdate)
+	c.speakerDispatchMu.Lock()
 	c.mu.Lock()
-	if c.voice != nil && c.voice != voice {
-		_ = c.voice.Disconnect()
-	}
+	oldAudioDone := c.audioDone
+	oldVoice := c.voice
 	if c.audioStop != nil {
 		close(c.audioStop)
 	}
@@ -341,6 +349,7 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	c.voiceGeneration++
 	voiceGeneration := c.voiceGeneration
 	c.audioStop = audioStop
+	c.audioDone = nil
 	c.daveCancel = daveCancel
 	c.ssrcUsers = map[uint32]string{}
 	c.audioSpeakers = map[string]time.Time{}
@@ -359,25 +368,42 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	c.status.DAVERatchetsMissing = 0
 	c.status.DAVELastRecoveryReason = ""
 	c.status.LastError = ""
+	var audioDone chan struct{}
+	if encoderForwardActive || captionForwardActive {
+		audioDone = make(chan struct{})
+		c.audioDone = audioDone
+	}
 	c.mu.Unlock()
+	c.speakerDispatchMu.Unlock()
+	if oldVoice != nil && oldVoice != voice {
+		_ = oldVoice.Disconnect()
+	}
+	waitForOpusForwardStop(oldAudioDone)
 	go c.watchDAVE(daveCtx, job, voice, voiceGeneration)
 	if encoderForwardActive || captionForwardActive {
-		go c.forwardOpus(job, voice.OpusRecv, audioStop, forwarder, source)
+		go func() {
+			defer close(audioDone)
+			c.forwardOpus(job, voiceGeneration, voice.OpusRecv, audioStop, forwarder, source)
+		}()
 	}
 	return nil
 }
 
 func (c *RealClient) LeaveVoice(streamID string) error {
+	c.speakerDispatchMu.Lock()
 	c.mu.Lock()
 	if c.job.StreamID != "" && streamID != "" && c.job.StreamID != streamID {
 		c.mu.Unlock()
+		c.speakerDispatchMu.Unlock()
 		return errors.New("stream_id does not match current voice job")
 	}
 	voice := c.voice
+	audioDone := c.audioDone
 	if c.audioStop != nil {
 		close(c.audioStop)
 		c.audioStop = nil
 	}
+	c.audioDone = nil
 	if c.daveCancel != nil {
 		c.daveCancel()
 		c.daveCancel = nil
@@ -394,28 +420,36 @@ func (c *RealClient) LeaveVoice(streamID string) error {
 	c.status.CurrentGuildID = ""
 	c.status.CurrentVoiceID = ""
 	c.mu.Unlock()
+	c.speakerDispatchMu.Unlock()
+	var disconnectErr error
 	if voice != nil {
-		if err := voice.Disconnect(); err != nil {
-			c.setLastError(err.Error())
-			return err
-		}
+		disconnectErr = voice.Disconnect()
+	}
+	waitForOpusForwardStop(audioDone)
+	if disconnectErr != nil {
+		c.setLastError(disconnectErr.Error())
+		return disconnectErr
 	}
 	return nil
 }
 
-func (c *RealClient) onVoiceSpeakingUpdate(_ *discordgo.VoiceConnection, event *discordgo.VoiceSpeakingUpdate) {
+func (c *RealClient) onVoiceSpeakingUpdate(voice *discordgo.VoiceConnection, event *discordgo.VoiceSpeakingUpdate) {
 	if event == nil {
 		return
 	}
 	c.mu.Lock()
+	if c.voice != voice || !c.status.VoiceConnected {
+		c.mu.Unlock()
+		return
+	}
 	if c.ssrcUsers == nil {
 		c.ssrcUsers = map[uint32]string{}
 	}
 	if event.SSRC != 0 && event.UserID != "" {
 		c.ssrcUsers[uint32(event.SSRC)] = event.UserID
 	}
-	streamID := c.job.StreamID
-	sink := c.sink
+	job := c.job
+	voiceGeneration := c.voiceGeneration
 	userID := event.UserID
 	speaking := event.Speaking
 	if userID != "" {
@@ -429,19 +463,85 @@ func (c *RealClient) onVoiceSpeakingUpdate(_ *discordgo.VoiceConnection, event *
 		}
 	}
 	c.mu.Unlock()
-	if streamID == "" || userID == "" || sink == nil {
+	c.dispatchActiveSpeakerState(job, voiceGeneration, userID, speaking)
+}
+
+const (
+	opusForwardQueueBatches = 64
+	opusForwardStopWait     = 2 * time.Second
+)
+
+func waitForOpusForwardStop(done <-chan struct{}) {
+	if done == nil {
 		return
 	}
-	if stateSink, ok := sink.(ActiveSpeakerStateSink); ok {
-		stateSink.ActiveSpeakerStateChanged(streamID, userID, speaking)
-		return
-	}
-	if speaking {
-		sink.ActiveSpeakerDetected(streamID, userID)
+	timer := time.NewTimer(opusForwardStopWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
 	}
 }
 
-func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet, stop <-chan struct{}, forwarder AudioForwarder, source string) {
+type opusForwardTarget struct {
+	caption bool
+	url     string
+	token   string
+	batches *audioforward.BatchQueue
+}
+
+func newOpusForwardTarget(caption bool, targetURL, token string) *opusForwardTarget {
+	if strings.TrimSpace(targetURL) == "" {
+		return nil
+	}
+	return &opusForwardTarget{
+		caption: caption,
+		url:     targetURL,
+		token:   token,
+		batches: audioforward.NewBatchQueue(opusForwardQueueBatches),
+	}
+}
+
+func (c *RealClient) runOpusForwardTarget(ctx context.Context, job VoiceJob, voiceGeneration uint64, forwarder AudioForwarder, source string, target *opusForwardTarget, done *sync.WaitGroup) {
+	defer done.Done()
+	target.batches.Run(ctx, 5*time.Second, func(requestCtx context.Context, batch []audioforward.OpusPacket) error {
+		return forwarder.ForwardOpus(requestCtx, target.url, job.StreamID, source, target.token, batch)
+	}, func(packetCount int, err error) {
+		if err != nil {
+			c.setForwardErrorForJob(job, voiceGeneration, target.caption, err.Error())
+			return
+		}
+		now := time.Now().UTC()
+		c.mu.Lock()
+		if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
+			c.mu.Unlock()
+			return
+		}
+		if target.caption {
+			c.status.CaptionPacketsForwarded += int64(packetCount)
+			c.status.LastCaptionForwardError = ""
+		} else {
+			c.status.AudioPacketsForwarded += int64(packetCount)
+			c.status.LastForwardAt = now.Format(time.RFC3339Nano)
+			c.status.LastForwardError = ""
+		}
+		c.mu.Unlock()
+	})
+}
+
+func (c *RealClient) enqueueOpusForwardBatch(job VoiceJob, voiceGeneration uint64, target *opusForwardTarget, batch []audioforward.OpusPacket) {
+	if target == nil || len(batch) == 0 {
+		return
+	}
+	if !c.isCurrentVoiceJob(job, voiceGeneration) {
+		return
+	}
+	if !target.batches.Enqueue(batch) {
+		c.recordForwardQueueDropForJob(job, voiceGeneration, target.caption, len(batch))
+	}
+}
+
+func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <-chan *discordgo.Packet, stop <-chan struct{}, forwarder AudioForwarder, source string) {
 	encoderBatchMax := 20
 	captionBatchMax := job.CaptionAudioMaxBatchPackets
 	if captionBatchMax <= 0 {
@@ -471,9 +571,20 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 		case <-monitorDone:
 		}
 	}()
+	encoderTarget := newOpusForwardTarget(false, job.EncoderAudioURL, job.StreamIngestToken)
+	captionTarget := newOpusForwardTarget(true, job.CaptionAudioURL, job.CaptionAudioToken)
+	var forwarders sync.WaitGroup
+	for _, target := range []*opusForwardTarget{encoderTarget, captionTarget} {
+		if target == nil {
+			continue
+		}
+		forwarders.Add(1)
+		go c.runOpusForwardTarget(runCtx, job, voiceGeneration, forwarder, source, target, &forwarders)
+	}
 	defer func() {
 		close(monitorDone)
 		cancel()
+		forwarders.Wait()
 	}()
 
 	encoderBatch := make([]audioforward.OpusPacket, 0, encoderBatchMax)
@@ -502,38 +613,15 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 		if len(batch) == 0 {
 			return
 		}
-		url := job.EncoderAudioURL
-		token := job.StreamIngestToken
 		if isCaption {
-			url = job.CaptionAudioURL
-			token = job.CaptionAudioToken
-			if strings.TrimSpace(token) == "" {
-				c.setCaptionForwardError(errors.New("caption_audio_token is required").Error())
+			if strings.TrimSpace(job.CaptionAudioToken) == "" {
+				c.setForwardErrorForJob(job, voiceGeneration, true, errors.New("caption_audio_token is required").Error())
 				return
 			}
-		}
-		ctx, cancel := context.WithTimeout(runCtx, 5*time.Second)
-		err := forwarder.ForwardOpus(ctx, url, job.StreamID, source, token, batch)
-		cancel()
-		if err != nil {
-			if isCaption {
-				c.setCaptionForwardError(err.Error())
-			} else {
-				c.setForwardError(err.Error())
-			}
+			c.enqueueOpusForwardBatch(job, voiceGeneration, captionTarget, batch)
 			return
 		}
-		now := time.Now().UTC()
-		c.mu.Lock()
-		if isCaption {
-			c.status.CaptionPacketsForwarded += int64(len(batch))
-			c.status.LastCaptionForwardError = ""
-		} else {
-			c.status.AudioPacketsForwarded += int64(len(batch))
-			c.status.LastForwardAt = now.Format(time.RFC3339Nano)
-			c.status.LastForwardError = ""
-		}
-		c.mu.Unlock()
+		c.enqueueOpusForwardBatch(job, voiceGeneration, encoderTarget, batch)
 	}
 	appendPacket := func(packet audioforward.OpusPacket) {
 		if strings.TrimSpace(job.EncoderAudioURL) != "" {
@@ -553,7 +641,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 				continue
 			}
 			if userID != "" {
-				c.recordAudioSpeakerActivity(job, userID, now)
+				c.recordAudioSpeakerActivity(job, voiceGeneration, userID, now)
 			}
 			for _, packet := range buffered {
 				packet.UserID = userID
@@ -570,6 +658,9 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 		case <-stop:
 			return
 		case now := <-flushTicker.C:
+			if !c.isCurrentVoiceJob(job, voiceGeneration) {
+				return
+			}
 			now = now.UTC()
 			flushExpiredUnresolved(now, false)
 			if now.Sub(lastCaptionFlush) >= captionFlush {
@@ -580,14 +671,17 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 				flush(false)
 				lastEncoderFlush = now
 			}
-			c.expireIdleAudioSpeakers(job, now)
+			c.expireIdleAudioSpeakers(job, voiceGeneration, now)
 		case packet, ok := <-packets:
 			if !ok {
-				c.markVoiceDisconnected("opus_recv_closed", false)
+				c.markVoiceDisconnectedForJob("opus_recv_closed", false, job, voiceGeneration)
 				return
 			}
 			if packet == nil || len(packet.Opus) == 0 {
 				continue
+			}
+			if !c.isCurrentVoiceJob(job, voiceGeneration) {
+				return
 			}
 			now := time.Now().UTC()
 			userID := c.userForSSRC(packet.SSRC)
@@ -598,12 +692,10 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 				// to the synthetic MIC speaker.
 				userID = resolveFallbackUser(now)
 			}
-			c.recordAudioSpeakerActivity(job, userID, now)
-			c.mu.Lock()
-			c.status.AudioReceiving = true
-			c.status.LastAudioAt = now.Format(time.RFC3339Nano)
-			c.status.AudioPacketsReceived++
-			c.mu.Unlock()
+			c.recordAudioSpeakerActivity(job, voiceGeneration, userID, now)
+			if !c.recordAudioPacketReceived(job, voiceGeneration, now) {
+				return
+			}
 			forwardedPacket := audioforward.OpusPacket{
 				SSRC:                 packet.SSRC,
 				UserID:               userID,
@@ -612,7 +704,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 				ReceivedAt:           now,
 				Opus:                 append([]byte(nil), packet.Opus...),
 				JobGeneration:        job.JobGeneration,
-				ConnectionGeneration: c.connectionGenerationForJob(job),
+				ConnectionGeneration: voiceGeneration,
 			}
 			if userID == "" && unresolvedWindow > 0 {
 				if len(unresolved[packet.SSRC]) < 50 {
@@ -637,22 +729,40 @@ func (c *RealClient) forwardOpus(job VoiceJob, packets <-chan *discordgo.Packet,
 	}
 }
 
-func (c *RealClient) connectionGenerationForJob(job VoiceJob) uint64 {
+func (c *RealClient) connectionGenerationForJob(job VoiceJob, voiceGeneration uint64) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.job.StreamID != job.StreamID || c.job.GuildID != job.GuildID || c.job.VoiceChannelID != job.VoiceChannelID {
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
 		return 0
 	}
-	return c.voiceGeneration
+	return voiceGeneration
 }
 
-func (c *RealClient) recordAudioSpeakerActivity(job VoiceJob, userID string, now time.Time) {
+func (c *RealClient) isCurrentVoiceJob(job VoiceJob, voiceGeneration uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.voiceGeneration == voiceGeneration && sameVoiceJob(c.job, job) && c.status.VoiceConnected
+}
+
+func (c *RealClient) recordAudioPacketReceived(job VoiceJob, voiceGeneration uint64, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
+		return false
+	}
+	c.status.AudioReceiving = true
+	c.status.LastAudioAt = now.Format(time.RFC3339Nano)
+	c.status.AudioPacketsReceived++
+	return true
+}
+
+func (c *RealClient) recordAudioSpeakerActivity(job VoiceJob, voiceGeneration uint64, userID string, now time.Time) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return
 	}
 	c.mu.Lock()
-	if c.job.StreamID != job.StreamID || c.job.GuildID != job.GuildID || c.job.VoiceChannelID != job.VoiceChannelID {
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
 		c.mu.Unlock()
 		return
 	}
@@ -661,22 +771,15 @@ func (c *RealClient) recordAudioSpeakerActivity(job VoiceJob, userID string, now
 	}
 	_, alreadyActive := c.audioSpeakers[userID]
 	c.audioSpeakers[userID] = now
-	streamID := c.job.StreamID
-	sink := c.sink
 	c.mu.Unlock()
-	if alreadyActive || sink == nil {
-		return
-	}
-	if stateSink, ok := sink.(ActiveSpeakerStateSink); ok {
-		stateSink.ActiveSpeakerStateChanged(streamID, userID, true)
-	} else {
-		sink.ActiveSpeakerDetected(streamID, userID)
+	if !alreadyActive {
+		c.dispatchActiveSpeakerState(job, voiceGeneration, userID, true)
 	}
 }
 
-func (c *RealClient) expireIdleAudioSpeakers(job VoiceJob, now time.Time) {
+func (c *RealClient) expireIdleAudioSpeakers(job VoiceJob, voiceGeneration uint64, now time.Time) {
 	c.mu.Lock()
-	if c.job.StreamID != job.StreamID || c.job.GuildID != job.GuildID || c.job.VoiceChannelID != job.VoiceChannelID {
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
 		c.mu.Unlock()
 		return
 	}
@@ -687,15 +790,42 @@ func (c *RealClient) expireIdleAudioSpeakers(job VoiceJob, now time.Time) {
 			expired = append(expired, userID)
 		}
 	}
+	c.mu.Unlock()
+	for _, userID := range expired {
+		c.dispatchActiveSpeakerState(job, voiceGeneration, userID, false)
+	}
+}
+
+func (c *RealClient) dispatchActiveSpeakerState(job VoiceJob, voiceGeneration uint64, userID string, speaking bool) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	c.speakerDispatchMu.Lock()
+	defer c.speakerDispatchMu.Unlock()
+
+	c.mu.Lock()
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
+		c.mu.Unlock()
+		return
+	}
+	_, active := c.audioSpeakers[userID]
+	if active != speaking {
+		c.mu.Unlock()
+		return
+	}
 	streamID := c.job.StreamID
 	sink := c.sink
 	c.mu.Unlock()
-	stateSink, ok := sink.(ActiveSpeakerStateSink)
-	if !ok {
+	if streamID == "" || sink == nil {
 		return
 	}
-	for _, userID := range expired {
-		stateSink.ActiveSpeakerStateChanged(streamID, userID, false)
+	if stateSink, ok := sink.(ActiveSpeakerStateSink); ok {
+		stateSink.ActiveSpeakerStateChanged(streamID, userID, speaking)
+		return
+	}
+	if speaking {
+		sink.ActiveSpeakerDetected(streamID, userID)
 	}
 }
 
@@ -1337,7 +1467,24 @@ func currentTrackedVoiceChannel(session *discordgo.Session, guildID, userID stri
 }
 
 func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {
+	c.speakerDispatchMu.Lock()
+	defer c.speakerDispatchMu.Unlock()
 	c.mu.Lock()
+	c.markVoiceDisconnectedLocked(reason, closeAudioStop)
+}
+
+func (c *RealClient) markVoiceDisconnectedForJob(reason string, closeAudioStop bool, job VoiceJob, voiceGeneration uint64) {
+	c.speakerDispatchMu.Lock()
+	defer c.speakerDispatchMu.Unlock()
+	c.mu.Lock()
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
+		c.mu.Unlock()
+		return
+	}
+	c.markVoiceDisconnectedLocked(reason, closeAudioStop)
+}
+
+func (c *RealClient) markVoiceDisconnectedLocked(reason string, closeAudioStop bool) {
 	wasConnected := c.status.VoiceConnected
 	job := c.job
 	voiceGeneration := c.voiceGeneration
@@ -1393,6 +1540,48 @@ func (c *RealClient) setCaptionForwardError(value string) {
 	safeValue := secrets.SanitizeOperationalError(value, "discord caption audio forward failed")
 	c.status.LastCaptionForwardError = safeValue
 	c.status.LastError = safeValue
+}
+
+func (c *RealClient) setForwardErrorForJob(job VoiceJob, voiceGeneration uint64, caption bool, value string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
+		return false
+	}
+	if caption {
+		c.status.CaptionForwardErrors++
+		safeValue := secrets.SanitizeOperationalError(value, "discord caption audio forward failed")
+		c.status.LastCaptionForwardError = safeValue
+		c.status.LastError = safeValue
+		return true
+	}
+	c.status.AudioForwardErrors++
+	safeValue := secrets.SanitizeOperationalError(value, "discord audio forward failed")
+	c.status.LastForwardError = safeValue
+	c.status.LastError = safeValue
+	return true
+}
+
+func (c *RealClient) recordForwardQueueDropForJob(job VoiceJob, voiceGeneration uint64, caption bool, packetCount int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) || !c.status.VoiceConnected {
+		return false
+	}
+	if caption {
+		c.status.CaptionForwardQueueDrops += int64(packetCount)
+		c.status.CaptionForwardErrors++
+		safeValue := secrets.SanitizeOperationalError("discord caption audio forward queue full", "discord caption audio forward failed")
+		c.status.LastCaptionForwardError = safeValue
+		c.status.LastError = safeValue
+		return true
+	}
+	c.status.AudioForwardQueueDrops += int64(packetCount)
+	c.status.AudioForwardErrors++
+	safeValue := secrets.SanitizeOperationalError("discord audio forward queue full", "discord audio forward failed")
+	c.status.LastForwardError = safeValue
+	c.status.LastError = safeValue
+	return true
 }
 
 type NoopClient struct {

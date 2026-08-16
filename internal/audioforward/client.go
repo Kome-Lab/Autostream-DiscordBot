@@ -41,8 +41,8 @@ type OpusPacket struct {
 type packetWire struct {
 	SSRC                 uint32    `json:"ssrc"`
 	UserID               string    `json:"user_id,omitempty"`
-	JobGeneration        uint64    `json:"job_generation,omitempty"`
-	ConnectionGeneration uint64    `json:"connection_generation,omitempty"`
+	JobGeneration        uint64    `json:"job_generation"`
+	ConnectionGeneration uint64    `json:"connection_generation"`
 	Sequence             uint16    `json:"sequence"`
 	Timestamp            uint32    `json:"timestamp"`
 	ReceivedAt           time.Time `json:"received_at"`
