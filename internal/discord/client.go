@@ -12,6 +12,7 @@ import (
 
 	"github.com/cartridge-gg/discordgo"
 	"github.com/example/autostream-discord-bot/internal/audioforward"
+	"github.com/example/autostream-discord-bot/internal/davewatch"
 	"github.com/example/autostream-discord-bot/internal/secrets"
 )
 
@@ -171,6 +172,14 @@ type Status struct {
 	CaptionForwardErrors      int64   `json:"caption_forward_errors"`
 	GatewayReconnectCount     int64   `json:"gateway_reconnect_count"`
 	VoiceDisconnectCount      int64   `json:"voice_disconnect_count"`
+	DAVEInitialized           bool    `json:"dave_initialized"`
+	DAVEWelcomeReceived       bool    `json:"dave_welcome_received"`
+	DAVERosterSize            int     `json:"dave_roster_size"`
+	DAVERatchetsMissing       int     `json:"dave_ratchets_missing"`
+	DAVEKeyPackageResends     int64   `json:"dave_key_package_resends"`
+	DAVESoftResets            int64   `json:"dave_soft_resets"`
+	DAVERecoveryErrors        int64   `json:"dave_recovery_errors"`
+	DAVELastRecoveryReason    string  `json:"dave_last_recovery_reason,omitempty"`
 	LastForwardAt             string  `json:"last_forward_at,omitempty"`
 	LastForwardAgeSec         float64 `json:"last_forward_age_sec,omitempty"`
 	LastForwardError          string  `json:"last_forward_error,omitempty"`
@@ -202,6 +211,7 @@ type RealClient struct {
 	forward          AudioForwarder
 	source           string
 	audioStop        chan struct{}
+	daveCancel       context.CancelFunc
 	ssrcUsers        map[uint32]string
 	audioSpeakers    map[string]time.Time
 	mu               sync.Mutex
@@ -321,11 +331,17 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	if c.audioStop != nil {
 		close(c.audioStop)
 	}
+	if c.daveCancel != nil {
+		c.daveCancel()
+	}
 	audioStop := make(chan struct{})
+	daveCtx, daveCancel := context.WithCancel(context.Background())
 	c.voice = voice
 	c.job = job
 	c.voiceGeneration++
+	voiceGeneration := c.voiceGeneration
 	c.audioStop = audioStop
+	c.daveCancel = daveCancel
 	c.ssrcUsers = map[uint32]string{}
 	c.audioSpeakers = map[string]time.Time{}
 	forwarder := c.forward
@@ -337,8 +353,14 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	captionForwardActive := forwarder != nil && strings.TrimSpace(job.CaptionAudioURL) != "" && voice.OpusRecv != nil
 	c.status.AudioForwardActive = encoderForwardActive
 	c.status.CaptionAudioForwardActive = captionForwardActive
+	c.status.DAVEInitialized = false
+	c.status.DAVEWelcomeReceived = false
+	c.status.DAVERosterSize = 0
+	c.status.DAVERatchetsMissing = 0
+	c.status.DAVELastRecoveryReason = ""
 	c.status.LastError = ""
 	c.mu.Unlock()
+	go c.watchDAVE(daveCtx, job, voice, voiceGeneration)
 	if encoderForwardActive || captionForwardActive {
 		go c.forwardOpus(job, voice.OpusRecv, audioStop, forwarder, source)
 	}
@@ -355,6 +377,10 @@ func (c *RealClient) LeaveVoice(streamID string) error {
 	if c.audioStop != nil {
 		close(c.audioStop)
 		c.audioStop = nil
+	}
+	if c.daveCancel != nil {
+		c.daveCancel()
+		c.daveCancel = nil
 	}
 	c.voice = nil
 	c.voiceGeneration++
@@ -703,8 +729,118 @@ func (c *RealClient) uniqueHumanVoiceParticipant(job VoiceJob) string {
 
 func (c *RealClient) Status() Status {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return normalizeStatus(c.status, time.Now().UTC())
+	status := c.status
+	voice := c.voice
+	c.mu.Unlock()
+	if voice != nil {
+		health := voice.DAVEHealth()
+		status.DAVEInitialized = health.Initialized
+		status.DAVEWelcomeReceived = health.OP30Received
+		status.DAVERosterSize = health.LastRosterSize
+		status.DAVERatchetsMissing = health.LastMissing
+	}
+	return normalizeStatus(status, time.Now().UTC())
+}
+
+type discordDAVERecovery struct {
+	voice *discordgo.VoiceConnection
+}
+
+func (r discordDAVERecovery) Health() davewatch.Health {
+	if r.voice == nil {
+		return davewatch.Health{}
+	}
+	health := r.voice.DAVEHealth()
+	return davewatch.Health{
+		Initialized:         health.Initialized,
+		OP26SentAt:          health.OP26SentAt,
+		OP30Received:        health.OP30Received,
+		LastMissing:         health.LastMissing,
+		MissingFirstSeen:    health.MissingFirstSeen,
+		ProposalFailedSince: health.ProposalFailedSince,
+	}
+}
+
+func (r discordDAVERecovery) ResendKeyPackage() error {
+	if r.voice == nil {
+		return errors.New("DAVE voice connection is unavailable")
+	}
+	return r.voice.ResendDAVEKeyPackage()
+}
+
+func (r discordDAVERecovery) SoftReset() error {
+	if r.voice == nil {
+		return errors.New("DAVE voice connection is unavailable")
+	}
+	return r.voice.SoftResetDAVE()
+}
+
+func (c *RealClient) watchDAVE(ctx context.Context, job VoiceJob, voice *discordgo.VoiceConnection, voiceGeneration uint64) {
+	watchdog := davewatch.New(
+		discordDAVERecovery{voice: voice},
+		func() bool { return c.remoteVoiceParticipantPresent(job, voice, voiceGeneration) },
+		func(event davewatch.Event) { c.recordDAVERecovery(job, voice, voiceGeneration, event) },
+		davewatch.Config{},
+	)
+	watchdog.Run(ctx)
+}
+
+func (c *RealClient) remoteVoiceParticipantPresent(job VoiceJob, voice *discordgo.VoiceConnection, voiceGeneration uint64) bool {
+	c.mu.Lock()
+	if c.voice != voice || c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) {
+		c.mu.Unlock()
+		return false
+	}
+	session := c.session
+	c.mu.Unlock()
+	if session == nil || session.State == nil || !session.State.TrackVoice {
+		return false
+	}
+	state := session.State
+	state.RLock()
+	defer state.RUnlock()
+	selfUserID := ""
+	if state.User != nil {
+		selfUserID = strings.TrimSpace(state.User.ID)
+	}
+	for _, guild := range state.Guilds {
+		if guild == nil || guild.ID != job.GuildID {
+			continue
+		}
+		for _, voiceState := range guild.VoiceStates {
+			if voiceState == nil || voiceState.ChannelID != job.VoiceChannelID {
+				continue
+			}
+			userID := strings.TrimSpace(voiceState.UserID)
+			if userID != "" && userID != selfUserID {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func (c *RealClient) recordDAVERecovery(job VoiceJob, voice *discordgo.VoiceConnection, voiceGeneration uint64, event davewatch.Event) {
+	c.mu.Lock()
+	if c.voice != voice || c.voiceGeneration != voiceGeneration || !sameVoiceJob(c.job, job) {
+		c.mu.Unlock()
+		return
+	}
+	switch event.Action {
+	case "resend_key_package":
+		c.status.DAVEKeyPackageResends++
+	case "soft_reset":
+		c.status.DAVESoftResets++
+	}
+	c.status.DAVELastRecoveryReason = event.Reason
+	errorClass := ""
+	if event.Result != "success" {
+		c.status.DAVERecoveryErrors++
+		errorClass = "dave_recovery_failed"
+	}
+	c.mu.Unlock()
+	log.Printf("Discord DAVE recovery: event=%s stream_id=%s job_generation=%d voice_generation=%d reason=%s result=%s attempt=%d limit=%d error_class=%s", event.Action, strings.TrimSpace(job.StreamID), job.JobGeneration, voiceGeneration, event.Reason, event.Result, event.Attempt, event.Limit, errorClass)
 }
 
 func (c *RealClient) onGatewayDisconnect(_ *discordgo.Session, _ *discordgo.Disconnect) {
@@ -1208,6 +1344,10 @@ func (c *RealClient) markVoiceDisconnected(reason string, closeAudioStop bool) {
 	if closeAudioStop && c.audioStop != nil {
 		close(c.audioStop)
 		c.audioStop = nil
+	}
+	if c.daveCancel != nil {
+		c.daveCancel()
+		c.daveCancel = nil
 	}
 	c.voice = nil
 	c.ssrcUsers = nil

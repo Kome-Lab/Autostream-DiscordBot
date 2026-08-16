@@ -1913,6 +1913,13 @@ func metricsFromStatus(status discord.Status, participantCount int) map[string]f
 		"discord.caption_forward_errors_total":    float64(status.CaptionForwardErrors),
 		"discord.reconnect_count":                 float64(status.GatewayReconnectCount),
 		"discord.voice_disconnect_count":          float64(status.VoiceDisconnectCount),
+		"discord.dave_initialized":                boolMetric(status.DAVEInitialized),
+		"discord.dave_welcome_received":           boolMetric(status.DAVEWelcomeReceived),
+		"discord.dave_roster_size":                float64(status.DAVERosterSize),
+		"discord.dave_ratchets_missing":           float64(status.DAVERatchetsMissing),
+		"discord.dave_key_package_resends_total":  float64(status.DAVEKeyPackageResends),
+		"discord.dave_soft_resets_total":          float64(status.DAVESoftResets),
+		"discord.dave_recovery_errors_total":      float64(status.DAVERecoveryErrors),
 	}
 	if status.LastAudioAgeSec > 0 {
 		metrics["discord.audio_last_packet_age_sec"] = status.LastAudioAgeSec
