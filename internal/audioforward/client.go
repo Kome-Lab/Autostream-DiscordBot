@@ -27,6 +27,50 @@ type Client struct {
 	Sleep  func(context.Context, time.Duration) error
 }
 
+const (
+	defaultForwardOpusRequestTimeout = 5 * time.Second
+	maxForwardOpusRequestTimeout     = 30 * time.Second
+)
+
+// ForwardOpusRequestTimeout returns a bounded parent timeout that allows the
+// client's configured per-attempt timeouts and retry delays to run. The
+// Discord target queue uses this value instead of cutting the operation off at
+// the first attempt's deadline.
+func (c Client) ForwardOpusRequestTimeout() time.Duration {
+	attempts := c.Config.RetryMax
+	if attempts <= 0 {
+		attempts = 1
+	}
+	perAttempt := c.Config.Timeout
+	if perAttempt <= 0 {
+		perAttempt = defaultForwardOpusRequestTimeout
+	}
+	// Leave a small scheduling margin so the final attempt can return its
+	// receipt instead of racing the parent deadline at the exact sum.
+	budget := time.Second
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if perAttempt >= maxForwardOpusRequestTimeout-budget {
+			return maxForwardOpusRequestTimeout
+		}
+		budget += perAttempt
+		if attempt == attempts {
+			break
+		}
+		delay := retryDelay(c.Config.RetryBaseDelay, attempt)
+		if delay >= maxForwardOpusRequestTimeout-budget {
+			return maxForwardOpusRequestTimeout
+		}
+		budget += delay
+	}
+	if budget < defaultForwardOpusRequestTimeout {
+		return defaultForwardOpusRequestTimeout
+	}
+	if budget > maxForwardOpusRequestTimeout {
+		return maxForwardOpusRequestTimeout
+	}
+	return budget
+}
+
 type OpusPacket struct {
 	SSRC                 uint32
 	UserID               string

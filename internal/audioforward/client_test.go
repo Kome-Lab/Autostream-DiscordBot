@@ -142,6 +142,23 @@ func TestClientRetriesTransientForwardFailure(t *testing.T) {
 	}
 }
 
+func TestClientForwardOpusRequestTimeoutCoversConfiguredRetryBudget(t *testing.T) {
+	client := Client{Config: Config{
+		Timeout:        5 * time.Second,
+		RetryMax:       3,
+		RetryBaseDelay: time.Second,
+	}}
+
+	got := client.ForwardOpusRequestTimeout()
+	if got != 19*time.Second {
+		t.Fatalf("forward request timeout = %s, want 19s for three 5s attempts, 1s/2s backoff, and margin", got)
+	}
+	bounded := (Client{Config: Config{Timeout: time.Minute, RetryMax: 100, RetryBaseDelay: time.Minute}}).ForwardOpusRequestTimeout()
+	if bounded != 30*time.Second {
+		t.Fatalf("large retry configuration timeout = %s, want 30s hard bound", bounded)
+	}
+}
+
 func TestClientDoesNotRetryUnauthorizedForwardFailure(t *testing.T) {
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

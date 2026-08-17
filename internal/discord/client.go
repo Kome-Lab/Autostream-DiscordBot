@@ -469,6 +469,7 @@ func (c *RealClient) onVoiceSpeakingUpdate(voice *discordgo.VoiceConnection, eve
 const (
 	opusForwardQueueBatches = 64
 	opusForwardStopWait     = 2 * time.Second
+	opusForwardRequestLimit = 5 * time.Second
 )
 
 func waitForOpusForwardStop(done <-chan struct{}) {
@@ -490,6 +491,19 @@ type opusForwardTarget struct {
 	batches *audioforward.BatchQueue
 }
 
+type opusForwardRequestTimeoutProvider interface {
+	ForwardOpusRequestTimeout() time.Duration
+}
+
+func opusForwardRequestTimeout(forwarder AudioForwarder) time.Duration {
+	if provider, ok := forwarder.(opusForwardRequestTimeoutProvider); ok {
+		if timeout := provider.ForwardOpusRequestTimeout(); timeout > 0 {
+			return timeout
+		}
+	}
+	return opusForwardRequestLimit
+}
+
 func newOpusForwardTarget(caption bool, targetURL, token string) *opusForwardTarget {
 	if strings.TrimSpace(targetURL) == "" {
 		return nil
@@ -504,7 +518,7 @@ func newOpusForwardTarget(caption bool, targetURL, token string) *opusForwardTar
 
 func (c *RealClient) runOpusForwardTarget(ctx context.Context, job VoiceJob, voiceGeneration uint64, forwarder AudioForwarder, source string, target *opusForwardTarget, done *sync.WaitGroup) {
 	defer done.Done()
-	target.batches.Run(ctx, 5*time.Second, func(requestCtx context.Context, batch []audioforward.OpusPacket) error {
+	target.batches.Run(ctx, opusForwardRequestTimeout(forwarder), func(requestCtx context.Context, batch []audioforward.OpusPacket) error {
 		return forwarder.ForwardOpus(requestCtx, target.url, job.StreamID, source, target.token, batch)
 	}, func(packetCount int, err error) {
 		if err != nil {
