@@ -2,19 +2,56 @@ package davewatch
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
 
 type fakeRecovery struct {
-	health  Health
-	resends int
-	resets  int
+	health    Health
+	resends   int
+	resets    int
+	resendErr error
+	resetErr  error
 }
 
 func (f *fakeRecovery) Health() Health          { return f.health }
-func (f *fakeRecovery) ResendKeyPackage() error { f.resends++; return nil }
-func (f *fakeRecovery) SoftReset() error        { f.resets++; return nil }
+func (f *fakeRecovery) ResendKeyPackage() error { f.resends++; return f.resendErr }
+func (f *fakeRecovery) SoftReset() error        { f.resets++; return f.resetErr }
+
+func TestWatchdogDoesNotResendAfterCommitEstablishedTheEpoch(t *testing.T) {
+	now := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
+	recovery := &fakeRecovery{health: Health{
+		Initialized:      true,
+		OP26SentAt:       now.Add(-time.Minute),
+		EpochEstablished: true,
+		OP30Received:     false,
+	}}
+	watchdog := New(recovery, func() bool { return true }, nil, Config{})
+
+	watchdog.Tick(now)
+	if recovery.resends != 0 || recovery.resets != 0 {
+		t.Fatalf("recovery ran after an op29-established epoch: resend=%d reset=%d", recovery.resends, recovery.resets)
+	}
+}
+
+func TestWatchdogEscalatesFailedWelcomeResendToBoundedSoftReset(t *testing.T) {
+	now := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
+	recovery := &fakeRecovery{
+		health:    Health{Initialized: true, OP26SentAt: now.Add(-time.Minute)},
+		resendErr: errors.New("safe fake resend failure"),
+	}
+	var events []Event
+	watchdog := New(recovery, func() bool { return true }, func(event Event) { events = append(events, event) }, Config{})
+
+	watchdog.Tick(now)
+	if recovery.resends != 1 || recovery.resets != 1 {
+		t.Fatalf("resend/reset = %d/%d, want 1/1", recovery.resends, recovery.resets)
+	}
+	if len(events) != 2 || events[0].ErrorClass != "key_package_resend_failed" || events[1].Reason != "welcome_resend_failed" {
+		t.Fatalf("unexpected escalation events: %#v", events)
+	}
+}
 
 func TestWatchdogRecoversWelcomeTimeoutWithBoundedResends(t *testing.T) {
 	now := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
@@ -57,6 +94,7 @@ func TestWatchdogRecoversPersistentMissingRatchetsWithBoundedResets(t *testing.T
 	recovery := &fakeRecovery{health: Health{
 		Initialized:      true,
 		OP26SentAt:       now.Add(-time.Minute),
+		EpochEstablished: true,
 		OP30Received:     true,
 		LastMissing:      1,
 		MissingFirstSeen: now.Add(-16 * time.Second),

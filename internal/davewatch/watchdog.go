@@ -10,6 +10,7 @@ import (
 type Health struct {
 	Initialized         bool
 	OP26SentAt          time.Time
+	EpochEstablished    bool
 	OP30Received        bool
 	LastMissing         int
 	MissingFirstSeen    time.Time
@@ -24,11 +25,12 @@ type Recovery interface {
 }
 
 type Event struct {
-	Action  string
-	Reason  string
-	Result  string
-	Attempt int
-	Limit   int
+	Action     string
+	Reason     string
+	Result     string
+	Attempt    int
+	Limit      int
+	ErrorClass string
 }
 
 type Config struct {
@@ -124,9 +126,9 @@ func (w *Watchdog) Tick(now time.Time) {
 	switch {
 	case !health.ProposalFailedSince.IsZero() && now.Sub(health.ProposalFailedSince) > w.config.DivergedTimeout:
 		w.tryReset(now, "epoch_diverged")
-	case !health.OP30Received && now.Sub(health.OP26SentAt) > w.config.StuckTimeout:
+	case !health.EpochEstablished && now.Sub(health.OP26SentAt) > w.config.StuckTimeout:
 		w.tryResend(now, "welcome_timeout")
-	case health.OP30Received && health.LastMissing > 0 && !health.MissingFirstSeen.IsZero() && now.Sub(health.MissingFirstSeen) > w.config.MissingTimeout:
+	case health.EpochEstablished && health.LastMissing > 0 && !health.MissingFirstSeen.IsZero() && now.Sub(health.MissingFirstSeen) > w.config.MissingTimeout:
 		w.tryReset(now, "missing_ratchets")
 	}
 }
@@ -140,6 +142,10 @@ func (w *Watchdog) tryResend(now time.Time, reason string) {
 	event := Event{Action: "resend_key_package", Reason: reason, Result: "success", Attempt: len(w.resends), Limit: w.config.ResendLimit}
 	if err := w.recovery.ResendKeyPackage(); err != nil {
 		event.Result = "failure"
+		event.ErrorClass = "key_package_resend_failed"
+		w.emit(event)
+		w.tryReset(now, "welcome_resend_failed")
+		return
 	}
 	w.emit(event)
 }
@@ -153,6 +159,7 @@ func (w *Watchdog) tryReset(now time.Time, reason string) {
 	event := Event{Action: "soft_reset", Reason: reason, Result: "success", Attempt: len(w.resets), Limit: w.config.ResetLimit}
 	if err := w.recovery.SoftReset(); err != nil {
 		event.Result = "failure"
+		event.ErrorClass = "soft_reset_failed"
 	}
 	w.emit(event)
 }

@@ -175,6 +175,7 @@ type Status struct {
 	GatewayReconnectCount     int64   `json:"gateway_reconnect_count"`
 	VoiceDisconnectCount      int64   `json:"voice_disconnect_count"`
 	DAVEInitialized           bool    `json:"dave_initialized"`
+	DAVEReady                 bool    `json:"dave_ready"`
 	DAVEWelcomeReceived       bool    `json:"dave_welcome_received"`
 	DAVERosterSize            int     `json:"dave_roster_size"`
 	DAVERatchetsMissing       int     `json:"dave_ratchets_missing"`
@@ -363,6 +364,7 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	c.status.AudioForwardActive = encoderForwardActive
 	c.status.CaptionAudioForwardActive = captionForwardActive
 	c.status.DAVEInitialized = false
+	c.status.DAVEReady = false
 	c.status.DAVEWelcomeReceived = false
 	c.status.DAVERosterSize = 0
 	c.status.DAVERatchetsMissing = 0
@@ -419,6 +421,11 @@ func (c *RealClient) LeaveVoice(streamID string) error {
 	c.status.CaptionAudioForwardActive = false
 	c.status.CurrentGuildID = ""
 	c.status.CurrentVoiceID = ""
+	c.status.DAVEInitialized = false
+	c.status.DAVEReady = false
+	c.status.DAVEWelcomeReceived = false
+	c.status.DAVERosterSize = 0
+	c.status.DAVERatchetsMissing = 0
 	c.mu.Unlock()
 	c.speakerDispatchMu.Unlock()
 	var disconnectErr error
@@ -879,6 +886,7 @@ func (c *RealClient) Status() Status {
 	if voice != nil {
 		health := voice.DAVEHealth()
 		status.DAVEInitialized = health.Initialized
+		status.DAVEReady = health.EpochEstablished
 		status.DAVEWelcomeReceived = health.OP30Received
 		status.DAVERosterSize = health.LastRosterSize
 		status.DAVERatchetsMissing = health.LastMissing
@@ -898,6 +906,7 @@ func (r discordDAVERecovery) Health() davewatch.Health {
 	return davewatch.Health{
 		Initialized:         health.Initialized,
 		OP26SentAt:          health.OP26SentAt,
+		EpochEstablished:    health.EpochEstablished,
 		OP30Received:        health.OP30Received,
 		LastMissing:         health.LastMissing,
 		MissingFirstSeen:    health.MissingFirstSeen,
@@ -978,10 +987,12 @@ func (c *RealClient) recordDAVERecovery(job VoiceJob, voice *discordgo.VoiceConn
 		c.status.DAVESoftResets++
 	}
 	c.status.DAVELastRecoveryReason = event.Reason
-	errorClass := ""
+	errorClass := event.ErrorClass
 	if event.Result != "success" {
 		c.status.DAVERecoveryErrors++
-		errorClass = "dave_recovery_failed"
+		if errorClass == "" {
+			errorClass = "dave_recovery_failed"
+		}
 	}
 	c.mu.Unlock()
 	log.Printf("Discord DAVE recovery: event=%s stream_id=%s job_generation=%d voice_generation=%d reason=%s result=%s attempt=%d limit=%d error_class=%s", event.Action, strings.TrimSpace(job.StreamID), job.JobGeneration, voiceGeneration, event.Reason, event.Result, event.Attempt, event.Limit, errorClass)

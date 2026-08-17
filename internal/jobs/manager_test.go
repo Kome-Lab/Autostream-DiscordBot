@@ -889,7 +889,7 @@ func TestManagerRejectsSecondActiveJob(t *testing.T) {
 
 func TestParticipantAndActiveSpeakerState(t *testing.T) {
 	reporter := &fakeReporter{}
-	voice := &fakeVoice{status: discord.Status{Connected: true, VoiceConnected: true, AudioForwardEnabled: true, AudioForwardActive: true, CaptionAudioForwardActive: true, AudioReceiving: true, AudioPacketsReceived: 12, AudioPacketsForwarded: 10, AudioForwardErrors: 1, AudioForwardQueueDrops: 3, CaptionPacketsForwarded: 9, CaptionForwardErrors: 2, CaptionForwardQueueDrops: 4, GatewayReconnectCount: 2, VoiceDisconnectCount: 1, DAVEInitialized: true, DAVEWelcomeReceived: true, DAVERosterSize: 2, DAVERatchetsMissing: 1, DAVEKeyPackageResends: 2, DAVESoftResets: 3, DAVERecoveryErrors: 1}}
+	voice := &fakeVoice{status: discord.Status{Connected: true, VoiceConnected: true, AudioForwardEnabled: true, AudioForwardActive: true, CaptionAudioForwardActive: true, AudioReceiving: true, AudioPacketsReceived: 12, AudioPacketsForwarded: 10, AudioForwardErrors: 1, AudioForwardQueueDrops: 3, CaptionPacketsForwarded: 9, CaptionForwardErrors: 2, CaptionForwardQueueDrops: 4, GatewayReconnectCount: 2, VoiceDisconnectCount: 1, DAVEInitialized: true, DAVEReady: true, DAVEWelcomeReceived: true, DAVERosterSize: 2, DAVERatchetsMissing: 1, DAVEKeyPackageResends: 2, DAVESoftResets: 3, DAVERecoveryErrors: 1}}
 	manager := NewManagerWithReporter(voice, reporter)
 	if err := manager.Start(discord.VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"}); err != nil {
 		t.Fatal(err)
@@ -922,6 +922,7 @@ func TestParticipantAndActiveSpeakerState(t *testing.T) {
 		status.Metrics["discord.reconnect_count"] != 2 ||
 		status.Metrics["discord.voice_disconnect_count"] != 1 ||
 		status.Metrics["discord.dave_initialized"] != 1 ||
+		status.Metrics["discord.dave_ready"] != 1 ||
 		status.Metrics["discord.dave_welcome_received"] != 1 ||
 		status.Metrics["discord.dave_roster_size"] != 2 ||
 		status.Metrics["discord.dave_ratchets_missing"] != 1 ||

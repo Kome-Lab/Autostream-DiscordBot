@@ -1924,6 +1924,7 @@ func metricsFromStatus(status discord.Status, participantCount int) map[string]f
 		"discord.reconnect_count":                   float64(status.GatewayReconnectCount),
 		"discord.voice_disconnect_count":            float64(status.VoiceDisconnectCount),
 		"discord.dave_initialized":                  boolMetric(status.DAVEInitialized),
+		"discord.dave_ready":                        boolMetric(status.DAVEReady),
 		"discord.dave_welcome_received":             boolMetric(status.DAVEWelcomeReceived),
 		"discord.dave_roster_size":                  float64(status.DAVERosterSize),
 		"discord.dave_ratchets_missing":             float64(status.DAVERatchetsMissing),
