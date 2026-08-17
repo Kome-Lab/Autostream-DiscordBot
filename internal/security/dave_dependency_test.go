@@ -29,13 +29,36 @@ func TestDaveBuildContractIsPinnedAcrossSourceCIReleaseAndDocker(t *testing.T) {
 		}
 	}
 
+	discordgoGoMod := read("third_party", "discordgo", "go.mod")
+	if !strings.Contains(discordgoGoMod, "module github.com/cartridge-gg/discordgo") {
+		t.Fatal("third_party/discordgo is missing the pinned local discordgo source")
+	}
+
 	gitmodules := read(".gitmodules")
 	for _, marker := range []string{
-		"path = third_party/discordgo",
-		"url = https://github.com/cartridge-gg/discordgo.git",
+		"path = third_party/discordgo/dave/libdave",
+		"url = https://github.com/discord/libdave.git",
 	} {
 		if !strings.Contains(gitmodules, marker) {
 			t.Fatalf(".gitmodules is missing DAVE source marker %q", marker)
+		}
+	}
+	for _, marker := range []string{
+		"[submodule \"third_party/discordgo\"]",
+		"url = https://github.com/cartridge-gg/discordgo.git",
+	} {
+		if strings.Contains(gitmodules, marker) {
+			t.Fatalf(".gitmodules still contains inaccessible discordgo submodule marker %q", marker)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(root, "third_party", "discordgo", ".git"),
+		filepath.Join(root, "third_party", "discordgo", ".gitmodules"),
+	} {
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("legacy discordgo submodule metadata still exists at %s", path)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat legacy discordgo submodule metadata %s: %v", path, err)
 		}
 	}
 
