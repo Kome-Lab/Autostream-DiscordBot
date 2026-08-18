@@ -65,6 +65,14 @@ type reentrantStatusSpeakerSink struct {
 	called chan struct{}
 }
 
+type fakeVoiceSSRCResolver struct {
+	users map[uint32]string
+}
+
+func (f *fakeVoiceSSRCResolver) SSRCUserID(ssrc uint32) string {
+	return f.users[ssrc]
+}
+
 func (f *activeSpeakerStateSink) ActiveSpeakerStateChanged(streamID, userID string, speaking bool) {
 	f.activeStreamID = streamID
 	f.activeUserID = userID
@@ -78,6 +86,19 @@ func (f *reentrantStatusSpeakerSink) ActiveSpeakerStateChanged(streamID, userID 
 	select {
 	case f.called <- struct{}{}:
 	default:
+	}
+}
+
+func TestResolveSSRCUserIDFallsBackToVoiceConnectionCache(t *testing.T) {
+	resolver := &fakeVoiceSSRCResolver{users: map[uint32]string{
+		42: "user-01",
+		84: "user-02",
+	}}
+
+	for ssrc, want := range map[uint32]string{42: "user-01", 84: "user-02"} {
+		if got := resolveSSRCUserID(resolver, ssrc); got != want {
+			t.Fatalf("durable voice SSRC mapping was ignored for SSRC %d: got %q, want %q", ssrc, got, want)
+		}
 	}
 }
 
@@ -337,8 +358,20 @@ func TestVoiceSpeakingUpdateReportsActiveSpeaker(t *testing.T) {
 	if sink.activeStreamID != "stream-01" || sink.activeUserID != "user-01" {
 		t.Fatalf("active speaker was not reported from speaking update: %#v", sink)
 	}
-	if got := client.userForSSRC(42); got != "user-01" {
+	if got := client.userForSSRC(42, 1); got != "user-01" {
 		t.Fatalf("speaking update did not populate SSRC user map, got %q", got)
+	}
+}
+
+func TestUserForSSRCRejectsStaleVoiceGeneration(t *testing.T) {
+	client := &RealClient{
+		voiceGeneration: 2,
+		ssrcUsers:       map[uint32]string{42: "new-user"},
+		status:          Status{VoiceConnected: true},
+	}
+
+	if got := client.userForSSRC(42, 1); got != "" {
+		t.Fatalf("stale voice generation resolved current SSRC mapping: %q", got)
 	}
 }
 

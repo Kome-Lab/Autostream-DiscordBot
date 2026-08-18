@@ -654,7 +654,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 	}
 	flushExpiredUnresolved := func(now time.Time, force bool) {
 		for ssrc, buffered := range unresolved {
-			userID := c.userForSSRC(ssrc)
+			userID := c.userForSSRC(ssrc, voiceGeneration)
 			if userID == "" {
 				userID = resolveFallbackUser(now)
 			}
@@ -705,7 +705,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 				return
 			}
 			now := time.Now().UTC()
-			userID := c.userForSSRC(packet.SSRC)
+			userID := c.userForSSRC(packet.SSRC, voiceGeneration)
 			if userID == "" {
 				// Discord can deliver Opus before the first SSRC speaking update.
 				// When the target VC has exactly one human participant, use that
@@ -850,10 +850,54 @@ func (c *RealClient) dispatchActiveSpeakerState(job VoiceJob, voiceGeneration ui
 	}
 }
 
-func (c *RealClient) userForSSRC(ssrc uint32) string {
+type voiceSSRCUserResolver interface {
+	SSRCUserID(uint32) string
+}
+
+func resolveSSRCUserID(resolver voiceSSRCUserResolver, ssrc uint32) string {
+	if resolver == nil || ssrc == 0 {
+		return ""
+	}
+	return strings.TrimSpace(resolver.SSRCUserID(ssrc))
+}
+
+func (c *RealClient) userForSSRC(ssrc uint32, voiceGeneration uint64) string {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.ssrcUsers[ssrc]
+	if c.voiceGeneration != voiceGeneration || !c.status.VoiceConnected {
+		c.mu.Unlock()
+		return ""
+	}
+	userID := strings.TrimSpace(c.ssrcUsers[ssrc])
+	voice := c.voice
+	c.mu.Unlock()
+	if userID != "" || voice == nil {
+		return userID
+	}
+
+	// DiscordGo records OP5 SPEAKING mappings before userspace handlers run.
+	// Consult that durable map when JoinVoice registered our callback after a
+	// participant's first speaking event; otherwise only the first observed
+	// speaker receives captions and active-speaker state in a multi-user VC.
+	userID = resolveSSRCUserID(voice, ssrc)
+	if userID == "" {
+		return ""
+	}
+
+	c.mu.Lock()
+	if c.voice != voice || c.voiceGeneration != voiceGeneration || !c.status.VoiceConnected {
+		c.mu.Unlock()
+		return ""
+	}
+	if c.ssrcUsers == nil {
+		c.ssrcUsers = map[uint32]string{}
+	}
+	if current := strings.TrimSpace(c.ssrcUsers[ssrc]); current != "" {
+		userID = current
+	} else {
+		c.ssrcUsers[ssrc] = userID
+	}
+	c.mu.Unlock()
+	return userID
 }
 
 func (c *RealClient) uniqueHumanVoiceParticipant(job VoiceJob) string {
