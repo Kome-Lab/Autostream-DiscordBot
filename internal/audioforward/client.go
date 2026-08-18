@@ -279,7 +279,7 @@ func envInt(key string, fallback int) int {
 }
 
 func isRetryableStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+	return status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooManyRequests || status >= 500
 }
 
 func retryDelay(base time.Duration, attempt int) time.Duration {

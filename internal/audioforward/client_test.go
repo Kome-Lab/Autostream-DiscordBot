@@ -142,6 +142,31 @@ func TestClientRetriesTransientForwardFailure(t *testing.T) {
 	}
 }
 
+func TestClientRetriesConflictUntilEncoderAudioIngestIsReady(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := Client{
+		Config: Config{Token: "token", RetryMax: 3, RetryBaseDelay: time.Second},
+		Sleep:  func(context.Context, time.Duration) error { return nil },
+	}
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected Encoder readiness retries, got %d attempts", attempts)
+	}
+}
+
 func TestClientForwardOpusRequestTimeoutCoversConfiguredRetryBudget(t *testing.T) {
 	client := Client{Config: Config{
 		Timeout:        5 * time.Second,
