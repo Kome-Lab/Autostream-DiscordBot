@@ -474,9 +474,11 @@ func (c *RealClient) onVoiceSpeakingUpdate(voice *discordgo.VoiceConnection, eve
 }
 
 const (
-	opusForwardQueueBatches = 64
-	opusForwardStopWait     = 2 * time.Second
-	opusForwardRequestLimit = 5 * time.Second
+	opusForwardQueueBatches  = 64
+	opusForwardStopWait      = 2 * time.Second
+	opusForwardRequestLimit  = 5 * time.Second
+	opusEncoderBatchPackets  = 50
+	opusEncoderFlushInterval = 100 * time.Millisecond
 )
 
 func waitForOpusForwardStop(done <-chan struct{}) {
@@ -563,7 +565,7 @@ func (c *RealClient) enqueueOpusForwardBatch(job VoiceJob, voiceGeneration uint6
 }
 
 func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <-chan *discordgo.Packet, stop <-chan struct{}, forwarder AudioForwarder, source string) {
-	encoderBatchMax := 20
+	encoderBatchMax := opusEncoderBatchPackets
 	captionBatchMax := job.CaptionAudioMaxBatchPackets
 	if captionBatchMax <= 0 {
 		captionBatchMax = 5
@@ -688,7 +690,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 				flush(true)
 				lastCaptionFlush = now
 			}
-			if now.Sub(lastEncoderFlush) >= 500*time.Millisecond {
+			if now.Sub(lastEncoderFlush) >= opusEncoderFlushInterval {
 				flush(false)
 				lastEncoderFlush = now
 			}

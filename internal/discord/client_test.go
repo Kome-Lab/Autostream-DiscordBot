@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"reflect"
 	"strings"
@@ -459,6 +460,65 @@ func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
 		if strings.Contains(string(statusJSON), secret) {
 			t.Fatalf("status leaked forward secret/context %q: %s", secret, string(statusJSON))
 		}
+	}
+}
+
+func TestForwardOpusBatchesFifteenSpeakerLoadWithoutRequestBacklog(t *testing.T) {
+	forwarder := newFakeAudioForwarder()
+	client := &RealClient{}
+	packets := make(chan *discordgo.Packet, 75)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	job := VoiceJob{
+		StreamID:          "stream-15-speakers",
+		GuildID:           "guild-01",
+		VoiceChannelID:    "voice-01",
+		EncoderAudioURL:   "https://encoder.example.com/streams/stream-15-speakers/audio/opus",
+		StreamIngestToken: "job-ingest-token",
+	}
+	activateVoiceJobForTest(client, job, 1)
+	for speaker := 0; speaker < 15; speaker++ {
+		client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{
+			UserID:   fmt.Sprintf("user-%02d", speaker),
+			SSRC:     1000 + speaker,
+			Speaking: true,
+		})
+	}
+	go func() {
+		defer close(done)
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
+	}()
+	for frame := 0; frame < 5; frame++ {
+		for speaker := 0; speaker < 15; speaker++ {
+			packets <- &discordgo.Packet{
+				SSRC:      uint32(1000 + speaker),
+				Sequence:  uint16(frame + 1),
+				Timestamp: uint32((frame + 1) * 960),
+				Opus:      []byte{byte(speaker), byte(frame)},
+			}
+		}
+	}
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for client.Status().AudioPacketsForwarded < 75 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	forwardedBeforeStop := client.Status().AudioPacketsForwarded
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("15-speaker forward loop did not stop")
+	}
+	if forwardedBeforeStop != 75 {
+		t.Fatalf("forwarded packets before stop = %d, want 75 within 400 ms", forwardedBeforeStop)
+	}
+	calls := forwarder.callsSnapshot()
+	if len(calls) != 2 {
+		t.Fatalf("15-speaker load used %d encoder requests, want 2 bounded batches", len(calls))
+	}
+	if len(calls[0].packets) != 50 || len(calls[1].packets) != 25 {
+		t.Fatalf("unexpected 15-speaker batch sizes: %d, %d", len(calls[0].packets), len(calls[1].packets))
 	}
 }
 
