@@ -646,10 +646,12 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 		}
 		c.enqueueOpusForwardBatch(job, voiceGeneration, encoderTarget, batch)
 	}
-	appendPacket := func(packet audioforward.OpusPacket) {
+	appendEncoderPacket := func(packet audioforward.OpusPacket) {
 		if strings.TrimSpace(job.EncoderAudioURL) != "" {
 			encoderBatch = append(encoderBatch, packet)
 		}
+	}
+	appendCaptionPacket := func(packet audioforward.OpusPacket) {
 		if strings.TrimSpace(job.CaptionAudioURL) != "" {
 			captionBatch = append(captionBatch, packet)
 		}
@@ -668,7 +670,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 			}
 			for _, packet := range buffered {
 				packet.UserID = userID
-				appendPacket(packet)
+				appendCaptionPacket(packet)
 			}
 			delete(unresolved, ssrc)
 			delete(unresolvedSince, ssrc)
@@ -729,16 +731,21 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 				JobGeneration:        job.JobGeneration,
 				ConnectionGeneration: voiceGeneration,
 			}
-			if userID == "" && unresolvedWindow > 0 {
+			// Encoder mixing is keyed by SSRC and must not wait for Discord's
+			// eventually-consistent SSRC-to-user mapping. Delaying both targets
+			// here turns the identity window into a burst that can overflow the
+			// real-time mixer. Only captions need the resolved user identity.
+			appendEncoderPacket(forwardedPacket)
+			if strings.TrimSpace(job.CaptionAudioURL) != "" && userID == "" && unresolvedWindow > 0 {
 				if len(unresolved[packet.SSRC]) < 50 {
 					unresolved[packet.SSRC] = append(unresolved[packet.SSRC], forwardedPacket)
 					if unresolvedSince[packet.SSRC].IsZero() {
 						unresolvedSince[packet.SSRC] = now
 					}
 				}
-			} else {
+			} else if strings.TrimSpace(job.CaptionAudioURL) != "" {
 				flushExpiredUnresolved(now, false)
-				appendPacket(forwardedPacket)
+				appendCaptionPacket(forwardedPacket)
 			}
 			if len(captionBatch) >= captionBatchMax {
 				flush(true)

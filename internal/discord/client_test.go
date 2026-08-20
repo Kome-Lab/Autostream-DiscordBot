@@ -522,6 +522,71 @@ func TestForwardOpusBatchesFifteenSpeakerLoadWithoutRequestBacklog(t *testing.T)
 	}
 }
 
+func TestForwardOpusDoesNotDelayEncoderWhileSSRCIdentityIsUnresolved(t *testing.T) {
+	forwarder := newFakeAudioForwarder()
+	client := &RealClient{}
+	packets := make(chan *discordgo.Packet, 5)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	job := VoiceJob{
+		StreamID:                    "stream-unresolved-ssrc",
+		GuildID:                     "guild-01",
+		VoiceChannelID:              "voice-01",
+		EncoderAudioURL:             "https://encoder.example.com/audio",
+		CaptionAudioURL:             "https://worker.example.com/captions",
+		StreamIngestToken:           "encoder-token",
+		CaptionAudioToken:           "caption-token",
+		CaptionAudioFlushMS:         100,
+		CaptionAudioMaxBatchPackets: 5,
+		UnresolvedSSRCBufferMS:      300,
+	}
+	activateVoiceJobForTest(client, job, 1)
+	go func() {
+		defer close(done)
+		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
+	}()
+	for sequence := 1; sequence <= 5; sequence++ {
+		packets <- &discordgo.Packet{
+			SSRC:      42,
+			Sequence:  uint16(sequence),
+			Timestamp: uint32(sequence * 960),
+			Opus:      []byte{byte(sequence)},
+		}
+	}
+
+	encoderDeadline := time.Now().Add(250 * time.Millisecond)
+	for client.Status().AudioPacketsForwarded < 5 && time.Now().Before(encoderDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := client.Status().AudioPacketsForwarded; got != 5 {
+		close(stop)
+		<-done
+		t.Fatalf("encoder packets forwarded before identity timeout = %d, want 5", got)
+	}
+	for _, call := range forwarder.callsSnapshot() {
+		if call.url == job.CaptionAudioURL {
+			close(stop)
+			<-done
+			t.Fatal("caption packets were forwarded before the SSRC identity timeout")
+		}
+	}
+
+	captionDeadline := time.Now().Add(time.Second)
+	for client.Status().CaptionPacketsForwarded < 5 && time.Now().Before(captionDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("unresolved SSRC forward loop did not stop")
+	}
+	status := client.Status()
+	if status.AudioPacketsForwarded != 5 || status.CaptionPacketsForwarded != 5 {
+		t.Fatalf("unexpected unresolved SSRC forwarding status: %#v", status)
+	}
+}
+
 func TestForwardOpusForwardsCaptionOnly(t *testing.T) {
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
