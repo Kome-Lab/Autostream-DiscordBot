@@ -30,7 +30,7 @@ type VoiceJob struct {
 	CaptionAudioFlushMS         int    `json:"caption_audio_flush_ms,omitempty"`
 	CaptionAudioMaxBatchPackets int    `json:"caption_audio_max_batch_packets,omitempty"`
 	UnresolvedSSRCBufferMS      int    `json:"unresolved_ssrc_buffer_ms,omitempty"`
-	JobGeneration               uint64 `json:"job_generation,omitempty"`
+	JobGeneration               uint64 `json:"job_generation"`
 }
 
 type ParticipantEvent struct {

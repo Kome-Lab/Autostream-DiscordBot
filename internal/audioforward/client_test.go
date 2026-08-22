@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestClientForwardsOpusPackets(t *testing.T) {
+func TestClientForwardsOpusPacketsWithJobGeneration(t *testing.T) {
 	var gotAuth string
 	var gotPath string
 	var gotBody ingestRequest

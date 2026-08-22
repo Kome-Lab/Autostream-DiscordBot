@@ -123,7 +123,7 @@ func (r Reporter) ParticipantsChanged(job discord.VoiceJob, participants []jobs.
 func (r Reporter) ParticipantsChangedContext(ctx context.Context, job discord.VoiceJob, participants []jobs.Participant) error {
 	payload := struct {
 		Participants  []participantPayload `json:"participants"`
-		JobGeneration uint64               `json:"job_generation,omitempty"`
+		JobGeneration uint64               `json:"job_generation"`
 	}{Participants: make([]participantPayload, 0, len(participants)), JobGeneration: job.JobGeneration}
 	for _, participant := range participants {
 		payload.Participants = append(payload.Participants, participantPayload{

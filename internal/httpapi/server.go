@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,11 +21,26 @@ import (
 )
 
 type Status struct {
-	ServiceType string      `json:"service_type"`
-	ServiceID   string      `json:"service_id"`
-	Status      string      `json:"status"`
-	CheckedAt   time.Time   `json:"checked_at"`
-	Job         jobs.Status `json:"job"`
+	ServiceType string                  `json:"service_type"`
+	ServiceID   string                  `json:"service_id"`
+	Status      string                  `json:"status"`
+	CheckedAt   time.Time               `json:"checked_at"`
+	Job         publicJobStatusResponse `json:"job"`
+}
+
+type publicVoiceJob struct {
+	StreamID string `json:"stream_id"`
+}
+
+type publicJobStatusResponse struct {
+	CurrentJob       *publicVoiceJob    `json:"current_job,omitempty"`
+	CurrentStreamID  string             `json:"current_stream_id,omitempty"`
+	StartedAt        *time.Time         `json:"started_at,omitempty"`
+	Discord          discord.Status     `json:"discord"`
+	Metrics          map[string]float64 `json:"metrics"`
+	ParticipantCount int                `json:"participant_count"`
+	ActiveSpeakerID  string             `json:"active_speaker_id,omitempty"`
+	LastEventAt      *time.Time         `json:"last_event_at,omitempty"`
 }
 
 type updaterVersionResponse struct {
@@ -48,6 +64,8 @@ type TokenVerifier struct {
 	PlainToken string
 	SHA256Hex  string
 }
+
+const maxStartJobRequestBytes = 1 << 20
 
 var errStreamNotAssignedToService = errors.New("stream is not assigned to this discord bot as primary")
 
@@ -194,8 +212,12 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req discord.VoiceJob
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeSingleJSONValue(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
+		return
+	}
+	if req.JobGeneration == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "job_generation_required"})
 		return
 	}
 	if err := s.applyRuntimeDiscordConfig(r.Context(), &req); err != nil {
@@ -337,6 +359,30 @@ func decodeJSON(r *http.Request, value any) error {
 	return decoder.Decode(value)
 }
 
+func decodeSingleJSONValue(r *http.Request, value any) error {
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxStartJobRequestBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxStartJobRequestBytes {
+		return errors.New("request body exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
 func writeError(w http.ResponseWriter, err error) {
 	code := "request_failed"
 	status := http.StatusConflict
@@ -364,12 +410,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func publicJobStatus(status jobs.Status) jobs.Status {
+func publicJobStatus(status jobs.Status) publicJobStatusResponse {
 	status.Discord.CurrentGuildID = ""
 	status.Discord.CurrentVoiceID = ""
-	if status.CurrentJob == nil {
-		return status
+	result := publicJobStatusResponse{
+		CurrentStreamID:  status.CurrentStreamID,
+		StartedAt:        status.StartedAt,
+		Discord:          status.Discord,
+		Metrics:          status.Metrics,
+		ParticipantCount: status.ParticipantCount,
+		ActiveSpeakerID:  status.ActiveSpeakerID,
+		LastEventAt:      status.LastEventAt,
 	}
-	status.CurrentJob = &discord.VoiceJob{StreamID: status.CurrentJob.StreamID}
-	return status
+	if status.CurrentJob != nil {
+		result.CurrentJob = &publicVoiceJob{StreamID: status.CurrentJob.StreamID}
+	}
+	return result
 }

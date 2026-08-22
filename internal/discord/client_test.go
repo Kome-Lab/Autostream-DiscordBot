@@ -400,7 +400,7 @@ func TestActiveSpeakerCallbackMayReadClientStatusWithoutDeadlock(t *testing.T) {
 	}
 }
 
-func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
+func TestForwardOpusPreservesJobGenerationAndUpdatesStatus(t *testing.T) {
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
 	packets := make(chan *discordgo.Packet, 20)
@@ -408,6 +408,7 @@ func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
 	done := make(chan struct{})
 	job := VoiceJob{
 		StreamID:          "stream-01",
+		JobGeneration:     17,
 		GuildID:           "guild-01",
 		VoiceChannelID:    "voice-01",
 		EncoderAudioURL:   "https://encoder.example.com/streams/stream-01/audio/opus",
@@ -445,7 +446,7 @@ func TestForwardOpusForwardsSyntheticPacketsAndUpdatesStatus(t *testing.T) {
 	if len(forwarded) != 20 {
 		t.Fatalf("expected 20 forwarded packets, got %d", len(forwarded))
 	}
-	if forwarded[0].UserID != "user-01" || forwarded[0].SSRC != 42 || forwarded[0].Sequence != 100 || string(forwarded[0].Opus) != string([]byte{0, 0xaa, 0xbb}) {
+	if forwarded[0].UserID != "user-01" || forwarded[0].JobGeneration != 17 || forwarded[0].ConnectionGeneration != 1 || forwarded[0].SSRC != 42 || forwarded[0].Sequence != 100 || string(forwarded[0].Opus) != string([]byte{0, 0xaa, 0xbb}) {
 		t.Fatalf("unexpected forwarded packet: %#v", forwarded[0])
 	}
 	status := client.Status()

@@ -21,10 +21,11 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-func TestReporterPublishesParticipants(t *testing.T) {
+func TestReporterPublishesParticipantsWithJobGeneration(t *testing.T) {
 	var gotAuth string
 	var got struct {
-		Participants []participantPayload `json:"participants"`
+		Participants  []participantPayload `json:"participants"`
+		JobGeneration uint64               `json:"job_generation"`
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/streams/stream-01/events/participants" {
@@ -39,12 +40,12 @@ func TestReporterPublishesParticipants(t *testing.T) {
 	defer server.Close()
 
 	reporter := Reporter{Config: Config{Timeout: time.Second}}
-	job := discord.VoiceJob{StreamID: "stream-01", WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
+	job := discord.VoiceJob{StreamID: "stream-01", JobGeneration: 17, WorkerEventsURL: server.URL, WorkerEventsToken: "secret-token"}
 	if err := reporter.ParticipantsChanged(job, []jobs.Participant{{UserID: "user-01", Username: "alice", AvatarURL: "https://cdn.discordapp.com/avatars/user-01/a.png", IsBot: true, Speaking: true}}); err != nil {
 		t.Fatal(err)
 	}
 
-	if gotAuth != "Bearer secret-token" || len(got.Participants) != 1 || got.Participants[0].DisplayName != "alice" || got.Participants[0].AvatarURL == "" || !got.Participants[0].IsBot || !got.Participants[0].Speaking {
+	if gotAuth != "Bearer secret-token" || got.JobGeneration != 17 || len(got.Participants) != 1 || got.Participants[0].DisplayName != "alice" || got.Participants[0].AvatarURL == "" || !got.Participants[0].IsBot || !got.Participants[0].Speaking {
 		t.Fatalf("unexpected publish request: auth=%q body=%#v", gotAuth, got)
 	}
 }
