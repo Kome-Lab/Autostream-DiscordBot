@@ -166,6 +166,9 @@ func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("expected unauthenticated updater version request to return 200, got %d body=%s", res.Code, res.Body.String())
 	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("updater version cache control = %q", got)
+	}
 	var payload map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
 		t.Fatalf("decode updater version response: %v", err)
@@ -176,6 +179,19 @@ func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
 		payload["service_type"] != control.ServiceType ||
 		payload["config_revision"] != float64(11) {
 		t.Fatalf("expected embedded version and configured service identity, got %#v", payload)
+	}
+
+	methodReq := httptest.NewRequest(http.MethodPost, "/updater/version", nil)
+	methodRes := httptest.NewRecorder()
+	handler.ServeHTTP(methodRes, methodReq)
+	if methodRes.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("updater version POST status = %d body = %s", methodRes.Code, methodRes.Body.String())
+	}
+	if got := methodRes.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("updater version POST cache control = %q", got)
+	}
+	if got := methodRes.Header().Get("Allow"); !strings.Contains(got, http.MethodGet) {
+		t.Fatalf("updater version POST Allow = %q", got)
 	}
 }
 
