@@ -302,6 +302,8 @@ func sameWorkerEventJob(left, right discord.VoiceJob) bool {
 	return strings.TrimSpace(left.StreamID) == strings.TrimSpace(right.StreamID) &&
 		strings.TrimSpace(left.GuildID) == strings.TrimSpace(right.GuildID) &&
 		strings.TrimSpace(left.VoiceChannelID) == strings.TrimSpace(right.VoiceChannelID) &&
+		strings.TrimSpace(left.TextChannelID) == strings.TrimSpace(right.TextChannelID) &&
+		left.DiscordTargetRevision == right.DiscordTargetRevision &&
 		left.JobGeneration == right.JobGeneration
 }
 

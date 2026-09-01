@@ -99,7 +99,58 @@ func TestClientRejectsURLQueryOrFragment(t *testing.T) {
 	}
 }
 
+func TestClientUsesEncoderAudioTokenEnvironmentPrecedence(t *testing.T) {
+	tests := []struct {
+		name                 string
+		encoderAudioToken    string
+		encoderRecorderToken string
+		wantToken            string
+	}{
+		{
+			name:              "encoder audio token alone",
+			encoderAudioToken: "audio-token",
+			wantToken:         "audio-token",
+		},
+		{
+			name:                 "encoder recorder fallback alone",
+			encoderRecorderToken: "recorder-token",
+			wantToken:            "recorder-token",
+		},
+		{
+			name:                 "encoder audio token wins when both are set",
+			encoderAudioToken:    "audio-token",
+			encoderRecorderToken: "recorder-token",
+			wantToken:            "audio-token",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("ENCODER_AUDIO_TOKEN", test.encoderAudioToken)
+			t.Setenv("ENCODER_RECORDER_TOKEN", test.encoderRecorderToken)
+
+			var gotAuth string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+
+			client := Client{Config: ConfigFromEnv()}
+			err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{Opus: []byte{1}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "Bearer " + test.wantToken; gotAuth != want {
+				t.Fatalf("authorization header = %q, want %q", gotAuth, want)
+			}
+		})
+	}
+}
+
 func TestClientUsesTokenOverride(t *testing.T) {
+	t.Setenv("ENCODER_AUDIO_TOKEN", "audio-token")
+	t.Setenv("ENCODER_RECORDER_TOKEN", "recorder-token")
+
 	var gotAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -107,7 +158,7 @@ func TestClientUsesTokenOverride(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{Token: "env-token"}}
+	client := Client{Config: ConfigFromEnv()}
 	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "job-token", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
 	if err != nil {
 		t.Fatal(err)

@@ -301,6 +301,7 @@ func serviceCapabilities() map[string]any {
 		"audio_forward_retry":                true,
 		"chat_overlay_events":                true,
 		"caption_audio_forward":              true,
+		"discord_resolved_target_v2":         true,
 		"health_endpoint":                    true,
 		"job_endpoint":                       true,
 	}

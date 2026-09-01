@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -211,16 +210,21 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
-	var req discord.VoiceJob
-	if err := decodeSingleJSONValue(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
+	req, mode, err := decodeStartJobRequest(r)
+	if err != nil {
+		code := startJobCodeInvalidJSON
+		var requestErr startJobRequestError
+		if errors.As(err, &requestErr) {
+			code = requestErr.code
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": code})
 		return
 	}
 	if req.JobGeneration == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "job_generation_required"})
 		return
 	}
-	if err := s.applyRuntimeDiscordConfig(r.Context(), &req); err != nil {
+	if err := s.applyRuntimeDiscordConfig(r.Context(), &req, mode); err != nil {
 		if errors.Is(err, errStreamNotAssignedToService) {
 			writeError(w, err)
 			return
@@ -235,7 +239,7 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, publicJobStatus(s.manager.Status()))
 }
 
-func (s Server) applyRuntimeDiscordConfig(ctx context.Context, job *discord.VoiceJob) error {
+func (s Server) applyRuntimeDiscordConfig(ctx context.Context, job *discord.VoiceJob, mode startJobRequestMode) error {
 	if job == nil || s.runtimeConfig == nil || strings.TrimSpace(job.StreamID) == "" {
 		return nil
 	}
@@ -245,6 +249,12 @@ func (s Server) applyRuntimeDiscordConfig(ctx context.Context, job *discord.Voic
 	}
 	if !isPrimaryDiscordAssignment(cfg, job.StreamID) {
 		return errStreamNotAssignedToService
+	}
+	if mode == startJobRequestResolvedTargetV2 {
+		// v2's target is the immutable server-resolved snapshot. Runtime config
+		// remains authoritative for this Bot's primary assignment only and must
+		// never re-resolve or overwrite those IDs.
+		return nil
 	}
 	streamConfig, ok := cfg.DiscordConfigForStream(job.StreamID)
 	if !ok {
@@ -357,30 +367,6 @@ func decodeJSON(r *http.Request, value any) error {
 	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(value)
-}
-
-func decodeSingleJSONValue(r *http.Request, value any) error {
-	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxStartJobRequestBytes+1))
-	if err != nil {
-		return err
-	}
-	if len(body) > maxStartJobRequestBytes {
-		return errors.New("request body exceeds size limit")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(value); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return errors.New("request body must contain exactly one JSON value")
-		}
-		return err
-	}
-	return nil
 }
 
 func writeError(w http.ResponseWriter, err error) {

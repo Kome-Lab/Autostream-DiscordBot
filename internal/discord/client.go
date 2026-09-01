@@ -16,21 +16,26 @@ import (
 	"github.com/example/autostream-discord-bot/internal/secrets"
 )
 
+// VoiceJob is normalized runtime state, not an HTTP wire DTO. Every field is
+// excluded from JSON so status or diagnostics cannot accidentally expose
+// resolved channel IDs, endpoints, or job-scoped credentials.
 type VoiceJob struct {
-	GuildID                     string `json:"guild_id"`
-	VoiceChannelID              string `json:"voice_channel_id"`
-	TextChannelID               string `json:"text_channel_id,omitempty"`
-	StreamID                    string `json:"stream_id"`
-	EncoderAudioURL             string `json:"encoder_audio_url,omitempty"`
-	CaptionAudioURL             string `json:"caption_audio_url,omitempty"`
-	CaptionAudioToken           string `json:"caption_audio_token,omitempty"`
-	StreamIngestToken           string `json:"stream_ingest_token,omitempty"`
-	WorkerEventsURL             string `json:"worker_events_url,omitempty"`
-	WorkerEventsToken           string `json:"worker_events_token,omitempty"`
-	CaptionAudioFlushMS         int    `json:"caption_audio_flush_ms,omitempty"`
-	CaptionAudioMaxBatchPackets int    `json:"caption_audio_max_batch_packets,omitempty"`
-	UnresolvedSSRCBufferMS      int    `json:"unresolved_ssrc_buffer_ms,omitempty"`
-	JobGeneration               uint64 `json:"job_generation"`
+	GuildID                     string `json:"-"`
+	VoiceChannelID              string `json:"-"`
+	TextChannelID               string `json:"-"`
+	DiscordTargetRevision       uint64 `json:"-"`
+	StreamID                    string `json:"-"`
+	EncoderAudioURL             string `json:"-"`
+	CaptionAudioURL             string `json:"-"`
+	CaptionAudioToken           string `json:"-"`
+	StreamIngestToken           string `json:"-"`
+	WorkerEventsURL             string `json:"-"`
+	WorkerEventsToken           string `json:"-"`
+	CaptionAudioFlushMS         int    `json:"-"`
+	CaptionAudioMaxBatchPackets int    `json:"-"`
+	UnresolvedSSRCBufferMS      int    `json:"-"`
+	UnresolvedSSRCBufferMSSet   bool   `json:"-"`
+	JobGeneration               uint64 `json:"-"`
 }
 
 type ParticipantEvent struct {
@@ -580,10 +585,7 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 	if captionFlush > time.Second {
 		captionFlush = time.Second
 	}
-	unresolvedWindow := time.Duration(job.UnresolvedSSRCBufferMS) * time.Millisecond
-	if unresolvedWindow <= 0 {
-		unresolvedWindow = time.Second
-	}
+	unresolvedWindow := unresolvedSSRCBufferWindow(job)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	monitorDone := make(chan struct{})
@@ -757,6 +759,14 @@ func (c *RealClient) forwardOpus(job VoiceJob, voiceGeneration uint64, packets <
 			}
 		}
 	}
+}
+
+func unresolvedSSRCBufferWindow(job VoiceJob) time.Duration {
+	window := time.Duration(job.UnresolvedSSRCBufferMS) * time.Millisecond
+	if window < 0 || (window == 0 && !job.UnresolvedSSRCBufferMSSet) {
+		return time.Second
+	}
+	return window
 }
 
 func (c *RealClient) connectionGenerationForJob(job VoiceJob, voiceGeneration uint64) uint64 {
@@ -1498,6 +1508,8 @@ func sameVoiceJob(left, right VoiceJob) bool {
 	return strings.TrimSpace(left.StreamID) == strings.TrimSpace(right.StreamID) &&
 		strings.TrimSpace(left.GuildID) == strings.TrimSpace(right.GuildID) &&
 		strings.TrimSpace(left.VoiceChannelID) == strings.TrimSpace(right.VoiceChannelID) &&
+		strings.TrimSpace(left.TextChannelID) == strings.TrimSpace(right.TextChannelID) &&
+		left.DiscordTargetRevision == right.DiscordTargetRevision &&
 		left.JobGeneration == right.JobGeneration
 }
 

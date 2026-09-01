@@ -60,6 +60,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	if got.Capabilities["caption_audio_forward"] != true {
 		t.Fatalf("capabilities must advertise caption audio forwarding: %#v", got.Capabilities)
 	}
+	if got.Capabilities["discord_resolved_target_v2"] != true {
+		t.Fatalf("registration must advertise strict resolved-target v2 support as boolean true: %#v", got.Capabilities)
+	}
 	for name, value := range got.Capabilities {
 		if value == "placeholder" || value == "todo" {
 			t.Fatalf("capability %s has non-contract value %q", name, value)
@@ -93,8 +96,43 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH || got.Capabilities["job_endpoint"] != true {
 		t.Fatalf("heartbeat did not include platform/capabilities: %#v", got)
 	}
+	if got.Capabilities["discord_resolved_target_v2"] != true {
+		t.Fatalf("heartbeat must advertise strict resolved-target v2 support as boolean true: %#v", got.Capabilities)
+	}
 	if got.Commit != version.Commit || got.BuildDate != version.BuildDate {
 		t.Fatalf("heartbeat did not include build metadata: %#v", got)
+	}
+}
+
+func TestResolvedTargetCapabilityExposesNoPresetOrRuntimeSecret(t *testing.T) {
+	capabilities := serviceCapabilities()
+	if capabilities["discord_resolved_target_v2"] != true {
+		t.Fatalf("resolved-target v2 capability must be boolean true: %#v", capabilities)
+	}
+	for name, value := range capabilities {
+		if _, ok := value.(bool); !ok {
+			t.Fatalf("capability %q must expose only a non-secret boolean, got %#v", name, value)
+		}
+	}
+	for _, forbidden := range []string{
+		"preset_id",
+		"profile_id",
+		"discord_config_id",
+		"discord_target",
+		"guild_id",
+		"voice_channel_id",
+		"text_channel_id",
+		"bot_token_secret_name",
+		"caption_audio_token",
+		"stream_ingest_token",
+		"worker_events_token",
+		"runtime_secret",
+		"token",
+		"secret",
+	} {
+		if _, exposed := capabilities[forbidden]; exposed {
+			t.Fatalf("capability advertisement exposed preset or runtime-secret field %q: %#v", forbidden, capabilities)
+		}
 	}
 }
 

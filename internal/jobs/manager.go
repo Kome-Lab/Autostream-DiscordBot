@@ -819,7 +819,7 @@ func (m *Manager) restartParticipantSyncLocked() context.Context {
 
 func (m *Manager) hydrateVoiceParticipantsForGeneration(job discord.VoiceJob, suppressEmpty bool, generation int64) bool {
 	m.mu.Lock()
-	if m.reconnectGeneration != generation || m.current.StreamID != job.StreamID || m.current.GuildID != job.GuildID || m.current.VoiceChannelID != job.VoiceChannelID {
+	if m.reconnectGeneration != generation || !sameWorkerEventJob(m.current, job) {
 		m.mu.Unlock()
 		return false
 	}
@@ -851,7 +851,7 @@ func (m *Manager) participantJobCurrent(job discord.VoiceJob, generation int64, 
 	if requireGeneration && m.reconnectGeneration != generation {
 		return false
 	}
-	return !m.eventsPausedLocked() && m.current.StreamID == job.StreamID && m.current.GuildID == job.GuildID && m.current.VoiceChannelID == job.VoiceChannelID
+	return !m.eventsPausedLocked() && sameWorkerEventJob(m.current, job)
 }
 
 // eventsPausedLocked is the generation fence for Stop and Discord reconnect
@@ -1955,7 +1955,7 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 		}
 		m.mu.Lock()
 		current := m.current
-		if generation != m.reconnectGeneration || current.StreamID != job.StreamID || m.stopping {
+		if generation != m.reconnectGeneration || !sameWorkerEventJob(current, job) || m.stopping {
 			m.mu.Unlock()
 			return
 		}
@@ -1963,7 +1963,7 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 		m.mu.Unlock()
 		if err := m.voice.JoinVoice(job); err == nil {
 			m.mu.Lock()
-			stillCurrent := generation == m.reconnectGeneration && m.current.StreamID == job.StreamID && !m.stopping
+			stillCurrent := generation == m.reconnectGeneration && sameWorkerEventJob(m.current, job) && !m.stopping
 			previousWorkerRetry := m.workerRetry
 			var workerRetry *workerEventRetryQueue
 			var participantSyncContext context.Context
@@ -1986,7 +1986,7 @@ func (m *Manager) rejoinVoiceWithBackoff(job discord.VoiceJob, policy ReconnectP
 			return
 		}
 		m.mu.Lock()
-		if generation != m.reconnectGeneration || m.current.StreamID != job.StreamID {
+		if generation != m.reconnectGeneration || !sameWorkerEventJob(m.current, job) {
 			m.mu.Unlock()
 			return
 		}
