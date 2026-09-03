@@ -1,5 +1,7 @@
-github.com/Kome-Lab/Autostream-Contracts v1.2.12-0.20260903195800-89c280936013 h1:OWGtXNvMPO0Sv0+nMCd8/Nk4hSZC8sIlUc9jJ/KKkz0=
-github.com/Kome-Lab/Autostream-Contracts v1.2.12-0.20260903195800-89c280936013/go.mod h1:sJPMVofBZcO4uZd1T/y/VkN6/pwN0PJNAQGzlXI+GN4=
+github.com/Kome-Lab/Autostream-Contracts v1.2.12-0.20260903202917-82716abd84f2 h1:1CJ6iVtbhX7ea6mf/rwZ1nDL/MhTzL+Eu8SZx55R9xo=
+github.com/Kome-Lab/Autostream-Contracts v1.2.12-0.20260903202917-82716abd84f2/go.mod h1:sJPMVofBZcO4uZd1T/y/VkN6/pwN0PJNAQGzlXI+GN4=
+github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=
+github.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 golang.org/x/crypto v0.55.0 h1:+KWHjbgOaAQ66dh/YlkZKHlz9ZUlq61AFirAR9ntP8M=
