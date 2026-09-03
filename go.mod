@@ -15,6 +15,8 @@ replace github.com/example/autostream-contracts => github.com/Kome-Lab/Autostrea
 
 require (
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 )
