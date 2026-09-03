@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -199,13 +198,9 @@ type Config struct {
 	BotToken string
 }
 
-func ConfigFromEnv() Config {
-	return Config{BotToken: os.Getenv("DISCORD_BOT_TOKEN")}
-}
-
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.BotToken) == "" {
-		return errors.New("DISCORD_BOT_TOKEN is required")
+		return errors.New("Discord bot runtime secret is required")
 	}
 	return nil
 }

@@ -3,8 +3,5 @@ services:
     image: ${AUTOSTREAM_IMAGE_REGISTRY:-ghcr.io/kome-lab/autostream-docker}/discord-bot:${AUTOSTREAM_DOCKER_VERSION:-latest}
     restart: unless-stopped
     env_file: .env
-    environment:
-      AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}
-      AUTOSTREAM_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_DISCORD_BOT_CONTAINER_PORT:-8080}
     ports: !override
       - "127.0.0.1:${AUTOSTREAM_DISCORD_BOT_PORT:-8083}:${AUTOSTREAM_DISCORD_BOT_CONTAINER_PORT:-8080}"

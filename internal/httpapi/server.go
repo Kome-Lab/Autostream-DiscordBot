@@ -101,36 +101,7 @@ func (v TokenVerifier) Verify(header string) bool {
 	if runtimeToken := control.NodeRuntimeTokenFromEnv(); runtimeToken != "" {
 		return subtle.ConstantTimeCompare([]byte(token), []byte(runtimeToken)) == 1
 	}
-	if !allowControlPanelTokenFallback() {
-		return false
-	}
-	controlPanelToken := os.Getenv("CONTROL_PANEL_TOKEN")
-	if controlPanelToken == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(controlPanelToken)) == 1
-}
-
-func allowControlPanelTokenFallback() bool {
-	if envBool("AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG", false) {
-		return false
-	}
-	return !strings.EqualFold(strings.TrimSpace(os.Getenv("AUTOSTREAM_ENV")), "production")
-}
-
-func envBool(key string, fallback bool) bool {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
-	}
-	switch strings.ToLower(raw) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
+	return false
 }
 
 func NewServer(serviceType string, manager *jobs.Manager, verifier TokenVerifier) http.Handler {
@@ -194,7 +165,11 @@ func (s Server) updaterVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) status(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: os.Getenv("SERVICE_ID"), Status: "ready", CheckedAt: time.Now().UTC(), Job: publicJobStatus(s.manager.Status())})
+	serviceID := ""
+	if identity, err := s.updaterIdentity.ResolveFromEnv(); err == nil {
+		serviceID = identity.ServiceID
+	}
+	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: serviceID, Status: "ready", CheckedAt: time.Now().UTC(), Job: publicJobStatus(s.manager.Status())})
 }
 
 func (s Server) heartbeat(w http.ResponseWriter, r *http.Request) {

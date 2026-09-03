@@ -139,6 +139,12 @@ func TestReporterPublishesDiscordChatOverlay(t *testing.T) {
 	if got.Type != "overlay.discord_chat" || got.Payload["message_id"] != "msg-01" || got.Payload["author_id"] != "user-01" || got.Payload["display_name"] != "alice" || got.Payload["avatar_url"] == "" || got.Payload["is_bot"] != true || got.Payload["content"] != "こんにちは" || got.Payload["text_channel_id"] != "text-01" {
 		t.Fatalf("unexpected discord chat payload: %#v", got)
 	}
+	if _, ok := got.Payload["user_id"]; ok {
+		t.Fatalf("removed chat author alias was emitted: %#v", got.Payload)
+	}
+	if _, ok := got.Payload["text"]; ok {
+		t.Fatalf("removed chat content alias was emitted: %#v", got.Payload)
+	}
 }
 
 func TestReporterErrorDoesNotLeakToken(t *testing.T) {

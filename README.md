@@ -9,7 +9,7 @@ AutoStream の Discord Bot service です。Discord Gateway / Voice に接続し
 - Control Panel へ service registration / heartbeat を送信する。
 - Control Panel から stream job start / stop を受ける。
 - Control Panel の runtime config から、自分の `service_id` に紐付く Discord Bot Config だけを取得する。
-- Discord Bot token を Control Panel の runtime secret として取得する。`DISCORD_BOT_TOKEN` env は移行期間の fallback です。
+- Discord Bot token を Control Panel の runtime secret として取得する。
 - stream job に含まれる guild / voice channel へ参加する。
 - Discord VC の Opus packet を Encoder/Recorder の audio ingest endpoint へ forward する。
 - participant / active speaker / chat 状態を、stream job で指定された Worker へ送る。
@@ -17,41 +17,30 @@ AutoStream の Discord Bot service です。Discord Gateway / Voice に接続し
 
 ## Bootstrap Env
 
-通常運用で必要な env は Control Panel 接続と inbound job 検証だけです。
+通常運用のidentity、Control Panel接続、public endpoint、listener credential selectorはpanel-managed node configに集約し、local bind endpointは選択されたcredentialから読み込みます。
 
 ```text
-SERVICE_ID=discord-bot-01
-SERVICE_NAME=Discord Bot 01
-SERVICE_PUBLIC_URL=https://bot.example.com
-CONTROL_PANEL_URL=https://control.example.com
-CONTROL_PANEL_TOKEN=<SERVICE_TOKEN>
+AUTOSTREAM_NODE_CONFIG=/etc/autostream-discord-bot/config.yml
 SERVICE_CONTROL_TOKEN_SHA256=<SHA256_OF_SERVICE_CALL_TOKEN>
 DISCORD_RECONNECT_ENABLED=true
 DISCORD_RECONNECT_MAX_ATTEMPTS=5
 DISCORD_RECONNECT_BASE_DELAY=2s
 DISCORD_RECONNECT_MAX_DELAY=30s
-AUTOSTREAM_BIND_ADDR=127.0.0.1:8083
-AUTOSTREAM_CONFIG_REVISION=1
 TZ=Asia/Tokyo
 ```
 
-`AUTOSTREAM_CONFIG_REVISION` is a root-owned positive integer used by the local
-executor to bind `/updater/version` to the applied service configuration.
-It defaults to `1`; increment it after a configuration change. Invalid, signed,
-fractional, padded, zero, or negative values stop Discord Bot before it starts
-serving HTTP.
+Panel-managed `config.yml` must select `listener.credential: node-listener.json`.
+For systemd, `LoadCredential` exposes the strict four-field JSON from
+`/opt/autostream/local-executor/ports/discord-bot.json`; its `bind_address` is
+the only local listener authority and its positive `config_revision` is
+reported by `/updater/version`. The JSON also carries `schema_version: 2` and
+`service_type: discord_bot`. Missing, malformed, writable, or mismatched
+credentials fail closed. There is no bind or revision environment fallback.
 
-The Control Panel local executor writes managed bind/revision overrides to
-`/opt/autostream/local-executor/ports/discord-bot.env`. systemd loads this optional root-owned
-sidecar after `discord-bot.env`, so managed values win without breaking
-existing hosts where the sidecar does not exist.
-
-systemd 版の待受ポートは `/etc/autostream/discord-bot.env` の
-`AUTOSTREAM_BIND_ADDR` で変更できます。ポートは非特権範囲の
-`1024`～`65535` を指定してください。標準の env ファイルは IPv4
-loopback の `127.0.0.1:8083` を明示します。変数自体がない既存環境では、
-アップグレードだけでポートを移動しないようバイナリの従来値
-`127.0.0.1:8080` を維持します。
+`api.host` and `api.port` remain the public/reverse-proxy endpoint and do not
+select the local socket. The listener `bind_address` must use an unprivileged
+port from `1024` through `65535`; the standard host value is
+`127.0.0.1:8083`.
 例えば `127.0.0.1:18083` に変更した場合、`/health` と
 `/updater/version` も同じ `18083` で待ち受けます。不正な形式、範囲外、
 または特権ポートを指定した場合は Discord Bot が起動時に停止します。
@@ -73,22 +62,23 @@ intentionally omit an in-container `healthcheck`: the runtime image has no
 purpose-built HTTP probe client, and the image contract does not add or repurpose `curl`, `wget`, or another unrelated executable solely for container health.
 For managed Docker changes, the Local Executor probes the loopback published port for both `/health` and `/updater/version`; the published port is the health port.
 A recreate is accepted only when health, service identity, version, and
-`AUTOSTREAM_CONFIG_REVISION` match; otherwise the executor rolls back or reports
+the listener credential's `config_revision` match; otherwise the executor rolls back or reports
 `rollback_failed`.
 
 ```powershell
 $env:AUTOSTREAM_DISCORD_BOT_PORT = "18083"
 $env:AUTOSTREAM_DISCORD_BOT_CONTAINER_PORT = "18080"
+$env:AUTOSTREAM_CONFIG_REVISION = "1" # Compose JSON generation input only
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-Production mode sets `AUTOSTREAM_ENV=production` or `AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true`. In that mode the Discord Bot must register with Control Panel, fetch service-scoped runtime config, resolve `bot_token_secret_name` through `/services/runtime-secrets/resolve`, and initialize a real Discord client. It does not fall back to `DISCORD_BOT_TOKEN` or dry-run mode when Control Panel runtime config or runtime secret resolution fails. Dry-run Discord mode is for local migration checks only.
+Production mode sets `AUTOSTREAM_ENV=production` or `AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true`. In that mode the Discord Bot must register with Control Panel, fetch service-scoped runtime config, resolve `bot_token_secret_name` through `/services/runtime-secrets/resolve`, and initialize a real Discord client. It does not enter dry-run mode when Control Panel runtime config or runtime secret resolution fails. Dry-run Discord mode is for local checks only.
 
 When the runtime config provider is configured, `/jobs/start` fails closed if the Control Panel runtime config refresh fails. Request-supplied guild or voice channel IDs do not bypass the saved stream Discord config. Stream auto-start candidates are distributed only when the selected Discord Bot Config points to this service ID.
 
-Inbound Control Panel dispatch uses `SERVICE_CONTROL_TOKEN` or `SERVICE_CONTROL_TOKEN_SHA256`. `CONTROL_PANEL_TOKEN` is outbound-only; in production or runtime-config-required mode it must not authorize `/jobs/start`, `/jobs/{id}/stop`, or status mutation endpoints.
+Inbound Control Panel dispatch uses `SERVICE_CONTROL_TOKEN` or `SERVICE_CONTROL_TOKEN_SHA256`; the Node Runtime Token is read from `config.yml` and no outbound credential is accepted as an inbound fallback.
 
-Control Panel の Discord Bot Config に `bot_token`、`guild_id`、`voice_channel_id`、`text_channel_id`、caption/STT 設定を登録してください。`DISCORD_BOT_TOKEN`、`DISCORD_GUILD_ID`、`DISCORD_VOICE_CHANNEL_ID` は互換 fallback または local dry-run 用に限定します。
+Control Panel の Discord Bot Config にbot token secret reference、guild、voice channel、text channel、caption/STT設定を登録してください。実値とchannel IDはruntime config/job contextだけから取得します。
 
 ## Discord Gateway Intents
 
@@ -98,7 +88,7 @@ Bot は Gateway 接続時に `Guild Voice States`、`Guild Messages`、`Message 
 
 ## Runtime Config
 
-起動時に service token で `/services/register` を呼び、その後 `/services/runtime-config?service_id=<SERVICE_ID>` を取得します。runtime config には raw secret は含まれず、`bot_token_secret_name` のような参照だけが含まれます。
+起動時にnode configのservice identityで `/services/register` を呼び、その後自serviceのruntime configを取得します。runtime config には raw secret は含まれず、`bot_token_secret_name` のような参照だけが含まれます。
 
 `/jobs/start` を受けた時も Control Panel の runtime config を再取得し、対象 stream の `stream_discord_configs` から `guild_id`、`voice_channel_id`、`text_channel_id` を補完します。Streams で選ばれた Discord Bot Config の `service_id` がこの Bot service と一致する待機streamが候補になります。Control Panel は VC参加による開始要求を受けた時、保存済みconfig、`streams.start` scope、auto-start trigger、待機状態を確認し、開始直前に対象streamへ primary Discord Bot assignment を作成します。明示的に別Botが primary assigned されているstreamは勝手に上書きしません。
 

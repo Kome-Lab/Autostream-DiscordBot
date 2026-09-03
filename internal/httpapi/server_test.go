@@ -152,7 +152,6 @@ func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
 	t.Setenv("SERVICE_ID", "legacy-env-service-id")
 	t.Setenv("SERVICE_VERSION", "v9.9.9")
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "11")
 	t.Cleanup(func() {
 		version.Version = previousVersion
 	})
@@ -195,11 +194,14 @@ func TestUpdaterVersionDoesNotRequireAuthorization(t *testing.T) {
 	}
 }
 
-func TestNewServerFailsClosedForInvalidConfigRevision(t *testing.T) {
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
+func TestNewServerFailsClosedForInvalidListenerConfigRevision(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	writeNodeConfigForVerifierTest(t, configPath, control.ServiceType)
+	writeNodeListenerCredentialForVerifierTest(t, configPath, control.ServiceType, "0")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
 	defer func() {
 		if recover() == nil {
-			t.Fatal("NewServer must reject an invalid AUTOSTREAM_CONFIG_REVISION")
+			t.Fatal("NewServer must reject an invalid listener config_revision")
 		}
 	}()
 	_ = NewServer(control.ServiceType, jobs.NewManager(&discord.NoopClient{}), TokenVerifier{})
@@ -221,11 +223,8 @@ func TestUpdaterVersionFailsClosedWhenIdentityDriftsAfterConstruction(t *testing
 	configPath := filepath.Join(t.TempDir(), "config.yml")
 	writeNodeConfigForVerifierTest(t, configPath, control.ServiceType)
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "11")
 	handler := NewServer(control.ServiceType, jobs.NewManager(&discord.NoopClient{}), TokenVerifier{})
-	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
-	t.Setenv("SERVICE_ID", "changed-after-start")
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "12")
+	writeNodeListenerCredentialForVerifierTest(t, configPath, control.ServiceType, "12")
 
 	req := httptest.NewRequest(http.MethodGet, "/updater/version", nil)
 	res := httptest.NewRecorder()
@@ -1046,11 +1045,11 @@ func TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackWhenRuntimeConfigRe
 	}
 }
 
-func TestTokenVerifierFromEnvAllowsControlPanelTokenFallbackOutsideProduction(t *testing.T) {
+func TestTokenVerifierFromEnvRejectsRemovedControlPanelTokenFallbackOutsideProduction(t *testing.T) {
 	t.Setenv("CONTROL_PANEL_TOKEN", "control-panel-token")
 	verifier := TokenVerifierFromEnv()
-	if !verifier.Verify("Bearer control-panel-token") {
-		t.Fatal("expected local compatibility CONTROL_PANEL_TOKEN fallback outside production")
+	if verifier.Verify("Bearer control-panel-token") {
+		t.Fatal("removed CONTROL_PANEL_TOKEN fallback authorized an inbound request")
 	}
 }
 
@@ -1094,12 +1093,15 @@ func TestErrorDoesNotEchoBearerToken(t *testing.T) {
 
 func writeNodeConfigForVerifierTest(t *testing.T, path, nodeType string) {
 	t.Helper()
+	writeNodeListenerCredentialForVerifierTest(t, path, nodeType, "11")
 	body := `panel:
   url: "https://panel.example.jp"
 node:
   id: "discord-bot-01"
   name: "Discord Bot 01"
   type: "` + nodeType + `"
+listener:
+  credential: "node-listener.json"
 api:
   host: "discord.example.jp"
   port: 8443
@@ -1109,6 +1111,19 @@ auth:
   token: "runtime-secret"
 `
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeNodeListenerCredentialForVerifierTest(t *testing.T, configPath, serviceType, revision string) {
+	t.Helper()
+	credentialDir := filepath.Join(filepath.Dir(configPath), "credentials")
+	if err := os.MkdirAll(credentialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
+	body := `{"schema_version":2,"service_type":"` + serviceType + `","bind_address":"127.0.0.1:18083","config_revision":` + revision + `}`
+	if err := os.WriteFile(filepath.Join(credentialDir, "node-listener.json"), []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
 }

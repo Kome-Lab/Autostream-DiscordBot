@@ -828,13 +828,14 @@ Type=simple
 User=autostream
 Group=autostream
 EnvironmentFile=-/etc/autostream/discord-bot.env
+LoadCredential=node-listener.json:/opt/autostream/local-executor/ports/discord-bot.json
 ExecStart=/usr/local/bin/autostream-discord-bot
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
-printf '%s\n' 'AUTOSTREAM_BIND_ADDR=127.0.0.1:18083' \
+printf '%s\n' 'AUTOSTREAM_NODE_CONFIG=/etc/autostream-discord-bot/config.yml' \
   > "${EXTRACTED_ROOT}/.env.example"
 
 jq -n \

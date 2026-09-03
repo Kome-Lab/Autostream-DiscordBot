@@ -165,12 +165,10 @@ func (r Reporter) ChatMessageReceivedContext(ctx context.Context, job discord.Vo
 		"payload": map[string]any{
 			"message_id":      message.MessageID,
 			"author_id":       message.UserID,
-			"user_id":         message.UserID,
 			"display_name":    message.Username,
 			"avatar_url":      message.AvatarURL,
 			"is_bot":          message.IsBot,
 			"content":         message.Content,
-			"text":            message.Content,
 			"text_channel_id": message.TextChannelID,
 			"created_at":      message.CreatedAt.UTC().Format(time.RFC3339Nano),
 		},

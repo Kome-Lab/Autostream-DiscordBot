@@ -1420,7 +1420,7 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	}
 	if m.streamStarter == nil {
 		if m.shouldLogAutoStartLocked("starter-missing:"+streamID, now) {
-			log.Printf("Discord VC auto-start unavailable: Control Panel stream starter is not configured for stream=%s (check CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN)", streamID)
+			log.Printf("Discord VC auto-start unavailable: Control Panel stream starter is not configured for stream=%s (check panel-managed node config)", streamID)
 		}
 		m.mu.Unlock()
 		return

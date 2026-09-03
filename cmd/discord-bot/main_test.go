@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,27 +14,20 @@ import (
 	"github.com/example/autostream-discord-bot/internal/jobs"
 )
 
-func TestDiscordBotBindAddrFromEnvPreservesLegacyFallbackPort8080(t *testing.T) {
-	t.Setenv("AUTOSTREAM_BIND_ADDR", "")
-
-	got, err := discordBotBindAddrFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "127.0.0.1:8080" {
-		t.Fatalf("default bind address = %q, want bridge-compatible 127.0.0.1:8080", got)
+func TestDiscordBotBindAddrRequiresNodeConfigValue(t *testing.T) {
+	if _, err := discordBotBindAddr(""); err == nil {
+		t.Fatal("missing node config bind address was accepted")
 	}
 }
 
-func TestDiscordBotBindAddrFromEnvAcceptsConfigurableUnprivilegedPort(t *testing.T) {
+func TestDiscordBotBindAddrAcceptsConfiguredUnprivilegedPort(t *testing.T) {
 	for _, value := range []string{
 		"127.0.0.1:1024",
 		"127.0.0.1:18083",
 		"127.0.0.1:65535",
 	} {
 		t.Run(value, func(t *testing.T) {
-			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
-			got, err := discordBotBindAddrFromEnv()
+			got, err := discordBotBindAddr(value)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -43,10 +38,8 @@ func TestDiscordBotBindAddrFromEnvAcceptsConfigurableUnprivilegedPort(t *testing
 	}
 }
 
-func TestDiscordBotBindAddrFromEnvAcceptsIPv6(t *testing.T) {
-	t.Setenv("AUTOSTREAM_BIND_ADDR", "[::1]:18083")
-
-	got, err := discordBotBindAddrFromEnv()
+func TestDiscordBotBindAddrAcceptsIPv6(t *testing.T) {
+	got, err := discordBotBindAddr("[::1]:18083")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +48,7 @@ func TestDiscordBotBindAddrFromEnvAcceptsIPv6(t *testing.T) {
 	}
 }
 
-func TestDiscordBotBindAddrFromEnvRejectsInvalidOrPrivilegedPort(t *testing.T) {
+func TestDiscordBotBindAddrRejectsInvalidOrPrivilegedPort(t *testing.T) {
 	for _, value := range []string{
 		"127.0.0.1",
 		"127.0.0.1:0",
@@ -64,27 +57,15 @@ func TestDiscordBotBindAddrFromEnvRejectsInvalidOrPrivilegedPort(t *testing.T) {
 		"127.0.0.1:not-a-port",
 	} {
 		t.Run(strings.ReplaceAll(value, ":", "_"), func(t *testing.T) {
-			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
-			if _, err := discordBotBindAddrFromEnv(); err == nil {
-				t.Fatalf("discordBotBindAddrFromEnv() accepted %q", value)
+			if _, err := discordBotBindAddr(value); err == nil {
+				t.Fatalf("discordBotBindAddr() accepted %q", value)
 			}
 		})
 	}
 }
 
-func TestDiscordBotStartupAddrFromEnvRejectsInvalidConfigRevision(t *testing.T) {
-	t.Setenv("AUTOSTREAM_BIND_ADDR", "127.0.0.1:18083")
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
-
-	if _, err := discordBotStartupAddrFromEnv(); err == nil ||
-		!strings.Contains(err.Error(), "AUTOSTREAM_CONFIG_REVISION") {
-		t.Fatalf("discordBotStartupAddrFromEnv() error = %v, want invalid config revision", err)
-	}
-}
-
 func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) {
-	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
-	t.Setenv("SERVICE_ID", "discord-authoritative")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", writeDiscordNodeConfig(t))
 	latch := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
 
 	if err := requireMatchingUpdaterIdentity(latch, "discord-authoritative"); err != nil {
@@ -93,6 +74,25 @@ func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) 
 	if err := requireMatchingUpdaterIdentity(latch, "discord-drifted"); !errors.Is(err, httpapi.ErrUpdaterIdentityDrift) {
 		t.Fatalf("registration identity drift error = %v", err)
 	}
+}
+
+func writeDiscordNodeConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	credentialDir := filepath.Join(dir, "credentials")
+	if err := os.Mkdir(credentialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialDir, "node-listener.json"), []byte(`{"schema_version":2,"service_type":"discord_bot","bind_address":"127.0.0.1:18083","config_revision":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
+	body := "panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"discord-authoritative\"\n  name: \"Discord Bot\"\n  type: \"discord_bot\"\nlistener:\n  credential: \"node-listener.json\"\napi:\n  host: \"discord.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token: \"runtime-token\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 type fakeStreamStarter struct {
@@ -326,7 +326,7 @@ func TestRequireControlPanelRuntimeConfigExplicitEnv(t *testing.T) {
 }
 
 func TestBuildDiscordClientRejectsDryRunWhenRuntimeConfigRequired(t *testing.T) {
-	client, err := buildDiscordClient(discordclient.Config{}, "environment fallback", false)
+	client, err := buildDiscordClient(discordclient.Config{}, "Control Panel runtime secret", false)
 	if err == nil {
 		t.Fatal("expected missing Discord token to fail when dry-run fallback is disabled")
 	}
@@ -336,7 +336,7 @@ func TestBuildDiscordClientRejectsDryRunWhenRuntimeConfigRequired(t *testing.T) 
 }
 
 func TestBuildDiscordClientAllowsDryRunOutsideProduction(t *testing.T) {
-	client, err := buildDiscordClient(discordclient.Config{}, "environment fallback", true)
+	client, err := buildDiscordClient(discordclient.Config{}, "Control Panel runtime secret", true)
 	if err != nil {
 		t.Fatalf("expected dry-run fallback outside production: %v", err)
 	}

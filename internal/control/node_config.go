@@ -11,14 +11,15 @@ import (
 )
 
 type nodeAgentConfig struct {
-	PanelURL      string
-	NodeID        string
-	NodeName      string
-	NodeType      string
-	APIHost       string
-	APIPort       int
-	APISSLEnabled bool
-	Token         string
+	PanelURL           string
+	NodeID             string
+	NodeName           string
+	NodeType           string
+	APIHost            string
+	ListenerCredential string
+	APIPort            int
+	APISSLEnabled      bool
+	Token              string
 }
 
 func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
@@ -31,6 +32,7 @@ func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
 	cfg.ServiceID = ""
 	cfg.ServiceName = ""
 	cfg.ServicePublicURL = ""
+	cfg.BindAddress = ""
 	nodeCfg, err := loadNodeAgentConfig(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -48,6 +50,13 @@ func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
 	cfg.ServiceID = nodeCfg.NodeID
 	cfg.ServiceName = nodeCfg.NodeName
 	cfg.ServicePublicURL = nodeAPIURL(nodeCfg.APIHost, nodeCfg.APIPort, nodeCfg.APISSLEnabled)
+	listener, err := loadNodeListenerConfig(nodeCfg)
+	if err != nil {
+		cfg.ConfigError = fmt.Sprintf("node listener config: %v", err)
+		return
+	}
+	cfg.BindAddress = listener.BindAddress
+	cfg.ConfigRevision = listener.ConfigRevision
 }
 
 func NodeConfigPathFromEnv() string {
@@ -114,6 +123,8 @@ func parseNodeAgentConfig(body []byte) (nodeAgentConfig, error) {
 			cfg.NodeType = value
 		case "api.host":
 			cfg.APIHost = value
+		case "listener.credential":
+			cfg.ListenerCredential = value
 		case "api.port":
 			cfg.APIPort, _ = strconv.Atoi(value)
 		case "api.ssl_enabled":
@@ -125,8 +136,8 @@ func parseNodeAgentConfig(body []byte) (nodeAgentConfig, error) {
 	if err := scanner.Err(); err != nil {
 		return nodeAgentConfig{}, err
 	}
-	if cfg.PanelURL == "" || cfg.NodeID == "" || cfg.NodeName == "" || cfg.Token == "" || cfg.APIHost == "" || cfg.APIPort <= 0 {
-		return nodeAgentConfig{}, fmt.Errorf("missing panel.url, node.id, node.name, api host/port, or auth.token")
+	if cfg.PanelURL == "" || cfg.NodeID == "" || cfg.NodeName == "" || cfg.Token == "" || cfg.APIHost == "" || cfg.ListenerCredential != "node-listener.json" || cfg.APIPort <= 0 {
+		return nodeAgentConfig{}, fmt.Errorf("missing panel.url, node.id, node.name, api host/port, listener.credential, or auth.token")
 	}
 	return cfg, nil
 }

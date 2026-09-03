@@ -15,7 +15,6 @@ import (
 )
 
 type Config struct {
-	Token          string
 	Timeout        time.Duration
 	RetryMax       int
 	RetryBaseDelay time.Duration
@@ -101,15 +100,10 @@ type ingestRequest struct {
 
 func ConfigFromEnv() Config {
 	return Config{
-		Token:          firstNonEmpty(os.Getenv("ENCODER_AUDIO_TOKEN"), os.Getenv("ENCODER_RECORDER_TOKEN")),
 		Timeout:        envDuration("ENCODER_AUDIO_TIMEOUT_SEC", 5*time.Second),
 		RetryMax:       envInt("ENCODER_AUDIO_RETRY_MAX", 3),
 		RetryBaseDelay: envDuration("ENCODER_AUDIO_RETRY_BASE_DELAY_SEC", time.Second),
 	}
-}
-
-func (c Config) Enabled() bool {
-	return strings.TrimSpace(c.Token) != ""
 }
 
 func (c Client) ForwardOpus(ctx context.Context, encoderAudioURL, streamID, source, tokenOverride string, packets []OpusPacket) error {
@@ -125,12 +119,9 @@ func (c Client) ForwardOpus(ctx context.Context, encoderAudioURL, streamID, sour
 	if len(packets) == 0 {
 		return nil
 	}
-	token := strings.TrimSpace(c.Config.Token)
-	if strings.TrimSpace(tokenOverride) != "" {
-		token = strings.TrimSpace(tokenOverride)
-	}
+	token := strings.TrimSpace(tokenOverride)
 	if token == "" {
-		return errors.New("ENCODER_AUDIO_TOKEN is required")
+		return errors.New("stream_ingest_token is required")
 	}
 	endpoint, err := audioEndpoint(encoderAudioURL, streamID)
 	if err != nil {
@@ -243,15 +234,6 @@ func audioEndpoint(baseURL, streamID string) (string, error) {
 func isLocalDevHost(host string) bool {
 	normalized := strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
 	return normalized == "localhost" || normalized == "127.0.0.1" || normalized == "host.docker.internal"
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

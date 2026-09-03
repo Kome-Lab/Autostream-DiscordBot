@@ -15,10 +15,15 @@ import (
 )
 
 func TestUpdaterVersionPendingThenBindsAuthoritativeIdentityAndRejectsDrift(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.yml")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	credentialDir := filepath.Join(dir, "credentials")
+	if err := os.Mkdir(credentialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credentialPath := filepath.Join(credentialDir, "node-listener.json")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
-	t.Setenv("SERVICE_ID", "placeholder-discord")
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "13")
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
 
 	latch := NewUpdaterIdentityLatch(control.ServiceType)
 	handler := NewServerWithRuntimeConfigAndUpdaterIdentity(
@@ -30,7 +35,7 @@ func TestUpdaterVersionPendingThenBindsAuthoritativeIdentityAndRejectsDrift(t *t
 	)
 	assertUpdaterIdentityStatus(t, handler, http.StatusServiceUnavailable, "")
 
-	writeUpdaterIdentityNodeConfig(t, configPath, "discord-authoritative", control.ServiceType)
+	writeUpdaterIdentityNodeConfig(t, configPath, credentialPath, "discord-authoritative", control.ServiceType, 13)
 	identity, err := latch.ResolveFromEnv()
 	if err != nil {
 		t.Fatalf("registration identity resolve failed: %v", err)
@@ -40,11 +45,11 @@ func TestUpdaterVersionPendingThenBindsAuthoritativeIdentityAndRejectsDrift(t *t
 	}
 	assertUpdaterIdentityStatus(t, handler, http.StatusOK, "discord-authoritative")
 
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "14")
+	writeUpdaterIdentityListenerCredential(t, credentialPath, control.ServiceType, 14)
 	assertUpdaterIdentityStatus(t, handler, http.StatusServiceUnavailable, "")
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "13")
+	writeUpdaterIdentityListenerCredential(t, credentialPath, control.ServiceType, 13)
 
-	writeUpdaterIdentityNodeConfig(t, configPath, "discord-drifted", control.ServiceType)
+	writeUpdaterIdentityNodeConfig(t, configPath, credentialPath, "discord-drifted", control.ServiceType, 13)
 	assertUpdaterIdentityStatus(t, handler, http.StatusServiceUnavailable, "")
 }
 
@@ -67,22 +72,33 @@ func assertUpdaterIdentityStatus(t *testing.T, handler http.Handler, wantStatus 
 	}
 }
 
-func writeUpdaterIdentityNodeConfig(t *testing.T, path, serviceID, serviceType string) {
+func writeUpdaterIdentityNodeConfig(t *testing.T, path, credentialPath, serviceID, serviceType string, revision int64) {
 	t.Helper()
+	writeUpdaterIdentityListenerCredential(t, credentialPath, serviceType, revision)
 	body := fmt.Sprintf(`panel:
   url: "https://panel.example.com"
 node:
   id: %q
   name: "Updater Probe"
   type: %q
+listener:
+  credential: "node-listener.json"
 api:
-  host: "127.0.0.1"
-  port: 8083
-  ssl_enabled: false
+  host: "discord.example.jp"
+  port: 8443
+  ssl_enabled: true
 auth:
   token: "runtime-token"
 `, serviceID, serviceType)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeUpdaterIdentityListenerCredential(t *testing.T, path, serviceType string, revision int64) {
+	t.Helper()
+	body := fmt.Sprintf(`{"schema_version":2,"service_type":%q,"bind_address":"127.0.0.1:18083","config_revision":%d}`, serviceType, revision)
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
 }

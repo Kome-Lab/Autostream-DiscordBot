@@ -36,7 +36,8 @@ func main() {
 		return
 	}
 
-	addr, err := discordBotStartupAddrFromEnv()
+	controlCfg := control.ConfigFromEnv()
+	addr, err := discordBotStartupAddr(controlCfg.BindAddress)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -48,7 +49,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	controlCfg := control.ConfigFromEnv()
 	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlCfg.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
@@ -83,12 +83,12 @@ func main() {
 		if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
 			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
 		} else {
-			log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
+			log.Fatal("panel-managed node config is required in this environment")
 		}
 	}
 
-	discordCfg := discordclient.ConfigFromEnv()
-	tokenSource := "environment fallback"
+	discordCfg := discordclient.Config{}
+	tokenSource := "Control Panel runtime secret"
 	if hasRuntimeConfig {
 		secretName := discordBotTokenSecretNameFromRuntimeConfig(runtimeCfg)
 		if secretName != "" {
@@ -97,15 +97,14 @@ func main() {
 				if requireRuntimeConfig {
 					log.Fatalf("control panel Discord bot token runtime secret is required but lease is active: %v", err)
 				}
-				log.Printf("control panel Discord bot token runtime secret lease is active; using existing environment fallback only if configured: %v", err)
+				log.Printf("control panel Discord bot token runtime secret lease is active; Discord remains disabled: %v", err)
 			} else if err != nil {
 				if requireRuntimeConfig {
 					log.Fatalf("control panel Discord bot token runtime secret resolve is required in this environment: %v", err)
 				}
-				log.Printf("control panel Discord bot token resolve failed; falling back to environment token if configured: %v", err)
+				log.Printf("control panel Discord bot token resolve failed; Discord remains disabled: %v", err)
 			} else if secret.Value != "" {
 				discordCfg.BotToken = secret.Value
-				tokenSource = "Control Panel Discord config"
 				log.Printf("loaded Discord bot token from Control Panel runtime secret %s", secret.SecretName)
 			} else if requireRuntimeConfig {
 				log.Fatal("control panel Discord bot token runtime secret resolved to an empty value")
@@ -122,9 +121,6 @@ func main() {
 	if source, ok := voiceClient.(discordclient.AudioForwardSource); ok {
 		cfg := audioforward.ConfigFromEnv()
 		source.SetAudioForwarder(audioforward.Client{Config: cfg}, controlCfg.ServiceID)
-		if !cfg.Enabled() {
-			log.Printf("static encoder audio token is not configured; job-scoped signed ingest tokens will be used")
-		}
 	}
 	manager := jobs.NewManagerWithReporter(voiceClient, buildWorkerReporter())
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
@@ -214,23 +210,18 @@ func main() {
 	}
 }
 
-func discordBotStartupAddrFromEnv() (string, error) {
-	addr, err := discordBotBindAddrFromEnv()
+func discordBotStartupAddr(configured string) (string, error) {
+	addr, err := discordBotBindAddr(configured)
 	if err != nil {
-		return "", fmt.Errorf("invalid AUTOSTREAM_BIND_ADDR: %w", err)
-	}
-	if _, err := control.ConfigRevisionFromEnv(); err != nil {
-		return "", fmt.Errorf("invalid AUTOSTREAM_CONFIG_REVISION: %w", err)
+		return "", fmt.Errorf("invalid node listener credential bind_address: %w", err)
 	}
 	return addr, nil
 }
 
-func discordBotBindAddrFromEnv() (string, error) {
-	const defaultAddr = "127.0.0.1:8080"
-
-	addr := strings.TrimSpace(os.Getenv("AUTOSTREAM_BIND_ADDR"))
+func discordBotBindAddr(configured string) (string, error) {
+	addr := strings.TrimSpace(configured)
 	if addr == "" {
-		addr = defaultAddr
+		return "", errors.New("node listener credential bind_address is required")
 	}
 	_, portText, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -661,7 +652,7 @@ func buildDiscordClient(cfg discordclient.Config, tokenSource string, allowDryRu
 		if !allowDryRun {
 			return nil, errors.New("Discord bot token is required in this environment")
 		}
-		log.Printf("Discord bot token is not configured by Control Panel or environment; running in dry-run Discord mode")
+		log.Printf("Discord bot token is not configured by Control Panel; running in dry-run Discord mode")
 		return &discordclient.NoopClient{}, nil
 	}
 	client, err := discordclient.NewRealClient(cfg)

@@ -24,8 +24,8 @@ func TestClientForwardsOpusPacketsWithJobGeneration(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{Token: "token"}}
-	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, UserID: "user-01", JobGeneration: 11, ConnectionGeneration: 7, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
+	client := Client{Config: Config{}}
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "token", []OpusPacket{{SSRC: 10, UserID: "user-01", JobGeneration: 11, ConnectionGeneration: 7, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,8 +38,8 @@ func TestClientForwardsOpusPacketsWithJobGeneration(t *testing.T) {
 }
 
 func TestClientRejectsUnsafeURL(t *testing.T) {
-	client := Client{Config: Config{Token: "token"}}
-	err := client.ForwardOpus(context.Background(), "file:///tmp/audio", "stream-01", "bot", "", []OpusPacket{{Opus: []byte{1}}})
+	client := Client{Config: Config{}}
+	err := client.ForwardOpus(context.Background(), "file:///tmp/audio", "stream-01", "bot", "token", []OpusPacket{{Opus: []byte{1}}})
 	if err == nil {
 		t.Fatal("expected unsafe URL to be rejected")
 	}
@@ -57,8 +57,8 @@ func TestClientDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{Token: "token"}}
-	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "bot", "", []OpusPacket{{Opus: []byte{1}}})
+	client := Client{Config: Config{}}
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "bot", "token", []OpusPacket{{Opus: []byte{1}}})
 	if err == nil {
 		t.Fatal("expected redirect response to fail")
 	}
@@ -68,8 +68,8 @@ func TestClientDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
 }
 
 func TestClientRejectsRemoteHTTPURL(t *testing.T) {
-	client := Client{Config: Config{Token: "token"}}
-	err := client.ForwardOpus(context.Background(), "http://encoder.example.com", "stream-01", "bot", "", []OpusPacket{{Opus: []byte{1}}})
+	client := Client{Config: Config{}}
+	err := client.ForwardOpus(context.Background(), "http://encoder.example.com", "stream-01", "bot", "token", []OpusPacket{{Opus: []byte{1}}})
 	if err == nil {
 		t.Fatal("expected remote http URL to be rejected")
 	}
@@ -89,8 +89,8 @@ func TestClientAllowsLocalHTTPURL(t *testing.T) {
 }
 
 func TestClientRejectsURLQueryOrFragment(t *testing.T) {
-	client := Client{Config: Config{Token: "token"}}
-	err := client.ForwardOpus(context.Background(), "https://encoder.example.com?token=bad", "stream-01", "bot", "", []OpusPacket{{Opus: []byte{1}}})
+	client := Client{Config: Config{}}
+	err := client.ForwardOpus(context.Background(), "https://encoder.example.com?token=bad", "stream-01", "bot", "token", []OpusPacket{{Opus: []byte{1}}})
 	if err == nil {
 		t.Fatal("expected URL with query to be rejected")
 	}
@@ -99,58 +99,15 @@ func TestClientRejectsURLQueryOrFragment(t *testing.T) {
 	}
 }
 
-func TestClientUsesEncoderAudioTokenEnvironmentPrecedence(t *testing.T) {
-	tests := []struct {
-		name                 string
-		encoderAudioToken    string
-		encoderRecorderToken string
-		wantToken            string
-	}{
-		{
-			name:              "encoder audio token alone",
-			encoderAudioToken: "audio-token",
-			wantToken:         "audio-token",
-		},
-		{
-			name:                 "encoder recorder fallback alone",
-			encoderRecorderToken: "recorder-token",
-			wantToken:            "recorder-token",
-		},
-		{
-			name:                 "encoder audio token wins when both are set",
-			encoderAudioToken:    "audio-token",
-			encoderRecorderToken: "recorder-token",
-			wantToken:            "audio-token",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("ENCODER_AUDIO_TOKEN", test.encoderAudioToken)
-			t.Setenv("ENCODER_RECORDER_TOKEN", test.encoderRecorderToken)
-
-			var gotAuth string
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotAuth = r.Header.Get("Authorization")
-				w.WriteHeader(http.StatusAccepted)
-			}))
-			defer server.Close()
-
-			client := Client{Config: ConfigFromEnv()}
-			err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{Opus: []byte{1}}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if want := "Bearer " + test.wantToken; gotAuth != want {
-				t.Fatalf("authorization header = %q, want %q", gotAuth, want)
-			}
-		})
+func TestClientRequiresJobScopedToken(t *testing.T) {
+	client := Client{Config: ConfigFromEnv()}
+	err := client.ForwardOpus(context.Background(), "https://encoder.example.com", "stream-01", "discord-bot-01", "", []OpusPacket{{Opus: []byte{1}}})
+	if err == nil || !strings.Contains(err.Error(), "stream_ingest_token") {
+		t.Fatalf("missing job-scoped token error = %v", err)
 	}
 }
 
-func TestClientUsesTokenOverride(t *testing.T) {
-	t.Setenv("ENCODER_AUDIO_TOKEN", "audio-token")
-	t.Setenv("ENCODER_RECORDER_TOKEN", "recorder-token")
-
+func TestClientUsesJobScopedToken(t *testing.T) {
 	var gotAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -181,10 +138,10 @@ func TestClientRetriesTransientForwardFailure(t *testing.T) {
 	defer server.Close()
 
 	client := Client{
-		Config: Config{Token: "token", RetryMax: 2, RetryBaseDelay: time.Second},
+		Config: Config{RetryMax: 2, RetryBaseDelay: time.Second},
 		Sleep:  func(context.Context, time.Duration) error { return nil },
 	}
-	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "token", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,10 +163,10 @@ func TestClientRetriesConflictUntilEncoderAudioIngestIsReady(t *testing.T) {
 	defer server.Close()
 
 	client := Client{
-		Config: Config{Token: "token", RetryMax: 3, RetryBaseDelay: time.Second},
+		Config: Config{RetryMax: 3, RetryBaseDelay: time.Second},
 		Sleep:  func(context.Context, time.Duration) error { return nil },
 	}
-	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "token", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,10 +201,10 @@ func TestClientDoesNotRetryUnauthorizedForwardFailure(t *testing.T) {
 	defer server.Close()
 
 	client := Client{
-		Config: Config{Token: "token", RetryMax: 3, RetryBaseDelay: time.Second},
+		Config: Config{RetryMax: 3, RetryBaseDelay: time.Second},
 		Sleep:  func(context.Context, time.Duration) error { return nil },
 	}
-	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
+	err := client.ForwardOpus(context.Background(), server.URL, "stream-01", "discord-bot-01", "token", []OpusPacket{{SSRC: 10, Sequence: 2, Timestamp: 960, Opus: []byte{1, 2, 3}}})
 	if err == nil {
 		t.Fatal("expected unauthorized error")
 	}
