@@ -129,6 +129,21 @@ jobs:
           CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
           CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
             go test -p 1 ./...
+      - name: Race-test decomposed Discord packages with DAVE-linked DiscordGo
+        timeout-minutes: 15
+        env:
+          GOMAXPROCS: '2'
+        shell: bash
+        run: |
+          set -euo pipefail
+          libdave_build="$PWD/third_party/discordgo/dave/libdave/cpp/build"
+          vcpkg_libdir="$(find "$libdave_build/vcpkg_installed" -maxdepth 2 -type d -name lib -print -quit)"
+          test -n "$vcpkg_libdir"
+          vcpkg_libs="$(find "$vcpkg_libdir" -maxdepth 1 -type f -name '*.a' -print | sort | tr '\n' ' ')"
+          CGO_ENABLED=1 \
+          CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
+          CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+            go test -mod=readonly -p 1 -race -count=1 ./internal/discord ./internal/jobs
       - name: Build Go packages with DAVE-linked DiscordGo
         shell: bash
         run: |
