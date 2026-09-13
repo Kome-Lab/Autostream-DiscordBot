@@ -1,0 +1,613 @@
+[
+  {
+    "target_id": "B9-M059",
+    "repository": "Kome-Lab/Autostream-DiscordBot",
+    "original_path": "internal/jobs/manager_test.go",
+    "original_sha256": "a99b426d3ed29e0191001462889445179afabe527207c79703e1e145e56bac77",
+    "before_physical_lines": 2626,
+    "disposition": "responsibility-split",
+    "responsibility": "job lifecycle;participants/speakers;auto-start/stop;rejoin/reconnect;reporting;test doubles",
+    "destinations": [
+      {
+        "path": "internal/jobs/manager_auto_stop_rejoin_test.go",
+        "sha256": "e7954569c4b54f6451d40aacd5ec82bb5621f91c6d9604ec7e8c28982b459980",
+        "symbols": [
+          "TestAutoStopRejoinPolicyCoversSequentialPanelStops",
+          "TestStartAndStopCancelScheduledAutoStop",
+          "TestVoiceJoinAfterPanelStopCallbackReconcilesRearmedStreamAfterRuntimeRefresh",
+          "TestVoiceJoinDuringAutoStopDoesNotRestartWhenActiveOrNoSuccessor",
+          "TestVoiceJoinDuringCommittedAutoStopReconcilesRearmedStream"
+        ],
+        "physical_lines": 336
+      },
+      {
+        "path": "internal/jobs/manager_auto_stop_retry_test.go",
+        "sha256": "1efa146200f25d9984654cf10d2f27f7a83fedbdb368f68074e9b7d19ed3443b",
+        "symbols": [
+          "TestAutoStopRetryPolicyUsesBoundedExpectedDelays",
+          "TestControlPanelStopCallbackDoesNotCancelOwnAutoStopRequest",
+          "TestParticipantLeavingEmptyVCDoesNotRetryRejectedStop",
+          "TestParticipantLeavingEmptyVCRetriesTransientStopFailures",
+          "TestParticipantReturningBeforeAutoStopCancelsRequest",
+          "TestParticipantReturningCancelsInFlightAutoStopRequest",
+          "TestParticipantReturningCancelsScheduledAutoStopRetry"
+        ],
+        "physical_lines": 228
+      },
+      {
+        "path": "internal/jobs/manager_event_reporting_test.go",
+        "sha256": "0f8700370551d0676d9e3bb350447cdc97b69a2fb73b389876d4d8482882d7e3",
+        "symbols": [
+          "TestActiveSpeakerMustBeParticipant",
+          "TestAutoStopDiagnosticRecordsEmptyParticipantObservation",
+          "TestChatMessageReceivedBoundsOverlayPayload",
+          "TestChatMessageReceivedPublishesOnlyCurrentTextChannel",
+          "TestManagerRecordsWorkerEventPublishFailures",
+          "TestWorkerPublishFailureLogIncludesSafeHTTPClassification",
+          "TestWorkerPublishFailureLogIsRateLimitedAndSecretSafe"
+        ],
+        "physical_lines": 220
+      },
+      {
+        "path": "internal/jobs/manager_participant_recovery_test.go",
+        "sha256": "3f462a21401a989904f067000d24f46beb278d4807b4d90e7e97c3121647ae04",
+        "symbols": [
+          "TestParticipantSnapshotRetriesHTTP409UntilWorkerAccepts",
+          "TestParticipantSnapshotSyncRunsPeriodicallyAndStopsWithJobGeneration",
+          "TestParticipantsSyncedIgnoresDelayedOlderSnapshot",
+          "TestParticipantsSyncedReplacesStaleMemberAfterGatewayRecovery",
+          "TestPeriodicParticipantReplayCannotOverwriteNewerGatewaySnapshot",
+          "TestPeriodicSnapshotReadCannotOverwriteConcurrentParticipantEvent",
+          "TestStartRehydratesParticipantsAfterTransientInitialEmpty",
+          "TestStartReplaysParticipantsAfterInitialWorkerPublishFailure",
+          "TestVoiceRejoinHydratesCurrentParticipants",
+          "TestWorkerEventRetryCoalescesSpeakerStopAndRestoresChat",
+          "TestWorkerEventRetryIsCanceledByStopAndDoesNotReachRearmedGeneration"
+        ],
+        "physical_lines": 364
+      },
+      {
+        "path": "internal/jobs/manager_participant_state_test.go",
+        "sha256": "3bdbb227f85d1a3711777e50363933c5ddcf5f855eca3e856a02db4ccc3cb035",
+        "symbols": [
+          "TestAuthoritativeEmptyAutoStopRevalidatesBeforeStop",
+          "TestParticipantAndActiveSpeakerState",
+          "TestParticipantLeavingEmptyVCRequestsStreamStopOnce",
+          "TestStartDoesNotAutoStopOnTransientEmptyInitialSnapshot",
+          "TestStartHydratesExistingVoiceParticipantsBeforeLeave",
+          "TestVoiceEventEmptyAutoStopDoesNotTrustOneEmptyRevalidation",
+          "TestVoiceEventEmptyAutoStopRevalidatesBeforeStop",
+          "TestVoiceEventPersistentEmptyAutoStopsAfterSecondRevalidation"
+        ],
+        "physical_lines": 338
+      },
+      {
+        "path": "internal/jobs/manager_reporter_fixture_test.go",
+        "sha256": "d55812246193b0c5b31b63ab4336b9812e6c7ca538d6650622b2626f51f641d9",
+        "symbols": [
+          "*fakeReporter.ActiveSpeakerChanged",
+          "*fakeReporter.ChatMessageReceived",
+          "*fakeReporter.ParticipantsChanged",
+          "*recordingParticipantReporter.ActiveSpeakerChanged",
+          "*recordingParticipantReporter.ChatMessageReceived",
+          "*recordingParticipantReporter.ParticipantsChanged",
+          "*recordingParticipantReporter.count",
+          "*retryingOverlayReporter.ActiveSpeakerChanged",
+          "*retryingOverlayReporter.ActiveSpeakerStateChanged",
+          "*retryingOverlayReporter.ChatMessageReceived",
+          "*retryingOverlayReporter.ParticipantsChanged"
+        ],
+        "physical_lines": 99
+      },
+      {
+        "path": "internal/jobs/manager_speaker_state_test.go",
+        "sha256": "b67ec3baaa3e02fb36f6b6e313db88fd152188f376cc60bc0e9a8605103d7e24",
+        "symbols": [
+          "TestActiveSpeakerDetectedPublishesWorkerEvent",
+          "TestActiveSpeakerStateChangedClearsOnlyTheStoppedSpeaker",
+          "TestActiveSpeakerStateChangedKeepsMultipleSpeakersHighlighted",
+          "TestClearActiveSpeakerPublishesAuthoritativeClear",
+          "TestConcurrentSpeakerEdgesPublishAuthoritativeParticipantState",
+          "TestDuplicateActiveSpeakerDetectedIsNoop",
+          "TestGatewayReconnectRestartsPeriodicParticipantSnapshotSync",
+          "TestManagerDoesNotRejoinOnGatewayDisconnect",
+          "TestManagerRejoinsVoiceAfterVoiceDisconnect",
+          "TestOvertakenParticipantReportPublishesLatestSpeakerState",
+          "TestParticipantSnapshotPublishCannotArriveAfterNewSpeakerEvent"
+        ],
+        "physical_lines": 302
+      },
+      {
+        "path": "internal/jobs/manager_start_voice_test.go",
+        "sha256": "1242686edfc0f163bbd6b192a9e87a2adbb893dfc539802018e0021533f49998",
+        "symbols": [
+          "TestAutoStartFailureLogPreservesHTTPStatusWithoutProviderCode",
+          "TestManagerRejectsSecondActiveJob",
+          "TestManagerStartAppliesStreamVoiceDefaults",
+          "TestManagerStartAppliesVoiceDefaults",
+          "TestManagerStartsAndStopsVoiceJob",
+          "TestSetStreamVoiceDefaultsPublishesAutoStartTargets",
+          "TestVoiceUserJoinedCancelsStartRetryOnDisconnect",
+          "TestVoiceUserJoinedDoesNotStartAmbiguousOrActiveStream",
+          "TestVoiceUserJoinedRefreshesAndRetriesARearmedSuccessorAfterNotFound",
+          "TestVoiceUserJoinedRefreshesDefaultsBeforeMatching",
+          "TestVoiceUserJoinedRequiresAutoStartEnabled",
+          "TestVoiceUserJoinedRetriesServiceUpdateInProgress",
+          "TestVoiceUserJoinedRetriesTransientControlPanelFailure",
+          "TestVoiceUserJoinedStartsMatchingConfiguredStream"
+        ],
+        "physical_lines": 337
+      },
+      {
+        "path": "internal/jobs/manager_stream_control_fixture_test.go",
+        "sha256": "ce9c69f6d563fcadb1ed0e04c6be29341099658bc8ab51c1ed2efd9eaebe356e",
+        "symbols": [
+          "*blockingContextStreamStopper.StopStream",
+          "*blockingContextStreamStopper.StopStreamContext",
+          "*commitAfterCancelStreamStopper.StopStream",
+          "*commitAfterCancelStreamStopper.StopStreamContext",
+          "*fakeStreamStarter.StartStream",
+          "*fakeStreamStopper.StopStream",
+          "*panelStopCallbackStreamStopper.StopStream",
+          "*panelStopCallbackStreamStopper.StopStreamContext"
+        ],
+        "physical_lines": 135
+      },
+      {
+        "path": "internal/jobs/manager_test.go",
+        "sha256": "50a1536a9be0aadf34e821e8c72e89d919dd6d3d3ea9b100df99901157a21500",
+        "symbols": [
+          "*activeSpeakerStateReporter.ActiveSpeakerStateChanged",
+          "*autoStartTargetVoice.SetAutoStartVoiceTargets",
+          "*orderedOverlayReporter.ActiveSpeakerChanged",
+          "*orderedOverlayReporter.ActiveSpeakerStateChanged",
+          "*orderedOverlayReporter.ChatMessageReceived",
+          "*orderedOverlayReporter.ParticipantsChanged",
+          "activeSpeakerStateReporter",
+          "autoStartTargetVoice",
+          "blockingContextStreamStopper",
+          "blockingSnapshotVoice",
+          "commitAfterCancelStreamStopper",
+          "fakeReporter",
+          "fakeStreamStarter",
+          "fakeStreamStopper",
+          "fakeVoice",
+          "orderedOverlayReporter",
+          "panelStopCallbackStreamStopper",
+          "recordingParticipantReporter",
+          "retryableWorkerPublishError",
+          "retryableWorkerPublishError.Error",
+          "retryableWorkerPublishError.ErrorClass",
+          "retryableWorkerPublishError.HTTPStatusCode",
+          "retryableWorkerPublishError.RetryablePublish",
+          "retryingOverlayReporter",
+          "sequenceSnapshotVoice",
+          "snapshotVoice"
+        ],
+        "physical_lines": 184
+      },
+      {
+        "path": "internal/jobs/manager_voice_fixture_test.go",
+        "sha256": "19a587267e408bdbb7c90aa6c2a6be8255c63721d2748dcc4a91a0b8b4dd6ba5",
+        "symbols": [
+          "*blockingSnapshotVoice.SnapshotVoiceParticipants",
+          "*fakeVoice.Connect",
+          "*fakeVoice.JoinVoice",
+          "*fakeVoice.LeaveVoice",
+          "*fakeVoice.SendMessage",
+          "*fakeVoice.Status",
+          "*sequenceSnapshotVoice.SnapshotVoiceParticipants",
+          "*sequenceSnapshotVoice.snapshotReadCount",
+          "*snapshotVoice.SnapshotVoiceParticipants",
+          "waitForSequenceSnapshotReads"
+        ],
+        "physical_lines": 156
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M060",
+    "repository": "Kome-Lab/Autostream-DiscordBot",
+    "original_path": "release/install-autostream-discord-bot",
+    "original_sha256": "ddd1f86c70abd8c61d5a60d48988571e030254f025a1e048ad6eedab83480e67",
+    "before_physical_lines": 2379,
+    "disposition": "generated-from-bounded-authoring",
+    "responsibility": "preamble/options;validation/identity;locks/journal;staging;account/systemd changes;activation/health;rollback/cleanup;main dispatch",
+    "destinations": [
+      {
+        "path": "authoring/install-autostream-discord-bot/account-rollback.sh.inc",
+        "sha256": "f9158c5d9c431520d26b89e5884ce3679945a4ebc5a492c44dab182d893268fd",
+        "symbols": [],
+        "physical_lines": 215
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/activation-cleanup.sh.inc",
+        "sha256": "c81343e6162a10dff2eb9fd8e7a787642fc050229d83bd4f1bcdb5bd2632349e",
+        "symbols": [],
+        "physical_lines": 193
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/artifact-verification.sh.inc",
+        "sha256": "992ec6e8ae54b07d53aa1c85cdb7b19cb8b76cc3acf1cd3797c807439d3528fa",
+        "symbols": [],
+        "physical_lines": 165
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/directory-journal.sh.inc",
+        "sha256": "6b8891e49b318de606174e3a4f74f69b7d2748cd3cae9bade60061c547a1239d",
+        "symbols": [],
+        "physical_lines": 117
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/directory-lock-boundaries.sh.inc",
+        "sha256": "cf68f01b7d84c708f214f9932868bcaa3164b446927a789a001abf40a201f96a",
+        "symbols": [],
+        "physical_lines": 178
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/host-preflight.sh.inc",
+        "sha256": "aec3760fa16884bbba248f5c052b7fd8ad4f01e93d4908107c80ee1f58307d50",
+        "symbols": [],
+        "physical_lines": 251
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/preflight-input.sh.inc",
+        "sha256": "33844541383fa7133ca1303ee74db10ad5a5465f68232c8b8905dd05dcfbe695",
+        "symbols": [],
+        "physical_lines": 244
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/public-activation.sh.inc",
+        "sha256": "227b50b529fa7b41c63aeff5973e81df5928e753dd58378297489dd4fcbd2bdc",
+        "symbols": [],
+        "physical_lines": 340
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/release-verification.sh.inc",
+        "sha256": "c5d8f0c1f679bb67132b486e4395280643cca1c9d6a8bd4c6e3856931d96de70",
+        "symbols": [],
+        "physical_lines": 231
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/state-rollback.sh.inc",
+        "sha256": "28a98904eabbdccb50a82e2d1eaa23ec2cd934fd6872c270ea66d54753d9a80e",
+        "symbols": [],
+        "physical_lines": 302
+      },
+      {
+        "path": "authoring/install-autostream-discord-bot/temporary-paths.sh.inc",
+        "sha256": "a5a8ae90dcc0b2889fa0c1da58458f55ea49e605bb2f7e95a2bd882dea1a78c2",
+        "symbols": [],
+        "physical_lines": 143
+      },
+      {
+        "path": "release/install-autostream-discord-bot",
+        "sha256": "ddd1f86c70abd8c61d5a60d48988571e030254f025a1e048ad6eedab83480e67",
+        "symbols": [],
+        "physical_lines": 2379
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M061",
+    "repository": "Kome-Lab/Autostream-DiscordBot",
+    "original_path": "release/test-install-autostream-discord-bot-integration.sh",
+    "original_sha256": "3ed55200bf2cae56a6ea3cdec8903a1c2c848a10810f54dd26edefc1621475ed",
+    "before_physical_lines": 1711,
+    "disposition": "responsibility-split",
+    "responsibility": "fixture setup/stubs;case families;assertions;cleanup;ordered entry",
+    "destinations": [
+      {
+        "path": "release/installer-tests/discord-bot/archive-and-runtime-sentinel-fixture.sh",
+        "sha256": "eb4c905d94b522a88923e259a371ee4c72bfbb7e05d50bb22a4baf08ce45332d",
+        "symbols": [],
+        "physical_lines": 225
+      },
+      {
+        "path": "release/installer-tests/discord-bot/fixture-ownership-and-runtime.sh",
+        "sha256": "18dc6e84926737d78801a5195b74ca3c796e2a77ce524eab2f24661d7d4369d0",
+        "symbols": [],
+        "physical_lines": 492
+      },
+      {
+        "path": "release/installer-tests/discord-bot/fresh-install-and-legacy-fixture.sh",
+        "sha256": "bbf15053c12810c98c497767c9ee13f6a7c40bbc796ec9878dab41291229a53d",
+        "symbols": [],
+        "physical_lines": 217
+      },
+      {
+        "path": "release/installer-tests/discord-bot/input-and-account-rejection-cases.sh",
+        "sha256": "caac13afeedb8510bfa453f9ee9af318cdad2cd8c711f1ce13099e9bd0c0650f",
+        "symbols": [],
+        "physical_lines": 335
+      },
+      {
+        "path": "release/installer-tests/discord-bot/legacy-rollback-and-recovery-cases.sh",
+        "sha256": "aab35ab07e8491d27473ca4e6c8db7816ceda93a92ce73347ddf2e7fd0d0053a",
+        "symbols": [],
+        "physical_lines": 123
+      },
+      {
+        "path": "release/installer-tests/discord-bot/migration-and-runtime-race-cases.sh",
+        "sha256": "70610dc38d9bfdf1afdeca8b95fbfbf6ca34c1ef882f8075e78193d9dac64e49",
+        "symbols": [],
+        "physical_lines": 148
+      },
+      {
+        "path": "release/test-install-autostream-discord-bot-integration.sh",
+        "sha256": "d5388f2661961ab7634f5e891dd5af8678d52ab21a7306531b8fc88b7e83534b",
+        "symbols": [],
+        "physical_lines": 179
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M062",
+    "repository": "Kome-Lab/Autostream-DiscordBot",
+    "original_path": "internal/discord/client_test.go",
+    "original_sha256": "b87fad7e1dfe4f36324bb2dc260dc732d2f1e7be2a53bae723a753884b1ef2c1",
+    "before_physical_lines": 1634,
+    "disposition": "responsibility-split",
+    "responsibility": "gateway events;voice lifecycle;audio forwarding/SSRC;speaker ordering;DAVE state;test doubles",
+    "destinations": [
+      {
+        "path": "internal/discord/client_audio_fixture_test.go",
+        "sha256": "b1d33022417532cfd4a89cb1a60dbf69fba53433a985a76de5bc257906003f60",
+        "symbols": [
+          "*blockingCaptionForwarder.ForwardOpus",
+          "*fakeAudioForwarder.ForwardOpus",
+          "*fakeAudioForwarder.callsSnapshot",
+          "*fakeAudioForwarder.failURL",
+          "*fakeAudioForwarder.failsURL",
+          "*fakeAudioForwarder.snapshot",
+          "activateVoiceJobForTest",
+          "blockingCaptionForwarder",
+          "fakeAudioForwardCall",
+          "fakeAudioForwarder",
+          "forwardResultsSettled",
+          "newFakeAudioForwarder",
+          "runSyntheticForwardBatch"
+        ],
+        "physical_lines": 194
+      },
+      {
+        "path": "internal/discord/client_audio_generation_test.go",
+        "sha256": "8625ab73cb09e74b4ea1209b9f96b769c8103e510c4ee3d6ee453e96638c805e",
+        "symbols": [
+          "TestActiveSpeakerCallbackMayReadClientStatusWithoutDeadlock",
+          "TestCaptionForwardErrorIsSanitizedInStatus",
+          "TestForwardErrorIsSanitizedInStatus",
+          "TestForwardOpusBatchesFifteenSpeakerLoadWithoutRequestBacklog",
+          "TestForwardOpusDoesNotDelayEncoderWhileSSRCIdentityIsUnresolved",
+          "TestForwardOpusPreservesJobGenerationAndUpdatesStatus",
+          "TestLastErrorIsSanitizedInStatus",
+          "TestUserForSSRCRejectsStaleVoiceGeneration",
+          "TestVoiceSpeakingUpdateReportsActiveSpeaker"
+        ],
+        "physical_lines": 291
+      },
+      {
+        "path": "internal/discord/client_audio_shutdown_test.go",
+        "sha256": "29b46a297d668eaf492aab42698162b5f463f0bda122ede6b0a0fc9b35f2f396",
+        "symbols": [
+          "TestAudioActivityExpiresMissingSpeakerStop",
+          "TestAudioActivityRefreshKeepsCurrentSpeakerHighlighted",
+          "TestForwardOpusCaptionDoesNotUseEncoderTokenFallback",
+          "TestForwardOpusOldReceiveClosureDoesNotDisconnectRearmedJob",
+          "TestForwardOpusStaleReconnectPacketCannotMutateCurrentState",
+          "TestLeaveVoiceWaitsForAudioForwardLoopCancellation",
+          "TestVoiceSpeakingUpdateIgnoresStopSpeaking",
+          "TestVoiceSpeakingUpdateReportsStopToStateSink"
+        ],
+        "physical_lines": 204
+      },
+      {
+        "path": "internal/discord/client_caption_forwarding_test.go",
+        "sha256": "0cda4dfc1a490f797260d0a7e8d1c454675c177f8a4d4042c056c1c8ac9b2370",
+        "symbols": [
+          "TestForwardOpusCaptionBackpressureDoesNotBlockEncoder",
+          "TestForwardOpusCaptionQueueIsBoundedAndCanceledOnStop",
+          "TestForwardOpusForwardsCaptionOnly",
+          "TestForwardOpusForwardsSameBatchToBothTargetsWithSeparateTokens",
+          "TestForwardOpusTargetFailuresAreIndependent"
+        ],
+        "physical_lines": 281
+      },
+      {
+        "path": "internal/discord/client_gateway_state_test.go",
+        "sha256": "85d5501f6d9699b133106e810e74325ef023a2f25bb7ee5355ad661711c7775e",
+        "symbols": [
+          "TestGatewayReconnectStatus",
+          "TestLogVoiceStateDiagnosticRecordsSafeTransitionFields",
+          "TestOwnVoiceStateDisconnectUpdatesStatus",
+          "TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob",
+          "TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder"
+        ],
+        "physical_lines": 243
+      },
+      {
+        "path": "internal/discord/client_participant_snapshots_test.go",
+        "sha256": "d9b6ba8cb423b3db86e6c07c3ca2716404a97f26c778cb975c364c7ee15dc399",
+        "symbols": [
+          "TestAutoStartPresenceSyncEmitsExistingHumanParticipant",
+          "TestDelayedTargetLeaveDeltaPreservesCurrentParticipant",
+          "TestMessageCreatePublishesOnlyActiveTextChannelMessages",
+          "TestOwnVoiceStateJoinDoesNotBecomeParticipant",
+          "TestReadyRestartsConnectedStateAndParticipantSnapshot",
+          "TestUniqueHumanVoiceParticipantProvidesCaptionIdentityFallback",
+          "TestVoiceParticipantSnapshotUsesDiscordDisplayNameAndGuildAvatar",
+          "TestVoiceParticipantSnapshotsHydrateAndRecoverAuthoritatively",
+          "TestVoiceStateUpdateDoesNotClearOtherParticipantsWhenStateCacheIsIncomplete",
+          "TestVoiceStateUpdateUsesDeltaForSnapshotAwareSink"
+        ],
+        "physical_lines": 352
+      },
+      {
+        "path": "internal/discord/client_test.go",
+        "sha256": "92d78f38dcd581b693e180b0aad0b4b48dc3349bf3ac65b05006b9f99444e1fd",
+        "symbols": [
+          "*activeSpeakerStateSink.ActiveSpeakerStateChanged",
+          "*fakeEventSink.ActiveSpeakerDetected",
+          "*fakeEventSink.ChatMessageReceived",
+          "*fakeEventSink.DiscordConnected",
+          "*fakeEventSink.DiscordDisconnected",
+          "*fakeEventSink.ParticipantChanged",
+          "*fakeEventSink.VoiceUserJoined",
+          "*fakeVoiceSSRCResolver.SSRCUserID",
+          "*participantStateSink.ParticipantChanged",
+          "*participantStateSink.ParticipantsSynced",
+          "*reentrantStatusSpeakerSink.ActiveSpeakerStateChanged",
+          "*snapshotEventSink.ParticipantsSynced",
+          "TestResolveSSRCUserIDFallsBackToVoiceConnectionCache",
+          "activeSpeakerStateSink",
+          "fakeEventSink",
+          "fakeVoiceSSRCResolver",
+          "participantStateSink",
+          "reentrantStatusSpeakerSink",
+          "snapshotEventSink"
+        ],
+        "physical_lines": 112
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M063",
+    "repository": "Kome-Lab/Autostream-DiscordBot",
+    "original_path": "internal/security/service_installer_test.go",
+    "original_sha256": "7f968c7fd673d9674ac30ccebdb457e23e8a25019085ea665b6630e7b265ea8b",
+    "before_physical_lines": 1215,
+    "disposition": "responsibility-split",
+    "responsibility": "fixture/model ownership;normal scenarios;authorization/negative cases;concurrency/failure/recovery;shared assertions",
+    "destinations": [
+      {
+        "path": "internal/security/installer_scenario_source_test.go",
+        "sha256": "2519383b0fdc0c6d735f19be91f652ea84a2498fc5d30011134b7bd90cc2eeb5",
+        "symbols": [
+          "readInstallerScenarioSource"
+        ],
+        "physical_lines": 53
+      },
+      {
+        "path": "internal/security/service_installer_artifact_test.go",
+        "sha256": "f76f14b0afbc18e1d38bec092d69e040ca1aed6343a26998c0af14fdb4e3166d",
+        "symbols": [
+          "TestDiscordBotReleaseShipsManagedServiceInstaller"
+        ],
+        "physical_lines": 625
+      },
+      {
+        "path": "internal/security/service_installer_host_transaction_test.go",
+        "sha256": "1df112d6923b9a6d78f68d1719f763225efed83f8a9907edba50dbd5547944c1",
+        "symbols": [
+          "TestDiscordBotInstallerClosesSignalJournalWindows",
+          "TestDiscordBotInstallerTransactionsPrivilegedHostSetup"
+        ],
+        "physical_lines": 399
+      },
+      {
+        "path": "internal/security/service_installer_test.go",
+        "sha256": "cb7b0a2e45a1d3b07cb9fa7101716fd0f75518d167869fc7c269b2d96480cc2c",
+        "symbols": [
+          "TestDiscordBotInstallerPreservesLegacyPublicInodesOnRollback",
+          "TestDiscordPublicSyncScenarioGuardRejectsMarkersOutsideScenario",
+          "discordPublicSyncScenarioHasRequiredAssertions"
+        ],
+        "physical_lines": 207
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M064",
+    "repository": "Kome-Lab/Autostream-DiscordBot",
+    "original_path": "internal/httpapi/server_test.go",
+    "original_sha256": "016d84274346bc1752f4658c2e4f26791af42addae617446b77d7e85ddf4532b",
+    "before_physical_lines": 1129,
+    "disposition": "responsibility-split",
+    "responsibility": "listener/auth;start-job framing;generation/target;stop/status;HTTP fixtures",
+    "destinations": [
+      {
+        "path": "internal/httpapi/server_listener_auth_test.go",
+        "sha256": "8065a2dc67e7e54d1d44337a952eb43e701d4058a43d56cc9afa0aac5b74da91",
+        "symbols": [
+          "TestNewServerFailsClosedForInvalidListenerConfigRevision",
+          "TestNewServerFailsClosedForInvalidNodeIdentity",
+          "TestProtectedEndpointsRejectMissingToken",
+          "TestStartJobRequiresValidTokenAndUpdatesStatus",
+          "TestUpdaterVersionDoesNotRequireAuthorization",
+          "TestUpdaterVersionFailsClosedWhenIdentityDriftsAfterConstruction"
+        ],
+        "physical_lines": 183
+      },
+      {
+        "path": "internal/httpapi/server_runtime_credentials_test.go",
+        "sha256": "ed3230d2518ed75fa4e0ae141a10b44b4b4ff06ec15df4ba280cddfff2ae1cb7",
+        "symbols": [
+          "TestErrorDoesNotEchoBearerToken",
+          "TestSHA256TokenVerifier",
+          "TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackInProduction",
+          "TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackWhenRuntimeConfigRequired",
+          "TestTokenVerifierFromEnvRejectsRemovedControlPanelTokenFallbackOutsideProduction",
+          "TestTokenVerifierReadsNodeRuntimeTokenAfterStartup",
+          "writeNodeConfigForVerifierTest",
+          "writeNodeListenerCredentialForVerifierTest"
+        ],
+        "physical_lines": 127
+      },
+      {
+        "path": "internal/httpapi/server_start_framing_test.go",
+        "sha256": "ff12e432bdfadd871799c734bacc2531efc8f9472f6398fc9e24a45d8f8f7480",
+        "symbols": [
+          "TestStartJobRejectsInvalidJobGenerationBeforeRuntimeConfig",
+          "TestStartJobRequiresExactlyOneJSONValue"
+        ],
+        "physical_lines": 252
+      },
+      {
+        "path": "internal/httpapi/server_start_target_test.go",
+        "sha256": "51272730526ad461a6b2443c025e5e2984fee15d9aeb935d8f5ff45fda35da93",
+        "symbols": [
+          "TestDecodeStartJobRequestV2AcceptsCaptionTuningBounds",
+          "TestStartJobAppliesRuntimeStreamDiscordConfig",
+          "TestStartJobDoesNotUseStandbyRuntimeStreamDiscordConfig",
+          "TestStartJobFailsClosedWhenRuntimeConfigFetchFailsEvenWithRequestChannels",
+          "TestStartJobRejectsUnassignedRuntimeStreamEvenWithRequestChannels",
+          "TestStartJobV2RejectsInvalidResolvedTargetContractsBeforeSideEffects",
+          "TestStartJobV2RejectsUnassignedStreamWithoutResolvingTargetAgain",
+          "TestStartJobV2UsesResolvedTargetSnapshotWithoutRuntimeOverride"
+        ],
+        "physical_lines": 399
+      },
+      {
+        "path": "internal/httpapi/server_stop_lifecycle_test.go",
+        "sha256": "e542b7a3c0865941b0925cfeeaebd1fa41a97e9ae1888322f47ba49a1f4e89e0",
+        "symbols": [
+          "TestStopJobCallbackDoesNotCancelOutboundAutoStopParentContext",
+          "TestStopJobTreatsNoActiveTargetAsAlreadyStopped"
+        ],
+        "physical_lines": 90
+      },
+      {
+        "path": "internal/httpapi/server_test.go",
+        "sha256": "4bd971272b51fa55e508e282d74ceef76337a3048412bcfa9121fe8773a2c7d3",
+        "symbols": [
+          "*httpFakeVoice.Connect",
+          "*httpFakeVoice.JoinVoice",
+          "*httpFakeVoice.LeaveVoice",
+          "*httpFakeVoice.SendMessage",
+          "*httpFakeVoice.Status",
+          "*httpPanelStopCallbackStopper.StopStream",
+          "*httpPanelStopCallbackStopper.StopStreamContext",
+          "*httpReadCountingBody.Close",
+          "*httpReadCountingBody.Read",
+          "TestStartJobRequestLimitIsOneMiB",
+          "expectedStartJobRequestLimitBytes",
+          "expectedStartJobRequestLimitPlusOneBytes",
+          "httpFakeVoice",
+          "httpPanelStopCallbackStopper",
+          "httpReadCountingBody"
+        ],
+        "physical_lines": 133
+      }
+    ]
+  }
+]
