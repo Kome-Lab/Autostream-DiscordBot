@@ -40,6 +40,10 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 	c.mu.Lock()
 	targets := append([]AutoStartVoiceTarget(nil), c.autoStartTargets...)
 	sink := c.sink
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	if session == nil {
 		session = c.session
 	}
@@ -82,10 +86,12 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 					}
 				}
 				events = append(events, VoiceJoinEvent{
-					GuildID:        target.GuildID,
-					VoiceChannelID: target.VoiceChannelID,
-					UserID:         userID,
-					Username:       username,
+					ExistingPresence: true,
+					Authority:        &AutoStartAuthority{StreamID: target.StreamID, AssignmentEpoch: target.AssignmentEpoch},
+					GuildID:          target.GuildID,
+					VoiceChannelID:   target.VoiceChannelID,
+					UserID:           userID,
+					Username:         username,
 				})
 				break
 			}
@@ -95,7 +101,9 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 	state.RUnlock()
 
 	for _, event := range events {
-		sink.VoiceUserJoined(event)
+		if c.autoStartAuthorityCurrent(session, event.Authority) {
+			sink.VoiceUserJoined(event)
+		}
 	}
 }
 
@@ -140,4 +148,21 @@ func currentTrackedVoiceChannel(session *discordgo.Session, guildID, userID stri
 		return "", true
 	}
 	return "", false
+}
+
+func (c *RealClient) autoStartAuthorityCurrent(session *discordgo.Session, authority *AutoStartAuthority) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if session != nil && session != c.session {
+		return false
+	}
+	if authority == nil {
+		return true
+	}
+	for _, target := range c.autoStartTargets {
+		if target.StreamID == authority.StreamID && target.AssignmentEpoch == authority.AssignmentEpoch {
+			return true
+		}
+	}
+	return false
 }

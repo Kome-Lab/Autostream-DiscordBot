@@ -12,16 +12,22 @@ import (
 
 type Manager struct {
 	voice                       discord.Client
+	runtimeRefreshMu            sync.Mutex
+	gatewayCredentialMu         sync.Mutex
+	gatewayCredentialReference  string
+	gatewayCredentialToken      string
 	reporter                    EventReporter
 	streamStarter               StreamStarter
 	streamStopper               StreamStopper
 	mu                          sync.Mutex
 	current                     discord.VoiceJob
+	currentAssignmentEpoch      string
 	stopping                    bool
 	disconnected                bool
 	defaults                    VoiceDefaults
 	streamDefaults              map[string]VoiceDefaults
 	autoStartPending            map[string]time.Time
+	autoStartStopped            map[string]VoiceDefaults
 	autoStartRetries            map[string]*autoStartRetry
 	autoStopPending             map[string]bool
 	autoStopGeneration          map[string]uint64
@@ -80,6 +86,7 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		activeSpeakers:      map[string]bool{},
 		streamDefaults:      map[string]VoiceDefaults{},
 		autoStartPending:    map[string]time.Time{},
+		autoStartStopped:    map[string]VoiceDefaults{},
 		autoStartRetries:    map[string]*autoStartRetry{},
 		autoStopPending:     map[string]bool{},
 		autoStopGeneration:  map[string]uint64{},
@@ -133,6 +140,7 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 		return errors.New("another stream job is already active")
 	}
 	m.cancelAutoStopLocked(job.StreamID)
+	assignmentEpoch := m.streamDefaults[job.StreamID].AssignmentEpoch
 	m.mu.Unlock()
 
 	if err := m.voice.JoinVoice(job); err != nil {
@@ -147,6 +155,7 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	workerRetry := newWorkerEventRetryQueue()
 	m.workerRetry = workerRetry
 	m.current = job
+	m.currentAssignmentEpoch = assignmentEpoch
 	m.stopping = false
 	m.disconnected = false
 	now := time.Now().UTC()
@@ -231,6 +240,7 @@ func (m *Manager) Stop(streamID string) error {
 	}
 	previousWorkerRetry := m.workerRetry
 	m.workerRetry = nil
+	m.autoStartStopped[currentStreamID] = m.streamDefaults[currentStreamID]
 	m.current = discord.VoiceJob{}
 	m.stopping = false
 	m.startedAt = time.Time{}

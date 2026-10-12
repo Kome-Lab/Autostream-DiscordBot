@@ -71,10 +71,13 @@ func (c *RealClient) SendMessage(ctx context.Context, message OutboundMessage) (
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if c.session == nil {
+	c.mu.Lock()
+	session := c.session
+	c.mu.Unlock()
+	if session == nil {
 		return SentMessage{}, &SendMessageError{Code: SendMessageCodeUnavailable, Retryable: true}
 	}
-	sent, err := c.session.ChannelMessageSendComplex(
+	sent, err := session.ChannelMessageSendComplex(
 		message.ChannelID,
 		newDiscordMessageSend(message.Content),
 		discordgo.WithContext(ctx),

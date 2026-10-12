@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -87,37 +88,9 @@ func main() {
 		}
 	}
 
-	discordCfg := discordclient.Config{}
-	tokenSource := "Control Panel runtime secret"
-	if hasRuntimeConfig {
-		secretName := discordBotTokenSecretNameFromRuntimeConfig(runtimeCfg)
-		if secretName != "" {
-			secret, err := controlClient.ResolveRuntimeSecret(ctx, secretName)
-			if errors.Is(err, control.ErrRuntimeSecretLeaseActive) {
-				if requireRuntimeConfig {
-					log.Fatalf("control panel Discord bot token runtime secret is required but lease is active: %v", err)
-				}
-				log.Printf("control panel Discord bot token runtime secret lease is active; Discord remains disabled: %v", err)
-			} else if err != nil {
-				if requireRuntimeConfig {
-					log.Fatalf("control panel Discord bot token runtime secret resolve is required in this environment: %v", err)
-				}
-				log.Printf("control panel Discord bot token resolve failed; Discord remains disabled: %v", err)
-			} else if secret.Value != "" {
-				discordCfg.BotToken = secret.Value
-				log.Printf("loaded Discord bot token from Control Panel runtime secret %s", secret.SecretName)
-			} else if requireRuntimeConfig {
-				log.Fatal("control panel Discord bot token runtime secret resolved to an empty value")
-			}
-		} else if requireRuntimeConfig {
-			log.Fatal("control panel Discord bot token secret reference is required in this environment")
-		}
-	}
-
-	voiceClient, err := buildDiscordClient(discordCfg, tokenSource, !requireRuntimeConfig || configPending)
-	if err != nil {
-		log.Fatal(err)
-	}
+	// Managed nodes begin disconnected. A selected primary assignment is the
+	// authority for loading credentials and opening the Gateway.
+	voiceClient := discordclient.Client(discordclient.NewDormantRealClient())
 	if source, ok := voiceClient.(discordclient.AudioForwardSource); ok {
 		cfg := audioforward.ConfigFromEnv()
 		source.SetAudioForwarder(audioforward.Client{Config: cfg}, controlCfg.ServiceID)
@@ -140,28 +113,26 @@ func main() {
 	manager.SetReconnectPolicy(reconnectPolicy)
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" && runtimeConfigProvider != nil {
 		manager.SetAutoStartRefresher(func() error {
-			refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cfg, err := controlClient.RuntimeConfig(refreshCtx)
-			if err != nil {
-				log.Printf("control panel runtime config refresh for VC auto-start failed: %v", err)
-				return err
-			}
-			applyRuntimeConfigToManager(manager, cfg, reconnectPolicy)
-			return nil
+			return manager.RefreshRuntimeConfig(func() error {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				cfg, err := controlClient.RuntimeConfig(refreshCtx)
+				if err != nil {
+					log.Printf("control panel runtime config refresh for VC auto-start failed: %v", err)
+					return err
+				}
+				if err := reconcileRuntimeGateway(refreshCtx, controlClient, manager, cfg); err != nil {
+					return err
+				}
+				applyRuntimeConfigToManager(manager, cfg, reconnectPolicy)
+				return nil
+			})
 		})
 	}
-	// Auto-start is driven by Discord VoiceStateUpdate events while no stream
-	// job is active.  RealClient used to open the Gateway only from JoinVoice,
-	// which made VC-join auto-start impossible: the event needed to trigger the
-	// start could never arrive before the start itself.  Keep dry-run mode
-	// disconnected, but establish the real Gateway session during startup so
-	// the bot can observe waiting stream channels.
-	if _, dryRun := voiceClient.(*discordclient.NoopClient); !dryRun {
-		if err := voiceClient.Connect(); err != nil {
-			log.Fatalf("Discord Gateway connection failed: %v", err)
+	if hasRuntimeConfig {
+		if err := reconcileRuntimeGateway(ctx, controlClient, manager, runtimeCfg); err != nil {
+			log.Printf("selected Discord Gateway unavailable: %v", err)
 		}
-		log.Printf("Discord Gateway connected; waiting for VC auto-start events")
 	}
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" && runtimeConfigProvider != nil {
 		go runRuntimeConfigRefreshLoop(ctx, controlClient, manager, reconnectPolicyFromEnv(), envDurationDefault("CONTROL_PANEL_RUNTIME_CONFIG_REFRESH_INTERVAL", 30*time.Second))
@@ -250,8 +221,32 @@ func controlRuntimeConfigFromEnv(ctx context.Context) (control.RuntimeConfig, er
 func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.Manager, fallbackReconnectPolicy jobs.ReconnectPolicy, requireRuntimeConfig bool, updaterIdentity *httpapi.UpdaterIdentityLatch) {
 	lastState := ""
 	registeredServiceID := ""
+	registeredAuthority := ""
+	var cancelRefresh context.CancelFunc
+	stopRefresh := func() {
+		if cancelRefresh != nil {
+			cancelRefresh()
+			cancelRefresh = nil
+		}
+		registeredAuthority = ""
+		if manager != nil {
+			_ = manager.RefreshRuntimeConfig(func() error {
+				manager.SetStreamVoiceDefaults(nil)
+				manager.SetAutoStartRefresher(nil)
+				manager.SetStreamStarter(nil)
+				manager.SetStreamStopper(nil)
+				return manager.ReconcileGatewayCredential("", false, nil)
+			})
+		}
+	}
+	defer stopRefresh()
 	for {
 		cfg := control.ConfigFromEnv()
+		authority := fmt.Sprintf("%x", sha256.Sum256([]byte(cfg.ServiceID+"\x00"+cfg.ControlPanelURL+"\x00"+cfg.Token)))
+		if registeredAuthority != "" && registeredAuthority != authority {
+			stopRefresh()
+			registeredServiceID = ""
+		}
 		client := control.Client{Config: cfg}
 		wait := controlPanelRegistrationInterval(cfg)
 		state := ""
@@ -260,6 +255,7 @@ func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.M
 				state = "pending:" + control.NodeConfigPathFromEnv()
 				logRegistrationStateChange(&lastState, state, "node config pending: waiting for %s", control.NodeConfigPathFromEnv())
 				registeredServiceID = ""
+				stopRefresh()
 			} else {
 				log.Fatalf("updater identity invalid: %v", err)
 			}
@@ -280,10 +276,12 @@ func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.M
 			}
 			logRegistrationStateChange(&lastState, state, "node config invalid: %v", cfg.ConfigError)
 			registeredServiceID = ""
+			stopRefresh()
 		case strings.TrimSpace(cfg.ControlPanelURL) == "" || strings.TrimSpace(cfg.Token) == "":
 			state = "pending:" + control.NodeConfigPathFromEnv()
 			logRegistrationStateChange(&lastState, state, "node config pending: waiting for %s", control.NodeConfigPathFromEnv())
 			registeredServiceID = ""
+			stopRefresh()
 		default:
 			if registeredServiceID != cfg.ServiceID {
 				if err := client.Register(ctx); err != nil {
@@ -293,19 +291,68 @@ func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.M
 					}
 					logRegistrationStateChange(&lastState, state, "control panel registration failed: %v", err)
 					registeredServiceID = ""
+					stopRefresh()
 					break
 				}
 				registeredServiceID = cfg.ServiceID
 				state = "registered:" + cfg.ServiceID
 				logRegistrationStateChange(&lastState, state, "registered with control panel as %s", cfg.ServiceID)
+				stopRefresh()
 				streamController := controlStreamStarter{client: client}
 				manager.SetStreamStarter(streamController)
 				manager.SetStreamStopper(streamController)
-				if runtimeCfg, ok := logRuntimeConfig(ctx, client); ok {
+
+				refreshLifetime, refreshCancel := context.WithCancel(ctx)
+				cancelRefresh = refreshCancel
+				registeredAuthority = authority
+				manager.SetAutoStartRefresher(func() error {
+					return manager.RefreshRuntimeConfig(func() error {
+						refreshCtx, cancel := context.WithTimeout(refreshLifetime, 10*time.Second)
+						defer cancel()
+						if err := refreshCtx.Err(); err != nil {
+							return err
+						}
+						cfg, err := client.RuntimeConfig(refreshCtx)
+						if err != nil {
+							return err
+						}
+						if err := refreshCtx.Err(); err != nil {
+							return err
+						}
+						if err = reconcileRuntimeGateway(refreshCtx, client, manager, cfg); err != nil {
+							return err
+						}
+						if err := refreshCtx.Err(); err != nil {
+							return err
+						}
+						applyRuntimeConfigToManager(manager, cfg, fallbackReconnectPolicy)
+						return nil
+					})
+				})
+				if err := manager.RefreshRuntimeConfig(func() error {
+					runtimeCfg, ok := logRuntimeConfig(refreshLifetime, client)
+					if !ok {
+						return errors.New("control panel runtime config unavailable")
+					}
+					if err := refreshLifetime.Err(); err != nil {
+						return err
+					}
+					if err := reconcileRuntimeGateway(refreshLifetime, client, manager, runtimeCfg); err != nil {
+						return err
+					}
+					if err := refreshLifetime.Err(); err != nil {
+						return err
+					}
 					applyRuntimeConfigToManager(manager, runtimeCfg, fallbackReconnectPolicy)
-				} else if requireRuntimeConfig {
-					log.Fatal("control panel runtime config is required in this environment")
+					return nil
+				}); err != nil {
+					log.Printf("pending registration Gateway reconciliation unavailable: %v", err)
+					if requireRuntimeConfig {
+						log.Fatal("control panel runtime config is required in this environment")
+					}
 				}
+				go runRuntimeConfigRefreshLoop(refreshLifetime, client, manager, fallbackReconnectPolicy, envDurationDefault("CONTROL_PANEL_RUNTIME_CONFIG_REFRESH_INTERVAL", 30*time.Second))
+
 			}
 			if registeredServiceID == cfg.ServiceID {
 				if err := client.HeartbeatWithMetrics(ctx, "online", manager.CurrentStreamID(), manager.Metrics()); err != nil {
@@ -416,14 +463,48 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 			return
 		case <-ticker.C:
 		}
-		cfg, err := client.RuntimeConfig(ctx)
-		if err != nil {
-			log.Printf("control panel runtime config refresh failed: %v", err)
-			continue
-		}
-		applyRuntimeConfigToManager(manager, cfg, baseReconnectPolicy)
-		log.Printf("refreshed control panel runtime config for %s: stream_discord_configs=%d", cfg.Service.ServiceID, len(cfg.StreamDiscordConfigs))
+		_ = manager.RefreshRuntimeConfig(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			cfg, err := client.RuntimeConfig(ctx)
+			if err != nil {
+				log.Printf("control panel runtime config refresh failed: %v", err)
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := reconcileRuntimeGateway(ctx, client, manager, cfg); err != nil {
+				manager.SetStreamVoiceDefaults(nil)
+				log.Printf("selected Discord Gateway refresh unavailable: %v", err)
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			applyRuntimeConfigToManager(manager, cfg, baseReconnectPolicy)
+			log.Printf("refreshed control panel runtime config for %s: stream_discord_configs=%d", cfg.Service.ServiceID, len(cfg.StreamDiscordConfigs))
+			return nil
+		})
 	}
+}
+
+func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager *jobs.Manager, cfg control.RuntimeConfig) error {
+	streams, _ := primaryDiscordAssignmentStreams(cfg)
+	if len(streams) == 0 {
+		return manager.ReconcileGatewayCredential("", false, nil)
+	}
+	secretName := discordBotTokenSecretNameFromRuntimeConfig(cfg)
+	if secretName == "" {
+		manager.SetStreamVoiceDefaults(nil)
+		_ = manager.ReconcileGateway(discordclient.Config{}, false)
+		return errors.New("selected Bot credential reference unavailable")
+	}
+	return manager.ReconcileGatewayCredential(cfg.Service.ServiceID+"/"+secretName+"/"+discordBotTokenFingerprintFromRuntimeConfig(cfg), true, func() (string, error) {
+		secret, err := client.ResolveRuntimeSecret(ctx, secretName)
+		return secret.Value, err
+	})
 }
 
 func applyRuntimeConfigToManager(manager *jobs.Manager, cfg control.RuntimeConfig, baseReconnectPolicy jobs.ReconnectPolicy) jobs.ReconnectPolicy {
@@ -462,7 +543,7 @@ func reconnectPolicyFromRuntimeConfig(cfg control.RuntimeConfig, fallback jobs.R
 
 func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[string]jobs.VoiceDefaults {
 	defaults := map[string]jobs.VoiceDefaults{}
-	assignedPrimaryStreams, hasDiscordAssignment := primaryDiscordAssignmentStreams(cfg)
+	assignedPrimaryStreams, _ := primaryDiscordAssignmentStreams(cfg)
 	for _, item := range cfg.StreamDiscordConfigs {
 		if item.StreamID == "" {
 			continue
@@ -474,10 +555,20 @@ func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[strin
 		// primary role. Once this Bot has an explicit assignment, accept only
 		// that authoritative primary stream so a completed source cannot mask
 		// its rearmed successor.
-		if hasDiscordAssignment && !assignedPrimaryStreams[item.StreamID] {
+		if !assignedPrimaryStreams[item.StreamID] {
+			continue
+		}
+		epoch := ""
+		for _, assignment := range cfg.Assignments {
+			if assignment.StreamID == item.StreamID && assignment.ServiceID == cfg.Service.ServiceID && assignment.ServiceType == control.ServiceType && assignment.AssignmentRole == "primary" && !assignment.AssignedAt.IsZero() {
+				epoch = assignment.AssignedAt.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		if epoch == "" {
 			continue
 		}
 		defaults[item.StreamID] = jobs.VoiceDefaults{
+			AssignmentEpoch:  epoch,
 			GuildID:          item.GuildID,
 			VoiceChannelID:   item.VoiceChannelID,
 			TextChannelID:    item.TextChannelID,
@@ -498,15 +589,22 @@ func primaryDiscordAssignmentStreams(cfg control.RuntimeConfig) (map[string]bool
 		if strings.TrimSpace(assignment.ServiceID) != serviceID {
 			continue
 		}
-		if serviceType := strings.TrimSpace(assignment.ServiceType); serviceType != "" && serviceType != control.ServiceType {
+		if strings.TrimSpace(assignment.ServiceType) != control.ServiceType {
 			continue
 		}
 		hasDiscordAssignment = true
-		if role := strings.TrimSpace(assignment.AssignmentRole); role == "" || role == "primary" {
+		if strings.TrimSpace(assignment.AssignmentRole) == "primary" && strings.TrimSpace(assignment.StreamID) != "" {
 			streams[strings.TrimSpace(assignment.StreamID)] = true
 		}
 	}
 	return streams, hasDiscordAssignment
+}
+
+func discordBotTokenFingerprintFromRuntimeConfig(cfg control.RuntimeConfig) string {
+	if profile, ok := firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID); ok {
+		return stringConfig(profile.Config, "bot_token_fingerprint")
+	}
+	return ""
 }
 
 func discordBotTokenSecretNameFromRuntimeConfig(cfg control.RuntimeConfig) string {
@@ -519,6 +617,12 @@ func discordBotTokenSecretNameFromRuntimeConfig(cfg control.RuntimeConfig) strin
 }
 
 func firstRuntimeProfileForService(profiles []control.RuntimeProfile, serviceID string) (control.RuntimeProfile, bool) {
+	// An explicitly scoped profile always wins over a legacy unscoped row.
+	for _, profile := range profiles {
+		if value, ok := profile.Config["service_id"].(string); ok && strings.TrimSpace(value) != "" && strings.TrimSpace(value) == strings.TrimSpace(serviceID) {
+			return profile, true
+		}
+	}
 	for _, profile := range profiles {
 		if profileBelongsToService(profile, serviceID) {
 			return profile, true

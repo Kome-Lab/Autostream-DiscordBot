@@ -65,6 +65,7 @@ type RealClient struct {
 	ssrcUsers        map[uint32]string
 	audioSpeakers    map[string]time.Time
 	mu               sync.Mutex
+	gatewayMu        sync.Mutex
 	// speakerDispatchMu serializes active-speaker callbacks with voice job
 	// transitions. Callers must never hold mu while acquiring this gate or
 	// invoking the external sink; Manager.Status takes the inverse Manager ->
@@ -84,20 +85,76 @@ func NewRealClient(cfg Config) (*RealClient, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	client := NewDormantRealClient()
+	session, err := client.newGatewaySession(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client.cfg, client.session = cfg, session
+	return client, nil
+}
+
+// A managed Bot can be registered without any selected stream. It must stay
+// dormant until its own primary assignment supplies a token and voice target.
+func NewDormantRealClient() *RealClient {
 	installSafeDAVELogSink()
+	return &RealClient{}
+}
+
+func (client *RealClient) newGatewaySession(cfg Config) (*discordgo.Session, error) {
 	session, err := discordgo.New("Bot " + cfg.BotToken)
 	if err != nil {
 		return nil, err
 	}
 	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildVoiceStates | discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
-	client := &RealClient{cfg: cfg, session: session}
 	session.AddHandler(client.onGatewayDisconnect)
 	session.AddHandler(client.onReady)
 	session.AddHandler(client.onGatewayResumed)
 	session.AddHandler(client.onGuildCreate)
 	session.AddHandler(client.onVoiceStateUpdate)
 	session.AddHandler(client.onMessageCreate)
-	return client, nil
+	return session, nil
+}
+
+func (c *RealClient) ReconcileGateway(cfg Config, selected bool) error {
+	c.gatewayMu.Lock()
+	defer c.gatewayMu.Unlock()
+	c.mu.Lock()
+	old := c.session
+	active := c.job.StreamID != ""
+	unchanged := old != nil && c.cfg.BotToken == cfg.BotToken
+	c.mu.Unlock()
+	// Never disrupt the legitimate connection of an active job. Updated
+	// credentials take effect after that job leaves voice.
+	if active {
+		return nil
+	}
+	if selected && cfg.Validate() != nil {
+		return errors.New("selected Bot credential unavailable")
+	}
+	if selected && unchanged {
+		return c.connectGateway()
+	}
+	if old != nil {
+		if err := old.Close(); err != nil {
+			return errors.New("Discord Gateway close failed")
+		}
+	}
+	c.mu.Lock()
+	c.session, c.cfg = nil, Config{}
+	c.status.Connected = false
+	c.mu.Unlock()
+	if !selected {
+		return nil
+	}
+	session, err := c.newGatewaySession(cfg)
+	if err != nil {
+		return errors.New("Discord Gateway configuration failed")
+	}
+	c.mu.Lock()
+	c.session, c.cfg = session, cfg
+	c.mu.Unlock()
+	return c.connectGateway()
 }
 
 func (c *RealClient) SetEventSink(sink EventSink) {

@@ -38,11 +38,18 @@ type ParticipantSnapshot struct {
 	Revision       uint64
 }
 
+type AutoStartAuthority struct {
+	StreamID        string
+	AssignmentEpoch string
+}
+
 type VoiceJoinEvent struct {
-	GuildID        string `json:"guild_id"`
-	VoiceChannelID string `json:"voice_channel_id"`
-	UserID         string `json:"user_id"`
-	Username       string `json:"username,omitempty"`
+	Authority        *AutoStartAuthority `json:"-"`
+	ExistingPresence bool                `json:"-"`
+	GuildID          string              `json:"guild_id"`
+	VoiceChannelID   string              `json:"voice_channel_id"`
+	UserID           string              `json:"user_id"`
+	Username         string              `json:"username,omitempty"`
 }
 
 type ChatMessageEvent struct {
@@ -84,9 +91,10 @@ type EventSource interface {
 // configuration was loaded, so the client must also be able to inspect the
 // cached guild state.
 type AutoStartVoiceTarget struct {
-	StreamID       string
-	GuildID        string
-	VoiceChannelID string
+	AssignmentEpoch string
+	StreamID        string
+	GuildID         string
+	VoiceChannelID  string
 }
 
 // AutoStartVoiceTargetSetter is an optional extension used by the job manager

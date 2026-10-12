@@ -18,6 +18,10 @@ func (c *RealClient) onMessageCreate(session *discordgo.Session, event *discordg
 	c.mu.Lock()
 	job := c.job
 	sink := c.sink
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	c.mu.Unlock()
 	if sink == nil || strings.TrimSpace(job.StreamID) == "" || strings.TrimSpace(job.TextChannelID) == "" {
 		return
@@ -97,6 +101,13 @@ func (c *RealClient) syncVoiceParticipants(session *discordgo.Session, expected 
 	c.mu.Lock()
 	job := c.job
 	sink := c.sink
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
+	if session == nil {
+		session = c.session
+	}
 	c.mu.Unlock()
 	if !sameVoiceJob(job, expected) {
 		return
@@ -104,9 +115,6 @@ func (c *RealClient) syncVoiceParticipants(session *discordgo.Session, expected 
 	snapshotSink, ok := sink.(ParticipantSnapshotSink)
 	if !ok {
 		return
-	}
-	if session == nil {
-		session = c.session
 	}
 	snapshot, ok := c.snapshotVoiceParticipantsLocked(session, job)
 	if !ok {

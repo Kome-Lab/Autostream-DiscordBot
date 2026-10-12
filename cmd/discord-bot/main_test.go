@@ -213,7 +213,8 @@ func TestApplyRuntimeConfigToManagerRefreshesAutoStartDefaults(t *testing.T) {
 	manager.SetStreamStarter(starter)
 
 	cfg := control.RuntimeConfig{
-		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+		Service:     control.RegisteredService{ServiceID: "discord-bot-01"},
+		Assignments: []control.StreamServiceAssignment{{StreamID: "stream-new", ServiceID: "discord-bot-01", ServiceType: control.ServiceType, AssignmentRole: "primary", AssignedAt: time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)}},
 		StreamDiscordConfigs: []control.StreamDiscordConfig{
 			{
 				StreamID:         "stream-new",
@@ -227,7 +228,7 @@ func TestApplyRuntimeConfigToManagerRefreshesAutoStartDefaults(t *testing.T) {
 	}
 	applyRuntimeConfigToManager(manager, cfg, reconnectPolicyFromEnv())
 
-	manager.VoiceUserJoined(discordclient.VoiceJoinEvent{GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
+	manager.VoiceUserJoined(discordclient.VoiceJoinEvent{Authority: &discordclient.AutoStartAuthority{StreamID: "stream-new", AssignmentEpoch: "2026-10-12T00:00:00Z"}, GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
 	select {
 	case got := <-starter.started:
 		if got != "stream-new" {
@@ -244,7 +245,8 @@ func TestApplyRuntimeConfigToManagerDoesNotAutoStartWithoutTrigger(t *testing.T)
 	manager.SetStreamStarter(starter)
 
 	cfg := control.RuntimeConfig{
-		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
+		Service:     control.RegisteredService{ServiceID: "discord-bot-01"},
+		Assignments: []control.StreamServiceAssignment{{StreamID: "stream-new", ServiceID: "discord-bot-01", ServiceType: control.ServiceType, AssignmentRole: "primary", AssignedAt: time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)}},
 		StreamDiscordConfigs: []control.StreamDiscordConfig{
 			{
 				StreamID:       "stream-new",
@@ -256,7 +258,7 @@ func TestApplyRuntimeConfigToManagerDoesNotAutoStartWithoutTrigger(t *testing.T)
 	}
 	applyRuntimeConfigToManager(manager, cfg, reconnectPolicyFromEnv())
 
-	manager.VoiceUserJoined(discordclient.VoiceJoinEvent{GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
+	manager.VoiceUserJoined(discordclient.VoiceJoinEvent{Authority: &discordclient.AutoStartAuthority{StreamID: "stream-new", AssignmentEpoch: "2026-10-12T00:00:00Z"}, GuildID: "guild-new", VoiceChannelID: "voice-new", UserID: "user-01"})
 	select {
 	case got := <-starter.started:
 		t.Fatalf("stream without auto-start trigger should not start, got %q", got)
@@ -268,7 +270,7 @@ func TestStreamDiscordDefaultsFromRuntimeConfigUsesAssignedPrimaryStream(t *test
 	cfg := control.RuntimeConfig{
 		Service: control.RegisteredService{ServiceID: "discord-bot-01"},
 		Assignments: []control.StreamServiceAssignment{
-			{StreamID: "stream-successor", ServiceID: "discord-bot-01", ServiceType: control.ServiceType, AssignmentRole: "primary"},
+			{StreamID: "stream-successor", ServiceID: "discord-bot-01", ServiceType: control.ServiceType, AssignmentRole: "primary", AssignedAt: time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)},
 		},
 		StreamDiscordConfigs: []control.StreamDiscordConfig{
 			// The Panel can transiently include the completed source in a legacy

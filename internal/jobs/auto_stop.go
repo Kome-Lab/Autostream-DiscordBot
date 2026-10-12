@@ -22,9 +22,10 @@ type ContextStreamStopper interface {
 }
 
 type autoStopInFlight struct {
-	generation uint64
-	cancel     context.CancelFunc
-	job        discord.VoiceJob
+	assignmentEpoch string
+	generation      uint64
+	cancel          context.CancelFunc
+	job             discord.VoiceJob
 }
 
 type autoStopObservation struct {
@@ -154,7 +155,7 @@ func (m *Manager) autoStopWhenEmpty(streamID string, observation autoStopObserva
 	m.autoStopLastAttempt[streamID] = time.Now().UTC()
 	attempt := m.autoStopAttempts[streamID] + 1
 	ctx, cancel := context.WithCancel(context.Background())
-	m.autoStopInFlight[streamID] = autoStopInFlight{generation: observation.autoStopGeneration, cancel: cancel, job: m.current}
+	m.autoStopInFlight[streamID] = autoStopInFlight{assignmentEpoch: m.currentAssignmentEpoch, generation: observation.autoStopGeneration, cancel: cancel, job: m.current}
 	m.mu.Unlock()
 	logAutoStopObservation("requested", streamID, observation, delay, attempt)
 

@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"errors"
 	"log"
 	"strings"
 
@@ -8,13 +9,23 @@ import (
 )
 
 func (c *RealClient) Connect() error {
+	c.gatewayMu.Lock()
+	defer c.gatewayMu.Unlock()
+	return c.connectGateway()
+}
+
+func (c *RealClient) connectGateway() error {
 	c.mu.Lock()
 	alreadyConnected := c.status.Connected
+	session := c.session
 	c.mu.Unlock()
 	if alreadyConnected {
 		return nil
 	}
-	if err := c.session.Open(); err != nil {
+	if session == nil {
+		return errors.New("Discord Gateway is not selected")
+	}
+	if err := session.Open(); err != nil {
 		c.setLastError(err.Error())
 		return err
 	}
@@ -29,8 +40,12 @@ func (c *RealClient) Connect() error {
 	return nil
 }
 
-func (c *RealClient) onGatewayDisconnect(_ *discordgo.Session, _ *discordgo.Disconnect) {
+func (c *RealClient) onGatewayDisconnect(session *discordgo.Session, _ *discordgo.Disconnect) {
 	c.mu.Lock()
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	c.status.Connected = false
 	sink := c.sink
 	job := c.job
@@ -44,6 +59,10 @@ func (c *RealClient) onGatewayDisconnect(_ *discordgo.Session, _ *discordgo.Disc
 
 func (c *RealClient) onReady(session *discordgo.Session, _ *discordgo.Ready) {
 	c.mu.Lock()
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	c.status.Connected = true
 	c.status.LastError = ""
 	sink := c.sink
@@ -63,6 +82,10 @@ func (c *RealClient) onReady(session *discordgo.Session, _ *discordgo.Ready) {
 
 func (c *RealClient) onGatewayResumed(session *discordgo.Session, _ *discordgo.Resumed) {
 	c.mu.Lock()
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	c.status.Connected = true
 	c.status.GatewayReconnectCount++
 	c.status.LastError = ""
@@ -86,10 +109,14 @@ func (c *RealClient) onGuildCreate(session *discordgo.Session, event *discordgo.
 	if event == nil || event.Guild == nil {
 		return
 	}
-	c.syncAutoStartVoiceMembers(session)
 	c.mu.Lock()
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	job := c.job
 	c.mu.Unlock()
+	c.syncAutoStartVoiceMembers(session)
 	if strings.TrimSpace(job.StreamID) == "" || event.Guild.ID != job.GuildID {
 		return
 	}
@@ -102,8 +129,13 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	}
 	currentVoiceChannelID, currentVoiceStateKnown := currentTrackedVoiceChannel(session, event.GuildID, event.UserID)
 	c.mu.Lock()
+	if session != nil && session != c.session {
+		c.mu.Unlock()
+		return
+	}
 	job := c.job
 	sink := c.sink
+	targets := append([]AutoStartVoiceTarget(nil), c.autoStartTargets...)
 	voiceGeneration := c.voiceGeneration
 	c.mu.Unlock()
 	decision := "ignored"
@@ -117,16 +149,22 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	// because the snapshot is non-authoritative at this point. Once a job is
 	// active, retain the current-state fence so delayed joins cannot resurrect a
 	// participant that has already left.
-	currentStateAcceptsJoin := job.StreamID == "" || !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
+	currentStateAcceptsJoin := !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
 	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && currentStateAcceptsJoin {
 		if job.StreamID != "" {
 			decision = "auto_start_join_candidate"
 		}
-		sink.VoiceUserJoined(VoiceJoinEvent{
-			GuildID:        event.GuildID,
-			VoiceChannelID: event.ChannelID,
-			UserID:         event.UserID,
-		})
+		for _, target := range targets {
+			if target.GuildID == event.GuildID && target.VoiceChannelID == event.ChannelID {
+				authority := &AutoStartAuthority{StreamID: target.StreamID, AssignmentEpoch: target.AssignmentEpoch}
+				if c.autoStartAuthorityCurrent(session, authority) {
+					sink.VoiceUserJoined(VoiceJoinEvent{Authority: authority, GuildID: event.GuildID, VoiceChannelID: event.ChannelID, UserID: event.UserID})
+				}
+			}
+		}
+		if len(targets) == 0 && job.StreamID != "" && c.autoStartAuthorityCurrent(session, nil) {
+			sink.VoiceUserJoined(VoiceJoinEvent{GuildID: event.GuildID, VoiceChannelID: event.ChannelID, UserID: event.UserID})
+		}
 	}
 	if job.StreamID == "" || event.GuildID != job.GuildID {
 		return

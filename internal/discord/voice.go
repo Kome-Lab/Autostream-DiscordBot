@@ -14,7 +14,9 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 	if strings.TrimSpace(job.GuildID) == "" || strings.TrimSpace(job.VoiceChannelID) == "" || strings.TrimSpace(job.StreamID) == "" {
 		return errors.New("stream_id, guild_id and voice_channel_id are required")
 	}
-	if err := c.Connect(); err != nil {
+	c.gatewayMu.Lock()
+	defer c.gatewayMu.Unlock()
+	if err := c.connectGateway(); err != nil {
 		return err
 	}
 	voice, err := c.session.ChannelVoiceJoin(job.GuildID, job.VoiceChannelID, false, false)

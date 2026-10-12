@@ -24,6 +24,7 @@ type retryableAutoStartError interface {
 }
 
 type autoStartRetry struct {
+	assignmentEpoch     string
 	cancel              context.CancelFunc
 	reconnectGeneration int64
 	guildID             string
@@ -57,8 +58,16 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	}
 	now := time.Now().UTC()
 	m.mu.Lock()
+	if event.ExistingPresence && m.current.StreamID != "" {
+		m.mu.Unlock()
+		return
+	}
 	if m.current.StreamID != "" {
 		current := m.current
+		if !autoStartAuthorityMatches(current.StreamID, m.currentAssignmentEpoch, event) {
+			m.mu.Unlock()
+			return
+		}
 		if current.GuildID == event.GuildID && current.VoiceChannelID == event.VoiceChannelID && m.hasAutoStopInFlightLocked(current.StreamID) {
 			m.recordAutoStopRejoinIntentLocked(current.StreamID, event.GuildID, event.VoiceChannelID)
 			m.cancelAutoStopLocked(current.StreamID)
@@ -66,7 +75,15 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 		m.mu.Unlock()
 		return
 	}
+	if event.ExistingPresence && m.inFlightAutoStopStreamForVoiceLocked(event.GuildID, event.VoiceChannelID) != "" {
+		m.mu.Unlock()
+		return
+	}
 	if sourceStreamID := m.inFlightAutoStopStreamForVoiceLocked(event.GuildID, event.VoiceChannelID); sourceStreamID != "" {
+		if !autoStartAuthorityMatches(sourceStreamID, m.autoStopInFlight[sourceStreamID].assignmentEpoch, event) {
+			m.mu.Unlock()
+			return
+		}
 		// The Panel has already called our local /stop endpoint, so canceling
 		// the parent request at this point can interrupt its remaining service
 		// dispatch. Retain the rejoin intent and wait for that request to return
@@ -97,6 +114,10 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	} else {
 		m.mu.Lock()
 	}
+	if streamID != "" && !m.autoStartEventAuthorizedLocked(streamID, event) {
+		m.mu.Unlock()
+		return
+	}
 	if streamID == "" {
 		if m.shouldLogAutoStartLocked("no-candidate", now) {
 			log.Printf("Discord VC auto-start ignored: no matching waiting stream for guild=%s voice=%s configured_streams=%d", event.GuildID, event.VoiceChannelID, len(m.streamDefaults))
@@ -111,6 +132,18 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 		m.mu.Unlock()
 		return
 	}
+	if _, stopped := m.autoStartStopped[streamID]; stopped {
+		if event.ExistingPresence {
+			m.mu.Unlock()
+			return
+		}
+		delete(m.autoStartStopped, streamID)
+		delete(m.autoStartPending, streamID)
+	}
+	if m.autoStartRetries[streamID] != nil {
+		m.mu.Unlock()
+		return
+	}
 	if last, ok := m.autoStartPending[streamID]; ok && now.Sub(last) < m.autoStartCooldown {
 		m.mu.Unlock()
 		return
@@ -119,6 +152,7 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	starter := m.streamStarter
 	retryCtx, retryCancel := context.WithCancel(context.Background())
 	retry := &autoStartRetry{
+		assignmentEpoch:     m.streamDefaults[streamID].AssignmentEpoch,
 		cancel:              retryCancel,
 		reconnectGeneration: m.reconnectGeneration,
 		guildID:             event.GuildID,
@@ -130,6 +164,9 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 
 	go func() {
 		defer m.finishAutoStartRetry(streamID, retry)
+		if retryCtx.Err() != nil || !m.autoStartRetryStillValid(streamID, retry) {
+			return
+		}
 		if err := starter.StartStream(streamID); err != nil {
 			if isRetryableAutoStartError(err) {
 				logAutoStartRetryFailure(streamID, 1, err, true)
@@ -150,19 +187,14 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 				return
 			}
 			successor := m.matchingAutoStartStreamLocked(event.GuildID, event.VoiceChannelID)
-			if successor != "" && successor != streamID {
-				m.autoStartPending[successor] = time.Now().UTC()
-			}
 			m.mu.Unlock()
 			if successor == "" || successor == streamID {
 				log.Printf("Discord VC auto-start stale stream has no refreshed successor: old_stream=%s", streamID)
 				return
 			}
-			if retryErr := starter.StartStream(successor); retryErr != nil {
-				logAutoStartRetryFailure(successor, 1, retryErr, false)
-			} else {
-				log.Printf("Discord VC auto-start successor accepted by control panel for stream=%s (old_stream=%s)", successor, streamID)
-			}
+			// Refresh can synchronously evaluate existing occupants. Re-enter the
+			// same reservation path as Gateway events instead of dispatching twice.
+			m.VoiceUserJoined(event)
 			return
 		}
 		// This receipt means only that the Control Panel accepted the request;
@@ -247,7 +279,7 @@ func (m *Manager) autoStartRetryStillValid(streamID string, retry *autoStartRetr
 	if m.autoStartRetries[streamID] != retry || m.current.StreamID != "" || m.reconnectGeneration != retry.reconnectGeneration {
 		return false
 	}
-	return m.matchingAutoStartStreamLocked(retry.guildID, retry.voiceChannelID) == streamID
+	return m.streamDefaults[streamID].AssignmentEpoch == retry.assignmentEpoch && m.matchingAutoStartStreamLocked(retry.guildID, retry.voiceChannelID) == streamID
 }
 
 func (m *Manager) finishAutoStartRetry(streamID string, retry *autoStartRetry) {
@@ -301,4 +333,15 @@ func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) 
 		matched = streamID
 	}
 	return matched
+}
+
+func (m *Manager) autoStartEventAuthorizedLocked(streamID string, event discord.VoiceJoinEvent) bool {
+	return autoStartAuthorityMatches(streamID, m.streamDefaults[streamID].AssignmentEpoch, event)
+}
+
+func autoStartAuthorityMatches(streamID, epoch string, event discord.VoiceJoinEvent) bool {
+	if event.Authority == nil {
+		return epoch == ""
+	}
+	return event.Authority.StreamID == streamID && event.Authority.AssignmentEpoch == epoch
 }

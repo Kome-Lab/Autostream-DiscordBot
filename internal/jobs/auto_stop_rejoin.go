@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"github.com/example/autostream-discord-bot/internal/discord"
 	"log"
 	"strings"
 	"time"
@@ -11,10 +12,11 @@ import (
 // cancellation, so this intent is retained until the freshly rearmed waiting
 // stream can be reconciled or a bounded retry window proves it is not needed.
 type autoStopRejoinIntent struct {
-	GuildID        string
-	VoiceChannelID string
-	SourceStreamID string
-	Sequence       uint64
+	AssignmentEpoch string
+	GuildID         string
+	VoiceChannelID  string
+	SourceStreamID  string
+	Sequence        uint64
 }
 
 // inFlightAutoStopStreamForVoiceLocked finds the still-unanswered outbound
@@ -53,11 +55,16 @@ func (m *Manager) recordAutoStopRejoinIntentLocked(sourceStreamID, guildID, voic
 		return
 	}
 	m.rejoinIntentSequence++
+	epoch := m.currentAssignmentEpoch
+	if flight, ok := m.autoStopInFlight[sourceStreamID]; ok {
+		epoch = flight.assignmentEpoch
+	}
 	m.rejoinIntents[key] = autoStopRejoinIntent{
-		GuildID:        guildID,
-		VoiceChannelID: voiceChannelID,
-		SourceStreamID: sourceStreamID,
-		Sequence:       m.rejoinIntentSequence,
+		GuildID:         guildID,
+		VoiceChannelID:  voiceChannelID,
+		SourceStreamID:  sourceStreamID,
+		AssignmentEpoch: epoch,
+		Sequence:        m.rejoinIntentSequence,
 	}
 }
 
@@ -150,27 +157,15 @@ func (m *Manager) reconcileAutoStopRejoin(sourceStreamID string) {
 			continue
 		}
 		rearmed := m.matchingAutoStartStreamLocked(intent.GuildID, intent.VoiceChannelID)
-		if rearmed == "" || rearmed != sourceStreamID || m.streamStarter == nil {
+		if rearmed == "" || rearmed != sourceStreamID || m.streamStarter == nil || m.streamDefaults[rearmed].AssignmentEpoch != intent.AssignmentEpoch {
 			m.mu.Unlock()
 			continue
 		}
-		now := time.Now().UTC()
-		if last, pending := m.autoStartPending[rearmed]; pending && now.Sub(last) < m.autoStartCooldown {
-			delete(m.rejoinIntents, key)
-			m.mu.Unlock()
-			return
-		}
-		m.autoStartPending[rearmed] = now
-		m.lastEventAt = now
-		starter := m.streamStarter
 		delete(m.rejoinIntents, key)
+		delete(m.autoStartStopped, rearmed)
 		m.mu.Unlock()
+		m.VoiceUserJoined(discord.VoiceJoinEvent{GuildID: intent.GuildID, VoiceChannelID: intent.VoiceChannelID, UserID: "retained-rejoin", Authority: &discord.AutoStartAuthority{StreamID: rearmed, AssignmentEpoch: intent.AssignmentEpoch}})
 
-		go func() {
-			if err := starter.StartStream(rearmed); err != nil {
-				log.Printf("Discord VC auto-stop rejoin request failed for stream=%s: %v", rearmed, err)
-			}
-		}()
 		return
 	}
 

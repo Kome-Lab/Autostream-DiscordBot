@@ -85,6 +85,7 @@ func TestOwnVoiceStateDisconnectUpdatesStatus(t *testing.T) {
 	session := &discordgo.Session{State: discordgo.NewState()}
 	session.State.User = &discordgo.User{ID: "bot-01"}
 
+	client.session = session
 	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
 		VoiceState:   &discordgo.VoiceState{UserID: "bot-01", GuildID: "guild-01", ChannelID: ""},
 		BeforeUpdate: &discordgo.VoiceState{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01"},
@@ -116,6 +117,7 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	session := &discordgo.Session{State: discordgo.NewState()}
 	session.State.User = &discordgo.User{ID: "bot-01"}
 
+	client.session = session
 	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
 		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
 	})
@@ -124,6 +126,7 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 		t.Fatalf("voice join did not trigger auto-start event: %#v", sink.voiceJoin)
 	}
 
+	client.session = session
 	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
 		VoiceState: &discordgo.VoiceState{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-02"},
 	})
@@ -182,7 +185,9 @@ func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
 		// discordgo updates State in gateway order before it runs handlers, but
 		// handlers are asynchronous by default. Model the leave handler running
 		// first and the stale join handler running later.
+		client.session = session
 		client.onVoiceStateUpdate(session, left)
+		client.session = session
 		client.onVoiceStateUpdate(session, joined)
 
 		if len(sink.participants) != 1 || sink.participants[0].Present || sink.participants[0].UserID != "user-01" {
@@ -205,7 +210,9 @@ func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
 		apply(t, session, left)
 		apply(t, session, joined)
 
+		client.session = session
 		client.onVoiceStateUpdate(session, joined)
+		client.session = session
 		client.onVoiceStateUpdate(session, left)
 
 		if len(sink.participants) != 1 || !sink.participants[0].Present || sink.participants[0].UserID != "user-01" {
@@ -230,7 +237,9 @@ func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
 
 		// The later leave from voice-02 is not itself a target-VC leave. The
 		// delayed move is the only event that can remove this user from voice-01.
+		client.session = session
 		client.onVoiceStateUpdate(session, leftElsewhere)
+		client.session = session
 		client.onVoiceStateUpdate(session, movedAway)
 
 		if len(sink.participants) != 1 || sink.participants[0].Present || sink.participants[0].UserID != "user-01" {
