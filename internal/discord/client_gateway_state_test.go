@@ -113,7 +113,8 @@ func TestOwnVoiceStateDisconnectUpdatesStatus(t *testing.T) {
 
 func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	sink := &fakeEventSink{}
-	client := &RealClient{sink: sink}
+	targets := []AutoStartVoiceTarget{{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", AssignmentEpoch: "epoch-01"}}
+	client := &RealClient{sink: sink, autoStartTargets: targets}
 	session := &discordgo.Session{State: discordgo.NewState()}
 	session.State.User = &discordgo.User{ID: "bot-01"}
 
@@ -139,12 +140,13 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	// during a guild rebuild). Waiting for the cache to agree would drop the
 	// only event that can trigger the waiting stream.
 	knownGuildSink := &fakeEventSink{}
-	knownGuildClient := &RealClient{sink: knownGuildSink}
+	knownGuildClient := &RealClient{sink: knownGuildSink, autoStartTargets: targets}
 	knownGuildSession := &discordgo.Session{State: discordgo.NewState()}
 	knownGuildSession.State.User = &discordgo.User{ID: "bot-01"}
 	if err := knownGuildSession.State.GuildAdd(&discordgo.Guild{ID: "guild-01"}); err != nil {
 		t.Fatal(err)
 	}
+	knownGuildClient.session = knownGuildSession
 	knownGuildClient.onVoiceStateUpdate(knownGuildSession, &discordgo.VoiceStateUpdate{
 		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
 	})

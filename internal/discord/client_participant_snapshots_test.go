@@ -276,6 +276,7 @@ func TestOwnVoiceStateJoinDoesNotBecomeParticipant(t *testing.T) {
 	}
 	session := &discordgo.Session{State: discordgo.NewState()}
 	session.State.User = &discordgo.User{ID: "bot-01"}
+	client.session = session
 
 	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
 		VoiceState: &discordgo.VoiceState{UserID: "bot-01", GuildID: "guild-01", ChannelID: "voice-01"},
@@ -305,6 +306,7 @@ func TestMessageCreatePublishesOnlyActiveTextChannelMessages(t *testing.T) {
 	}
 	session := &discordgo.Session{State: discordgo.NewState()}
 	session.State.User = &discordgo.User{ID: "bot-01"}
+	client.session = session
 
 	client.onMessageCreate(session, &discordgo.MessageCreate{Message: &discordgo.Message{
 		ID:        "msg-ignored",

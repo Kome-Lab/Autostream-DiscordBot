@@ -149,7 +149,7 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	// because the snapshot is non-authoritative at this point. Once a job is
 	// active, retain the current-state fence so delayed joins cannot resurrect a
 	// participant that has already left.
-	currentStateAcceptsJoin := !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
+	currentStateAcceptsJoin := (job.StreamID == "" && currentVoiceChannelID == "") || !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
 	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && currentStateAcceptsJoin {
 		if job.StreamID != "" {
 			decision = "auto_start_join_candidate"
