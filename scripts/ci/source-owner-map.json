@@ -415,7 +415,7 @@
       },
       {
         "path": "internal/discord/client_gateway_state_test.go",
-        "sha256": "948464d2f5ba6b493ed5a6610d85fe5e342275cad96dc371803def32e579373e",
+        "sha256": "734f70cd9ec20fc324a54b1c40dbfc96f57e71f1ca5aa33f4647c999d6f0ce0e",
         "symbols": [
           "TestGatewayReconnectStatus",
           "TestLogVoiceStateDiagnosticRecordsSafeTransitionFields",
@@ -423,11 +423,11 @@
           "TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob",
           "TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder"
         ],
-        "physical_lines": 254
+        "physical_lines": 257
       },
       {
         "path": "internal/discord/client_participant_snapshots_test.go",
-        "sha256": "0eb7d548a61e6d8184f3c9b7b759f3a8d12342c155a3ac3debe004433f7afc7e",
+        "sha256": "eb5f5db69ee616b7e19f7d2e83c032797c4c6463ae65bd5ebd979da9e0e9383d",
         "symbols": [
           "TestAutoStartPresenceSyncEmitsExistingHumanParticipant",
           "TestDelayedTargetLeaveDeltaPreservesCurrentParticipant",

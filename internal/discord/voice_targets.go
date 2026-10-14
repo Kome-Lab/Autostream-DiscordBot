@@ -27,6 +27,18 @@ func (c *RealClient) SetAutoStartVoiceTargets(targets []AutoStartVoiceTarget) {
 	c.mu.Lock()
 	c.autoStartTargets = normalized
 	session := c.session
+	for key, origin := range c.unknownAutoStartJoins {
+		current := false
+		for _, target := range normalized {
+			if origin == session && key.StreamID == target.StreamID && key.AssignmentEpoch == target.AssignmentEpoch && key.GuildID == target.GuildID && key.VoiceChannelID == target.VoiceChannelID {
+				current = true
+				break
+			}
+		}
+		if !current {
+			delete(c.unknownAutoStartJoins, key)
+		}
+	}
 	c.mu.Unlock()
 	c.syncAutoStartVoiceMembers(session)
 }
@@ -40,6 +52,7 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 	c.mu.Lock()
 	targets := append([]AutoStartVoiceTarget(nil), c.autoStartTargets...)
 	sink := c.sink
+	connected := c.status.Connected
 	if session != nil && session != c.session {
 		c.mu.Unlock()
 		return
@@ -48,7 +61,7 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 		session = c.session
 	}
 	c.mu.Unlock()
-	if sink == nil || session == nil || session.State == nil || !session.State.TrackVoice || len(targets) == 0 {
+	if !connected || sink == nil || session == nil || session.State == nil || !session.State.TrackVoice || len(targets) == 0 {
 		return
 	}
 
@@ -72,17 +85,18 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 				if userID == "" || userID == selfUserID {
 					continue
 				}
-				if voiceState.Member != nil && voiceState.Member.User != nil && voiceState.Member.User.Bot {
+				member, _ := currentVoiceMemberLocked(guild, userID, voiceState.Member)
+				if member == nil || member.User.Bot {
 					continue
 				}
 				username := ""
-				if voiceState.Member != nil && voiceState.Member.User != nil {
-					username = strings.TrimSpace(voiceState.Member.Nick)
+				if member != nil {
+					username = strings.TrimSpace(member.Nick)
 					if username == "" {
-						username = strings.TrimSpace(voiceState.Member.User.GlobalName)
+						username = strings.TrimSpace(member.User.GlobalName)
 					}
 					if username == "" {
-						username = strings.TrimSpace(voiceState.Member.User.Username)
+						username = strings.TrimSpace(member.User.Username)
 					}
 				}
 				events = append(events, VoiceJoinEvent{
@@ -101,6 +115,7 @@ func (c *RealClient) syncAutoStartVoiceMembers(session *discordgo.Session) {
 	state.RUnlock()
 
 	for _, event := range events {
+		c.resolveAutoStartPresence(session, &event)
 		if c.autoStartAuthorityCurrent(session, event.Authority) {
 			sink.VoiceUserJoined(event)
 		}

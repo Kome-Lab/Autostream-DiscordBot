@@ -43,14 +43,14 @@ func TestUI188WaitingJoinColdCacheRequiresCurrentSelectedAuthority(t *testing.T)
 					t.Fatal(err)
 				}
 			}
-			client := &RealClient{sink: sink, session: session}
+			client := &RealClient{sink: sink, session: session, status: Status{Connected: true}}
 			if tc.selected {
 				client.autoStartTargets = []AutoStartVoiceTarget{{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", AssignmentEpoch: "epoch-01"}}
 			}
 			if tc.stale {
 				client.session = &discordgo.Session{State: discordgo.NewState()}
 			}
-			client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}})
+			client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "user-01", Bot: false}}}})
 			if got := sink.voiceJoin.UserID != ""; got != tc.want {
 				t.Fatalf("join emitted=%v, want=%v", got, tc.want)
 			}

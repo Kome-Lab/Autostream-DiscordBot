@@ -31,7 +31,10 @@ func (m *Manager) ReconcileGatewayCredential(reference string, selected bool, re
 	m.gatewayCredentialMu.Lock()
 	defer m.gatewayCredentialMu.Unlock()
 	if !selected {
-		m.gatewayCredentialReference, m.gatewayCredentialToken = "", ""
+		// Disconnect immediately, but keep the last reference-scoped credential.
+		// A rapid reassignment of that same reference cannot reacquire its active
+		// Panel lease. Current assignment authority is still required before use;
+		// a changed reference/fingerprint always resolves a new credential.
 		return m.ReconcileGateway(discord.Config{}, false)
 	}
 	if strings.TrimSpace(reference) == "" {
@@ -96,6 +99,11 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 			})
 		}
 	}
+	if len(m.streamDefaults) > 0 {
+		// A start can outlast the waiting projection. Retain only its last
+		// nonempty authority snapshot, not an additional auto-start candidate.
+		m.lastStreamDefaults = m.streamDefaults
+	}
 	for streamID := range m.autoStartPending {
 		if _, ok := m.streamDefaults[streamID]; !ok {
 			delete(m.autoStartPending, streamID)
@@ -108,7 +116,9 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 		}
 	}
 	for streamID, stopped := range m.autoStartStopped {
-		if next, ok := m.streamDefaults[streamID]; !ok || next != stopped {
+		// Absence means the waiting projection has not rearmed yet. It is not
+		// new authority and must not restart an explicitly stopped VC by presence.
+		if next, ok := m.streamDefaults[streamID]; ok && (next.AssignmentEpoch != stopped.AssignmentEpoch || next.GuildID != stopped.GuildID || next.VoiceChannelID != stopped.VoiceChannelID) {
 			delete(m.autoStartStopped, streamID)
 			delete(m.autoStartPending, streamID)
 		}

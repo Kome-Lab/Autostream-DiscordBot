@@ -138,6 +138,10 @@ jobs:
           CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
           CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
             go test -p 1 ./...
+          CGO_ENABLED=1 \
+          CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
+          CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+            go test -mod=readonly -p 1 -tags ui188_chain -count=1 -timeout=60s ./cmd/discord-bot -run '^TestUI188R4External(OpusRejectsMalformed|GatewayHandshake)$'
       - name: Race-test decomposed Discord packages with DAVE-linked DiscordGo
         timeout-minutes: 15
         env:

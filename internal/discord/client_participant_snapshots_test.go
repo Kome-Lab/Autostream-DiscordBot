@@ -67,7 +67,7 @@ func TestAutoStartPresenceSyncEmitsExistingHumanParticipant(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &fakeEventSink{}
-	client := &RealClient{session: session, sink: sink}
+	client := &RealClient{session: session, sink: sink, status: Status{Connected: true}}
 
 	client.SetAutoStartVoiceTargets([]AutoStartVoiceTarget{{
 		StreamID:       "stream-01",

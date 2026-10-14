@@ -47,6 +47,7 @@ func (c *RealClient) onGatewayDisconnect(session *discordgo.Session, _ *discordg
 		return
 	}
 	c.status.Connected = false
+	c.unknownAutoStartJoins = nil
 	sink := c.sink
 	job := c.job
 	voiceGeneration := c.voiceGeneration
@@ -137,6 +138,7 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	sink := c.sink
 	targets := append([]AutoStartVoiceTarget(nil), c.autoStartTargets...)
 	voiceGeneration := c.voiceGeneration
+	connected := c.status.Connected
 	c.mu.Unlock()
 	decision := "ignored"
 	defer func() {
@@ -150,7 +152,23 @@ func (c *RealClient) onVoiceStateUpdate(session *discordgo.Session, event *disco
 	// active, retain the current-state fence so delayed joins cannot resurrect a
 	// participant that has already left.
 	currentStateAcceptsJoin := (job.StreamID == "" && currentVoiceChannelID == "") || !currentVoiceStateKnown || currentVoiceChannelID == event.ChannelID
-	if sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && (event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID) && currentStateAcceptsJoin {
+	member, identityKnown := currentAutoStartMember(session, event.VoiceState)
+	human := member != nil && !member.User.Bot
+	newJoin := event.BeforeUpdate == nil || event.BeforeUpdate.ChannelID != event.ChannelID
+	c.discardObsoleteAutoStartJoins(session, event.VoiceState, identityKnown && (!human || newJoin))
+	if connected && selfUserID != "" && sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && newJoin && currentStateAcceptsJoin {
+		if !identityKnown {
+			c.rememberUnknownAutoStartJoin(session, event.VoiceState, targets)
+			// Member information can arrive between classification and recording
+			// this transition. Re-read current State so that race loses no join
+			// and leaves no stale transition to rearm a later stopped job.
+			c.syncAutoStartVoiceMembers(session)
+		}
+	}
+	if human && !newJoin {
+		c.syncAutoStartVoiceMembers(session)
+	}
+	if connected && selfUserID != "" && human && sink != nil && event.ChannelID != "" && event.UserID != "" && event.UserID != selfUserID && newJoin && currentStateAcceptsJoin {
 		if job.StreamID != "" {
 			decision = "auto_start_join_candidate"
 		}

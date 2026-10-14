@@ -114,13 +114,13 @@ func TestOwnVoiceStateDisconnectUpdatesStatus(t *testing.T) {
 func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	sink := &fakeEventSink{}
 	targets := []AutoStartVoiceTarget{{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01", AssignmentEpoch: "epoch-01"}}
-	client := &RealClient{sink: sink, autoStartTargets: targets}
+	client := &RealClient{sink: sink, status: Status{Connected: true}, autoStartTargets: targets}
 	session := &discordgo.Session{State: discordgo.NewState()}
 	session.State.User = &discordgo.User{ID: "bot-01"}
 
 	client.session = session
 	client.onVoiceStateUpdate(session, &discordgo.VoiceStateUpdate{
-		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "user-01", Bot: false}}},
 	})
 
 	if sink.voiceJoin.GuildID != "guild-01" || sink.voiceJoin.VoiceChannelID != "voice-01" || sink.voiceJoin.UserID != "user-01" {
@@ -140,7 +140,7 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	// during a guild rebuild). Waiting for the cache to agree would drop the
 	// only event that can trigger the waiting stream.
 	knownGuildSink := &fakeEventSink{}
-	knownGuildClient := &RealClient{sink: knownGuildSink, autoStartTargets: targets}
+	knownGuildClient := &RealClient{sink: knownGuildSink, status: Status{Connected: true}, autoStartTargets: targets}
 	knownGuildSession := &discordgo.Session{State: discordgo.NewState()}
 	knownGuildSession.State.User = &discordgo.User{ID: "bot-01"}
 	if err := knownGuildSession.State.GuildAdd(&discordgo.Guild{ID: "guild-01"}); err != nil {
@@ -148,7 +148,7 @@ func TestVoiceStateJoinTriggersAutoStartEventWithoutActiveJob(t *testing.T) {
 	}
 	knownGuildClient.session = knownGuildSession
 	knownGuildClient.onVoiceStateUpdate(knownGuildSession, &discordgo.VoiceStateUpdate{
-		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"},
+		VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "user-01", Bot: false}}},
 	})
 	if knownGuildSink.voiceJoin.UserID != "user-01" {
 		t.Fatalf("join in a known guild with a cold VoiceStates cache must trigger auto-start: %#v", knownGuildSink.voiceJoin)
@@ -175,11 +175,12 @@ func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
 	t.Run("ultimately empty ignores delayed join", func(t *testing.T) {
 		sink := &fakeEventSink{}
 		client := &RealClient{
-			sink: sink,
-			job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+			sink:   sink,
+			status: Status{Connected: true},
+			job:    VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
 		}
 		session := newSession(t, nil)
-		joined := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}}
+		joined := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "user-01", Bot: false}}}}
 		left := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: ""}}
 		apply(t, session, joined)
 		apply(t, session, left)
@@ -203,12 +204,13 @@ func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
 	t.Run("ultimately occupied ignores delayed leave", func(t *testing.T) {
 		sink := &fakeEventSink{}
 		client := &RealClient{
-			sink: sink,
-			job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+			sink:   sink,
+			status: Status{Connected: true},
+			job:    VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
 		}
 		session := newSession(t, []*discordgo.VoiceState{{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}})
 		left := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: ""}}
-		joined := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}}
+		joined := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01", Member: &discordgo.Member{GuildID: "guild-01", User: &discordgo.User{ID: "user-01", Bot: false}}}}
 		apply(t, session, left)
 		apply(t, session, joined)
 
@@ -228,8 +230,9 @@ func TestVoiceStateUpdateIgnoresHandlersThatLostGatewayOrder(t *testing.T) {
 	t.Run("move away then leave elsewhere still removes target participant", func(t *testing.T) {
 		sink := &fakeEventSink{}
 		client := &RealClient{
-			sink: sink,
-			job:  VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
+			sink:   sink,
+			status: Status{Connected: true},
+			job:    VoiceJob{StreamID: "stream-01", GuildID: "guild-01", VoiceChannelID: "voice-01"},
 		}
 		session := newSession(t, []*discordgo.VoiceState{{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-01"}})
 		movedAway := &discordgo.VoiceStateUpdate{VoiceState: &discordgo.VoiceState{UserID: "user-01", GuildID: "guild-01", ChannelID: "voice-02"}}

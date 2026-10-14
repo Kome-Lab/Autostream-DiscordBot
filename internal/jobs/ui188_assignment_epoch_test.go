@@ -67,13 +67,22 @@ func TestUI188CredentialReferenceResolvedOnceWhileSelected(t *testing.T) {
 	if err := manager.ReconcileGatewayCredential("", false, nil); err != nil {
 		t.Fatal(err)
 	}
+	if voice.selected || voice.token != "" {
+		t.Fatal("unselected Gateway retained a usable configuration")
+	}
+	if err := manager.ReconcileGatewayCredential("selected/ref/rev1", true, func() (string, error) {
+		t.Fatal("same reassigned reference attempted to reacquire its active lease")
+		return "", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := manager.ReconcileGatewayCredential("selected/ref/rev2", true, resolve); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 2 {
 		t.Fatal("new selection did not resolve current credential")
 	}
-	if voice.reconciles != 5 || !voice.selected || voice.token != "test-only-token" {
+	if voice.reconciles != 6 || !voice.selected || voice.token != "test-only-token" {
 		t.Fatalf("Gateway did not receive each selection: %+v", voice)
 	}
 }

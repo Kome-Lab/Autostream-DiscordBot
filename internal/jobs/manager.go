@@ -16,6 +16,7 @@ type Manager struct {
 	gatewayCredentialMu         sync.Mutex
 	gatewayCredentialReference  string
 	gatewayCredentialToken      string
+	gatewayProfileAuthority     map[string]GatewayProfileAuthority
 	reporter                    EventReporter
 	streamStarter               StreamStarter
 	streamStopper               StreamStopper
@@ -26,6 +27,7 @@ type Manager struct {
 	disconnected                bool
 	defaults                    VoiceDefaults
 	streamDefaults              map[string]VoiceDefaults
+	lastStreamDefaults          map[string]VoiceDefaults // Last nonempty authority snapshot, never start candidates.
 	autoStartPending            map[string]time.Time
 	autoStartStopped            map[string]VoiceDefaults
 	autoStartRetries            map[string]*autoStartRetry
@@ -141,6 +143,9 @@ func (m *Manager) Start(job discord.VoiceJob) error {
 	}
 	m.cancelAutoStopLocked(job.StreamID)
 	assignmentEpoch := m.streamDefaults[job.StreamID].AssignmentEpoch
+	if _, waiting := m.streamDefaults[job.StreamID]; !waiting {
+		assignmentEpoch = m.lastStreamDefaults[job.StreamID].AssignmentEpoch
+	}
 	m.mu.Unlock()
 
 	if err := m.voice.JoinVoice(job); err != nil {
@@ -240,7 +245,13 @@ func (m *Manager) Stop(streamID string) error {
 	}
 	previousWorkerRetry := m.workerRetry
 	m.workerRetry = nil
-	m.autoStartStopped[currentStreamID] = m.streamDefaults[currentStreamID]
+	// Waiting targets omit live/stopping jobs. Keep the stopped execution's
+	// authority from the actual job, including across that runtime snapshot gap.
+	m.autoStartStopped[currentStreamID] = VoiceDefaults{
+		AssignmentEpoch: m.currentAssignmentEpoch,
+		GuildID:         m.current.GuildID,
+		VoiceChannelID:  m.current.VoiceChannelID,
+	}
 	m.current = discord.VoiceJob{}
 	m.stopping = false
 	m.startedAt = time.Time{}

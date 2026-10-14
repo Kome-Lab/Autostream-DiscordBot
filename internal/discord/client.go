@@ -52,20 +52,21 @@ func (c Config) Validate() error {
 }
 
 type RealClient struct {
-	cfg              Config
-	session          *discordgo.Session
-	voice            *discordgo.VoiceConnection
-	sink             EventSink
-	autoStartTargets []AutoStartVoiceTarget
-	forward          AudioForwarder
-	source           string
-	audioStop        chan struct{}
-	audioDone        chan struct{}
-	daveCancel       context.CancelFunc
-	ssrcUsers        map[uint32]string
-	audioSpeakers    map[string]time.Time
-	mu               sync.Mutex
-	gatewayMu        sync.Mutex
+	cfg                   Config
+	session               *discordgo.Session
+	voice                 *discordgo.VoiceConnection
+	sink                  EventSink
+	autoStartTargets      []AutoStartVoiceTarget
+	unknownAutoStartJoins map[pendingAutoStartJoin]*discordgo.Session
+	forward               AudioForwarder
+	source                string
+	audioStop             chan struct{}
+	audioDone             chan struct{}
+	daveCancel            context.CancelFunc
+	ssrcUsers             map[uint32]string
+	audioSpeakers         map[string]time.Time
+	mu                    sync.Mutex
+	gatewayMu             sync.Mutex
 	// speakerDispatchMu serializes active-speaker callbacks with voice job
 	// transitions. Callers must never hold mu while acquiring this gate or
 	// invoking the external sink; Manager.Status takes the inverse Manager ->
@@ -112,6 +113,8 @@ func (client *RealClient) newGatewaySession(cfg Config) (*discordgo.Session, err
 	session.AddHandler(client.onGatewayResumed)
 	session.AddHandler(client.onGuildCreate)
 	session.AddHandler(client.onVoiceStateUpdate)
+	session.AddHandler(client.onAutoStartMemberAdd)
+	session.AddHandler(client.onAutoStartMemberUpdate)
 	session.AddHandler(client.onMessageCreate)
 	return session, nil
 }

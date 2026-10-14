@@ -492,16 +492,38 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 
 func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager *jobs.Manager, cfg control.RuntimeConfig) error {
 	streams, _ := primaryDiscordAssignmentStreams(cfg)
+	current := map[string]string{}
+	mapped := map[string]string{}
+	for _, assignment := range cfg.Assignments {
+		if streams[assignment.StreamID] && assignment.ServiceID == cfg.Service.ServiceID && assignment.ServiceType == control.ServiceType && assignment.AssignmentRole == "primary" {
+			current[assignment.StreamID] = assignment.AssignedAt.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	for streamID := range streams {
+		if mapping, ok := cfg.DiscordConfigForStream(streamID); ok {
+			mapped[streamID] = strings.TrimSpace(mapping.DiscordConfigID)
+		}
+	}
+	profileID, selected := manager.GatewayProfileForAssignments(current, mapped, len(cfg.StreamDiscordConfigs) != 0)
 	if len(streams) == 0 {
 		return manager.ReconcileGatewayCredential("", false, nil)
 	}
-	secretName := discordBotTokenSecretNameFromRuntimeConfig(cfg)
-	if secretName == "" {
+	var profile control.RuntimeProfile
+	matches := 0
+	for _, candidate := range cfg.Profiles["discord_config"] {
+		if selected && candidate.ID == profileID {
+			profile = candidate
+			matches++
+		}
+	}
+	secretName := stringConfig(profile.Config, "bot_token_secret_name")
+	fingerprint := stringConfig(profile.Config, "bot_token_fingerprint")
+	if !selected || matches != 1 || !profileBelongsToService(profile, cfg.Service.ServiceID) || secretName == "" || fingerprint == "" {
 		manager.SetStreamVoiceDefaults(nil)
 		_ = manager.ReconcileGateway(discordclient.Config{}, false)
 		return errors.New("selected Bot credential reference unavailable")
 	}
-	return manager.ReconcileGatewayCredential(cfg.Service.ServiceID+"/"+secretName+"/"+discordBotTokenFingerprintFromRuntimeConfig(cfg), true, func() (string, error) {
+	return manager.ReconcileGatewayCredential(cfg.Service.ServiceID+"/"+secretName+"/"+fingerprint, true, func() (string, error) {
 		secret, err := client.ResolveRuntimeSecret(ctx, secretName)
 		return secret.Value, err
 	})
@@ -601,19 +623,52 @@ func primaryDiscordAssignmentStreams(cfg control.RuntimeConfig) (map[string]bool
 }
 
 func discordBotTokenFingerprintFromRuntimeConfig(cfg control.RuntimeConfig) string {
-	if profile, ok := firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID); ok {
+	if profile, ok := discordGatewayRuntimeProfile(cfg); ok {
 		return stringConfig(profile.Config, "bot_token_fingerprint")
 	}
 	return ""
 }
 
 func discordBotTokenSecretNameFromRuntimeConfig(cfg control.RuntimeConfig) string {
-	if profile, ok := firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID); ok {
+	if profile, ok := discordGatewayRuntimeProfile(cfg); ok {
 		if value := stringConfig(profile.Config, "bot_token_secret_name"); value != "" {
 			return value
 		}
 	}
 	return ""
+}
+
+// Current per-stream mappings are authority for the selected Gateway credential.
+// A stale profile belonging to this same service must not win by list order.
+func discordGatewayRuntimeProfile(cfg control.RuntimeConfig) (control.RuntimeProfile, bool) {
+	if len(cfg.StreamDiscordConfigs) == 0 {
+		return firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID)
+	}
+	streams, _ := primaryDiscordAssignmentStreams(cfg)
+	selected := ""
+	for streamID := range streams {
+		mapping, ok := cfg.DiscordConfigForStream(streamID)
+		id := strings.TrimSpace(mapping.DiscordConfigID)
+		if !ok || id == "" || (selected != "" && selected != id) {
+			return control.RuntimeProfile{}, false
+		}
+		selected = id
+	}
+	if selected == "" {
+		return control.RuntimeProfile{}, false
+	}
+	var match control.RuntimeProfile
+	found := false
+	for _, profile := range cfg.Profiles["discord_config"] {
+		if strings.TrimSpace(profile.ID) != selected || !profileBelongsToService(profile, cfg.Service.ServiceID) {
+			continue
+		}
+		if found { // Ambiguous duplicate IDs must not select a secret by list order.
+			return control.RuntimeProfile{}, false
+		}
+		match, found = profile, true
+	}
+	return match, found
 }
 
 func firstRuntimeProfileForService(profiles []control.RuntimeProfile, serviceID string) (control.RuntimeProfile, bool) {
