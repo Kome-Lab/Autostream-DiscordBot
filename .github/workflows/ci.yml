@@ -142,6 +142,13 @@ jobs:
           CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
           CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
             go test -mod=readonly -p 1 -tags ui188_chain -count=1 -timeout=60s ./cmd/discord-bot -run '^TestUI188R4External(OpusRejectsMalformed|GatewayHandshake)$'
+          CGO_ENABLED=1 \
+          CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
+          CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+            go test -mod=readonly -p 1 -tags ui188_chain -count=1 -timeout=60s ./cmd/discord-bot -run '^TestUI188R9StaleAuthoritySeam$' -json | tee "$RUNNER_TEMP/ui188-r9-stale-authority.json"
+          jq -s -e '([.[]|select(.Action=="skip" or .Action=="fail")]|length)==0 and ([.[]|select(.Action=="pass" and .Test=="TestUI188R9StaleAuthoritySeam")]|length)==1' "$RUNNER_TEMP/ui188-r9-stale-authority.json"
+          go list -json ./internal/discord > "$RUNNER_TEMP/ui188-r9-production-files.json"
+          jq -e '(.GoFiles|index("ui188_chain_voice_linux.go"))==null and (.IgnoredGoFiles|index("ui188_chain_voice_linux.go"))!=null' "$RUNNER_TEMP/ui188-r9-production-files.json"
       - name: Race-test decomposed Discord packages with DAVE-linked DiscordGo
         timeout-minutes: 15
         env:

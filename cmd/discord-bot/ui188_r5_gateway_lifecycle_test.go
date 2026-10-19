@@ -29,13 +29,20 @@ func TestUI188R5RuntimeGatewayActiveProjectionKeepsExactAuthority(t *testing.T) 
 	var callsMu sync.Mutex
 	resolved := func() []string { callsMu.Lock(); defer callsMu.Unlock(); return append([]string(nil), calls...) }
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
+		var body struct {
+			SecretName string                                  `json:"secret_name"`
+			Version    int                                     `json:"current_discord_binding_version"`
+			Binding    control.CurrentDiscordCredentialBinding `json:"current_discord_binding"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
 		callsMu.Lock()
 		defer callsMu.Unlock()
-		calls = append(calls, body["secret_name"])
+		if body.Version != 1 || body.Binding.SecretName != body.SecretName || body.Binding.StreamID != "s" {
+			t.Error("current resolver tuple was not sent")
+		}
+		calls = append(calls, body.SecretName)
 		if len(calls) > 1 {
 			w.WriteHeader(409)
 			_, _ = w.Write([]byte(`{"code":"runtime_secret_lease_active"}`))
@@ -46,9 +53,11 @@ func TestUI188R5RuntimeGatewayActiveProjectionKeepsExactAuthority(t *testing.T) 
 	defer server.Close()
 	client := control.Client{Config: control.Config{ControlPanelURL: server.URL, Token: "test-only-control", ServiceID: "own", ServiceName: "own", ServicePublicURL: "https://bot.example.com"}}
 	profile := func(id, owner string) control.RuntimeProfile {
-		return control.RuntimeProfile{ID: id, Config: map[string]any{"service_id": owner, "bot_token_secret_name": "secret-" + id, "bot_token_fingerprint": "fp-" + id}}
+		return control.RuntimeProfile{ID: id, Kind: "discord_config", Config: map[string]any{"service_id": owner, "bot_token_secret_name": "secret-" + id, "bot_token_fingerprint": "fp-" + id}}
 	}
 	base := control.RuntimeConfig{Service: control.RegisteredService{ServiceID: "own"}, Assignments: []control.StreamServiceAssignment{{StreamID: "s", ServiceID: "own", ServiceType: control.ServiceType, AssignmentRole: "primary", AssignedAt: time.Unix(100, 0)}}, StreamDiscordConfigs: []control.StreamDiscordConfig{{StreamID: "s", AssignmentRole: "primary", DiscordConfigID: "new", GuildID: "guild", VoiceChannelID: "voice"}}, Profiles: map[string][]control.RuntimeProfile{"discord_config": {profile("old", "own"), profile("new", "own")}}}
+	base.Service.ServiceType, base.Service.CurrentStreamID = control.ServiceType, "s"
+	base.CurrentDiscordBindings = &control.CurrentDiscordBindings{Version: 1, Bindings: []control.CurrentDiscordCredentialBinding{{StreamID: "s", ServiceID: "own", ServiceType: control.ServiceType, AssignmentRole: "primary", AssignmentEpoch: time.Unix(100, 0), ProfileID: "new", ProfileOwnerServiceID: "own", SecretName: "secret-new", Fingerprint: "fp-new", Ready: true}}}
 	voice := &ui188R5Gateway{}
 	m := jobs.NewManager(voice)
 	if err := reconcileRuntimeGateway(t.Context(), client, m, base); err != nil {
@@ -85,8 +94,9 @@ func TestUI188R5RuntimeGatewayActiveProjectionKeepsExactAuthority(t *testing.T) 
 			c.Profiles = map[string][]control.RuntimeProfile{"discord_config": {profile("old", "own"), profile("new", "own")}}
 			delete(c.Profiles["discord_config"][1].Config, "bot_token_fingerprint")
 		}},
-		{"wrong mapping", func(c *control.RuntimeConfig) {
+		{"other waiting mapping without explicit current authority", func(c *control.RuntimeConfig) {
 			c.StreamDiscordConfigs = []control.StreamDiscordConfig{{StreamID: "other", AssignmentRole: "primary", DiscordConfigID: "old"}}
+			c.CurrentDiscordBindings = nil
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,6 +124,8 @@ func TestUI188R5RuntimeGatewayActiveProjectionKeepsExactAuthority(t *testing.T) 
 	rotated := base
 	rotated.Profiles = map[string][]control.RuntimeProfile{"discord_config": {profile("old", "own"), profile("new", "own")}}
 	rotated.Profiles["discord_config"][1].Config["bot_token_fingerprint"] = "fp-rotated"
+	rotated.CurrentDiscordBindings = &control.CurrentDiscordBindings{Version: 1, Bindings: append([]control.CurrentDiscordCredentialBinding(nil), base.CurrentDiscordBindings.Bindings...)}
+	rotated.CurrentDiscordBindings.Bindings[0].Fingerprint = "fp-rotated"
 	if err := reconcileRuntimeGateway(t.Context(), client, m, rotated); err == nil || voice.selected || voice.token != "" || len(resolved()) != 2 {
 		t.Fatal("actual HTTP409 rotation reused cached token")
 	}

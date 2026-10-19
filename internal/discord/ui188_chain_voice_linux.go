@@ -40,3 +40,149 @@ func (c *RealClient) UI188ControlledVoice(job VoiceJob) (chan<- *discordgo.Packe
 	go func() { defer close(done); c.forwardOpus(job, generation, packets, stop, forwarder, source) }()
 	return packets, nil
 }
+
+type UI188GatewayRef struct {
+	owner   *RealClient
+	session *discordgo.Session
+	target  AutoStartVoiceTarget
+}
+
+func (c *RealClient) UI188CaptureGatewayRef(streamID string) (*UI188GatewayRef, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil || !c.status.Connected || c.job.StreamID != "" || c.sink == nil {
+		return nil, errors.New("ui188 capture requires connected waiting Gateway")
+	}
+	var result *UI188GatewayRef
+	for _, target := range c.autoStartTargets {
+		if target.StreamID != streamID {
+			continue
+		}
+		if result != nil || target.AssignmentEpoch == "" || target.GuildID == "" || target.VoiceChannelID == "" {
+			return nil, errors.New("ui188 capture requires one authoritative target")
+		}
+		result = &UI188GatewayRef{owner: c, session: c.session, target: target}
+	}
+	if result == nil {
+		return nil, errors.New("ui188 waiting target missing")
+	}
+	return result, nil
+}
+
+func (c *RealClient) ui188RefCurrentLocked(ref *UI188GatewayRef) bool {
+	if ref == nil || ref.owner != c || ref.session == nil || ref.session != c.session ||
+		!c.status.Connected || c.job.StreamID != "" || c.sink == nil {
+		return false
+	}
+	for _, target := range c.autoStartTargets {
+		if target == ref.target {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *RealClient) UI188GatewayRefCurrent(ref *UI188GatewayRef) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ui188RefCurrentLocked(ref)
+}
+
+func (c *RealClient) UI188GatewayVoiceLocation(ref *UI188GatewayRef, userID string) (string, error) {
+	if !c.UI188GatewayRefCurrent(ref) {
+		return "", errors.New("ui188 current Gateway missing")
+	}
+	if ref.session.State == nil {
+		return "", errors.New("ui188 SDK State missing")
+	}
+	ref.session.State.RLock()
+	tracked := ref.session.State.TrackVoice
+	ref.session.State.RUnlock()
+	if !tracked {
+		return "", errors.New("ui188 SDK voice tracking disabled")
+	}
+	channel, _ := currentTrackedVoiceChannel(ref.session, ref.target.GuildID, userID)
+	if channel == "" {
+		return "absent", nil
+	}
+	if channel == ref.target.VoiceChannelID {
+		return "target", nil
+	}
+	return "other", nil
+}
+
+func (ref *UI188GatewayRef) UI188MatchesCapturedJoin(event VoiceJoinEvent) bool {
+	return ref != nil && event.Authority != nil &&
+		event.Authority.StreamID == ref.target.StreamID &&
+		event.Authority.AssignmentEpoch == ref.target.AssignmentEpoch &&
+		event.GuildID == ref.target.GuildID && event.VoiceChannelID == ref.target.VoiceChannelID
+}
+
+func (c *RealClient) ui188ReplayContext(old, current *UI188GatewayRef) (EventSink, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if old == nil || old.owner != c || old.session == nil || !c.ui188RefCurrentLocked(current) ||
+		old.session == current.session || old.target.StreamID != current.target.StreamID ||
+		old.target.GuildID != current.target.GuildID || old.target.VoiceChannelID != current.target.VoiceChannelID ||
+		old.target.AssignmentEpoch == current.target.AssignmentEpoch {
+		return nil, errors.New("ui188 replay requires real replacement session and epoch")
+	}
+	return c.sink, nil
+}
+
+func (c *RealClient) UI188ReplayReady(old, current *UI188GatewayRef) bool {
+	_, err := c.ui188ReplayContext(old, current)
+	return err == nil // Test preconditions only; not a product rejection verdict.
+}
+
+func (c *RealClient) UI188CurrentHumanKnown(current *UI188GatewayRef, userID string) bool {
+	if !c.UI188GatewayRefCurrent(current) {
+		return false
+	}
+	_, err := ui188CurrentHuman(current, userID)
+	return err == nil
+}
+
+// Reads the actual current SDK cache; it never inserts a member or voice state.
+func ui188CurrentHuman(current *UI188GatewayRef, userID string) (*discordgo.VoiceStateUpdate, error) {
+	state := &discordgo.VoiceState{GuildID: current.target.GuildID,
+		ChannelID: current.target.VoiceChannelID, UserID: userID}
+	member, known := currentAutoStartMember(current.session, state)
+	if !known || member == nil || member.User == nil || member.User.Bot ||
+		userID == "" || userID == sessionUserID(current.session) {
+		return nil, errors.New("ui188 replay requires verified current human")
+	}
+	// Event has no BeforeUpdate: a genuine new-join-shaped input. No SDK cache write.
+	return &discordgo.VoiceStateUpdate{VoiceState: state}, nil
+}
+
+func (c *RealClient) UI188ReplayOldSession(old, current *UI188GatewayRef, userID string) error {
+	if _, err := c.ui188ReplayContext(old, current); err != nil {
+		return err
+	}
+	event, err := ui188CurrentHuman(current, userID)
+	if err != nil {
+		return err
+	}
+	// Do not pre-reject old.session here: production handler must receive it.
+	c.onVoiceStateUpdate(old.session, event)
+	return nil // Only means handler returned; external counters determine the verdict.
+}
+
+func (c *RealClient) UI188ReplayOldEpoch(old, current *UI188GatewayRef, held VoiceJoinEvent) error {
+	sink, err := c.ui188ReplayContext(old, current)
+	if err != nil {
+		return err
+	}
+	if !old.UI188MatchesCapturedJoin(held) {
+		return errors.New("ui188 captured join mismatch")
+	}
+	if _, err := ui188CurrentHuman(current, held.UserID); err != nil {
+		return err
+	}
+	// held.Authority is the immutable event observed BEFORE reassignment.
+	// Do NOT replace it with current.target, and do NOT pre-reject it in this hook.
+	// Real Manager.VoiceUserJoined must perform the epoch rejection.
+	sink.VoiceUserJoined(held) // c.mu is not held.
+	return nil
+}

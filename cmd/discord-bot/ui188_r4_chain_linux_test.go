@@ -339,7 +339,12 @@ func TestUI188R4NodeChild(t *testing.T) {
 	defer cancel()
 	trace := newUI188CredentialTrace(cfg.ServiceID)
 	defer trace.file.Close()
-	client := control.Client{Config: cfg, HTTP: &http.Client{Transport: trace, Timeout: 30 * time.Second}}
+	heartbeatTransport, heartbeatRecovery, closeHeartbeatTrace, err := newUI188MC12Heartbeat(cfg.ServiceID, trace)
+	if err != nil {
+		t.Fatal("test-only bounded heartbeat policy unavailable")
+	}
+	defer closeHeartbeatTrace()
+	client := control.Client{Config: cfg, HTTP: ui188HBHTTPClient(heartbeatTransport)}
 	if err := client.Register(ctx); err != nil {
 		t.Fatalf("real Panel registration: %v", err)
 	}
@@ -369,9 +374,11 @@ func TestUI188R4NodeChild(t *testing.T) {
 	discordgo.EndpointGatewayBot = discordgo.EndpointGateway
 	t.Cleanup(func() { discordgo.EndpointGateway, discordgo.EndpointGatewayBot = oldGateway, oldBot })
 	manager := jobs.NewManagerWithReporter(voice, buildWorkerReporter())
-	voice.SetEventSink(manager)
+	r9 := &ui188R9HeldSink{Manager: manager, voice: voice.RealClient, starts: map[string]uint64{}}
+	voice.SetEventSink(r9)
+	mux.HandleFunc("/r9/stale-authority", r9.control)
 	controller := controlStreamStarter{client: client}
-	manager.SetStreamStarter(controller)
+	manager.SetStreamStarter(ui188R9CountedStarter{sink: r9, next: controller})
 	manager.SetStreamStopper(controller)
 	refresh := func() error {
 		return manager.RefreshRuntimeConfig(func() error {
@@ -408,8 +415,8 @@ func TestUI188R4NodeChild(t *testing.T) {
 			if err := refresh(); err != nil {
 				t.Fatalf("real runtime refresh: %v", err)
 			}
-			if err := client.HeartbeatWithMetrics(ctx, "online", manager.CurrentStreamID(), manager.Metrics()); err != nil {
-				t.Fatalf("real heartbeat: %v", err)
+			if err := heartbeatRecovery.Tick(ctx, client, manager.CurrentStreamID(), manager.Metrics()); err != nil {
+				t.Fatalf("bounded real heartbeat: %v", err)
 			}
 		}
 	}

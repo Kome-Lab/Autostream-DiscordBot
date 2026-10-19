@@ -469,6 +469,12 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 			}
 			cfg, err := client.RuntimeConfig(ctx)
 			if err != nil {
+				var rejected control.ControlPanelError
+				if errors.Is(err, control.ErrInvalidCurrentDiscordBinding) || (errors.As(err, &rejected) && (rejected.StatusCode == http.StatusUnauthorized || rejected.StatusCode == http.StatusForbidden)) {
+					manager.SetStreamVoiceDefaults(nil)
+					manager.GatewayProfileForAssignments(nil, nil, true)
+					_ = manager.ReconcileGatewayCredential("", false, nil)
+				}
 				log.Printf("control panel runtime config refresh failed: %v", err)
 				return err
 			}
@@ -491,40 +497,25 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 }
 
 func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager *jobs.Manager, cfg control.RuntimeConfig) error {
-	streams, _ := primaryDiscordAssignmentStreams(cfg)
-	current := map[string]string{}
-	mapped := map[string]string{}
-	for _, assignment := range cfg.Assignments {
-		if streams[assignment.StreamID] && assignment.ServiceID == cfg.Service.ServiceID && assignment.ServiceType == control.ServiceType && assignment.AssignmentRole == "primary" {
-			current[assignment.StreamID] = assignment.AssignedAt.UTC().Format(time.RFC3339Nano)
-		}
+	authority, err := currentDiscordGatewayAuthority(cfg, client.Config.ServiceID)
+	if err != nil {
+		manager.SetStreamVoiceDefaults(nil)
+		manager.GatewayProfileForAssignments(nil, nil, true)
+		_ = manager.ReconcileGatewayCredential("", false, nil)
+		return err
 	}
-	for streamID := range streams {
-		if mapping, ok := cfg.DiscordConfigForStream(streamID); ok {
-			mapped[streamID] = strings.TrimSpace(mapping.DiscordConfigID)
-		}
-	}
-	profileID, selected := manager.GatewayProfileForAssignments(current, mapped, len(cfg.StreamDiscordConfigs) != 0)
-	if len(streams) == 0 {
+	profileID, selected := manager.GatewayProfileForAssignments(authority.current, authority.mapped, true)
+	if len(authority.current) == 0 {
 		return manager.ReconcileGatewayCredential("", false, nil)
 	}
-	var profile control.RuntimeProfile
-	matches := 0
-	for _, candidate := range cfg.Profiles["discord_config"] {
-		if selected && candidate.ID == profileID {
-			profile = candidate
-			matches++
-		}
-	}
-	secretName := stringConfig(profile.Config, "bot_token_secret_name")
-	fingerprint := stringConfig(profile.Config, "bot_token_fingerprint")
-	if !selected || matches != 1 || !profileBelongsToService(profile, cfg.Service.ServiceID) || secretName == "" || fingerprint == "" {
+	if !selected || profileID != authority.binding.ProfileID {
 		manager.SetStreamVoiceDefaults(nil)
-		_ = manager.ReconcileGateway(discordclient.Config{}, false)
+		_ = manager.ReconcileGatewayCredential("", false, nil)
 		return errors.New("selected Bot credential reference unavailable")
 	}
-	return manager.ReconcileGatewayCredential(cfg.Service.ServiceID+"/"+secretName+"/"+fingerprint, true, func() (string, error) {
-		secret, err := client.ResolveRuntimeSecret(ctx, secretName)
+	binding := authority.binding
+	return manager.ReconcileGatewayCredential(cfg.Service.ServiceID+"/"+binding.SecretName+"/"+binding.Fingerprint, true, func() (string, error) {
+		secret, err := client.ResolveRuntimeSecretForCurrentBinding(ctx, binding)
 		return secret.Value, err
 	})
 }
@@ -641,6 +632,10 @@ func discordBotTokenSecretNameFromRuntimeConfig(cfg control.RuntimeConfig) strin
 // Current per-stream mappings are authority for the selected Gateway credential.
 // A stale profile belonging to this same service must not win by list order.
 func discordGatewayRuntimeProfile(cfg control.RuntimeConfig) (control.RuntimeProfile, bool) {
+	if cfg.CurrentDiscordBindingsPresent || cfg.CurrentDiscordBindings != nil {
+		authority, err := currentDiscordGatewayAuthority(cfg, cfg.Service.ServiceID)
+		return authority.profile, err == nil && authority.binding.ProfileID != ""
+	}
 	if len(cfg.StreamDiscordConfigs) == 0 {
 		return firstRuntimeProfileForService(cfg.Profiles["discord_config"], cfg.Service.ServiceID)
 	}

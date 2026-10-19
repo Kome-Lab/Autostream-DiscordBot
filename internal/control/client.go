@@ -151,10 +151,12 @@ type Heartbeat struct {
 }
 
 type RuntimeConfig struct {
-	Service              RegisteredService           `json:"service"`
-	Assignments          []StreamServiceAssignment   `json:"assignments"`
-	Profiles             map[string][]RuntimeProfile `json:"profiles"`
-	StreamDiscordConfigs []StreamDiscordConfig       `json:"stream_discord_configs,omitempty"`
+	Service                       RegisteredService           `json:"service"`
+	Assignments                   []StreamServiceAssignment   `json:"assignments"`
+	Profiles                      map[string][]RuntimeProfile `json:"profiles"`
+	StreamDiscordConfigs          []StreamDiscordConfig       `json:"stream_discord_configs,omitempty"`
+	CurrentDiscordBindings        *CurrentDiscordBindings     `json:"current_discord_bindings,omitempty"`
+	CurrentDiscordBindingsPresent bool                        `json:"-"`
 }
 
 type RegisteredService struct {
