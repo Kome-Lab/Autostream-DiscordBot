@@ -47,6 +47,30 @@ type UI188GatewayRef struct {
 	target  AutoStartVoiceTarget
 }
 
+// UI188SynchronousGatewayBarrier selects deterministic SDK dispatch before a
+// fixture connects. An ordered member-update marker then proves all earlier
+// production typed handlers completed; SDK cache mutation alone cannot do so.
+func (c *RealClient) UI188SynchronousGatewayBarrier(userID string) (<-chan struct{}, error) {
+	c.gatewayMu.Lock()
+	defer c.gatewayMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil || c.status.Connected || c.job.StreamID != "" || strings.TrimSpace(userID) == "" {
+		return nil, errors.New("ui188 synchronous barrier requires an idle unconnected Gateway")
+	}
+	barrier := make(chan struct{}, 16)
+	c.session.SyncEvents = true
+	c.session.AddHandler(func(_ *discordgo.Session, event *discordgo.GuildMemberUpdate) {
+		if event != nil && event.Member != nil && event.User != nil && event.User.ID == userID {
+			select {
+			case barrier <- struct{}{}:
+			default:
+			}
+		}
+	})
+	return barrier, nil
+}
+
 func (c *RealClient) UI188CaptureGatewayRef(streamID string) (*UI188GatewayRef, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

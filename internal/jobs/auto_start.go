@@ -160,6 +160,7 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	}
 	m.autoStartRetries[streamID] = retry
 	m.lastEventAt = now
+	log.Printf("Discord auto-start diagnostic: stage=reserved stream_id=%s assignment_epoch=%s existing_presence=%t", streamID, retry.assignmentEpoch, event.ExistingPresence)
 	m.mu.Unlock()
 
 	go func() {
@@ -275,7 +276,45 @@ func (m *Manager) retryAutoStart(ctx context.Context, retry *autoStartRetry, sta
 
 func (m *Manager) autoStartRetryStillValid(streamID string, retry *autoStartRetry) bool {
 	m.mu.Lock()
+	valid := m.autoStartRetryStillValidLocked(streamID, retry)
+	m.mu.Unlock()
+	if !valid {
+		return false
+	}
+	source, ok := m.voice.(discord.AutoStartVoicePresenceSource)
+	if !ok {
+		return true
+	}
+	// The initial Gateway callback may have been queued before the last human
+	// left. Re-read current presence for the first request and every bounded
+	// retry, without holding the manager lock across a client callback.
+	present, known := source.AutoStartVoicePresence(discord.AutoStartVoiceTarget{
+		StreamID: streamID, AssignmentEpoch: retry.assignmentEpoch,
+		GuildID: retry.guildID, VoiceChannelID: retry.voiceChannelID,
+	})
+	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.autoStartRetryStillValidLocked(streamID, retry) {
+		return false
+	}
+	reason := "human_present"
+	if !known {
+		reason = "gateway_view_unavailable"
+	} else if !present {
+		reason = "human_absent"
+	}
+	log.Printf("Discord auto-start diagnostic: stage=presence stream_id=%s assignment_epoch=%s reason=%s", streamID, retry.assignmentEpoch, reason)
+	if !known || !present {
+		m.cancelAutoStartRetryLocked(streamID)
+		// No start was accepted. A genuine next join must not inherit this
+		// canceled attempt's cooldown.
+		delete(m.autoStartPending, streamID)
+		return false
+	}
+	return true
+}
+
+func (m *Manager) autoStartRetryStillValidLocked(streamID string, retry *autoStartRetry) bool {
 	if m.autoStartRetries[streamID] != retry || m.current.StreamID != "" || m.reconnectGeneration != retry.reconnectGeneration {
 		return false
 	}

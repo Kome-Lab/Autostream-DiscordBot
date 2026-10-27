@@ -43,6 +43,67 @@ func (c *RealClient) SetAutoStartVoiceTargets(targets []AutoStartVoiceTarget) {
 	c.syncAutoStartVoiceMembers(session)
 }
 
+// AutoStartVoicePresence reads only the currently selected waiting target and
+// current SDK State. It never treats an unknown member as a human or reuses a
+// snapshot from a replaced Gateway session or assignment.
+func (c *RealClient) AutoStartVoicePresence(target AutoStartVoiceTarget) (bool, bool) {
+	c.mu.Lock()
+	session := c.session
+	current := c.autoStartPresenceCurrentLocked(session, target)
+	c.mu.Unlock()
+	if !current || session.State == nil {
+		return false, false
+	}
+
+	present, known := false, false
+	state := session.State
+	state.RLock()
+	if state.TrackVoice && state.User != nil && strings.TrimSpace(state.User.ID) != "" {
+		for _, guild := range state.Guilds {
+			if guild == nil || guild.ID != target.GuildID {
+				continue
+			}
+			known = true
+			for _, voice := range guild.VoiceStates {
+				if voice == nil || voice.ChannelID != target.VoiceChannelID {
+					continue
+				}
+				userID := strings.TrimSpace(voice.UserID)
+				if userID == "" || userID == strings.TrimSpace(state.User.ID) {
+					continue
+				}
+				member, _ := currentVoiceMemberLocked(guild, userID, voice.Member)
+				if member != nil && !member.User.Bot {
+					present = true
+					break
+				}
+			}
+			break
+		}
+	}
+	state.RUnlock()
+
+	c.mu.Lock()
+	current = c.autoStartPresenceCurrentLocked(session, target)
+	c.mu.Unlock()
+	if !current {
+		return false, false
+	}
+	return present, known
+}
+
+func (c *RealClient) autoStartPresenceCurrentLocked(session *discordgo.Session, target AutoStartVoiceTarget) bool {
+	if session == nil || session != c.session || !c.status.Connected || c.job.StreamID != "" {
+		return false
+	}
+	for _, selected := range c.autoStartTargets {
+		if selected == target {
+			return true
+		}
+	}
+	return false
+}
+
 // syncAutoStartVoiceMembers emits at most one synthetic join event per
 // configured target when a human is already present in that VC. It never calls
 // the event sink while DiscordGo's State lock is held, and the manager's

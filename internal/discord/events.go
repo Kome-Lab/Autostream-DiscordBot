@@ -103,6 +103,13 @@ type AutoStartVoiceTargetSetter interface {
 	SetAutoStartVoiceTargets(targets []AutoStartVoiceTarget)
 }
 
+// AutoStartVoicePresenceSource revalidates human presence in a waiting target
+// immediately before an automatic start request. A disconnected, stale, or
+// unavailable Gateway view is non-authoritative and must not permit a start.
+type AutoStartVoicePresenceSource interface {
+	AutoStartVoicePresence(target AutoStartVoiceTarget) (present, known bool)
+}
+
 // ParticipantSnapshotSink is implemented by consumers that can replace their
 // participant state from an authoritative Discord State snapshot. EventSink is
 // intentionally kept backward-compatible for lightweight consumers that only

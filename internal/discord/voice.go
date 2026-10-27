@@ -12,15 +12,19 @@ import (
 
 func (c *RealClient) JoinVoice(job VoiceJob) error {
 	if strings.TrimSpace(job.GuildID) == "" || strings.TrimSpace(job.VoiceChannelID) == "" || strings.TrimSpace(job.StreamID) == "" {
+		logVoiceJoinDiagnostic(job, "target_invalid")
 		return errors.New("stream_id, guild_id and voice_channel_id are required")
 	}
+	logVoiceJoinDiagnostic(job, "requested")
 	c.gatewayMu.Lock()
 	defer c.gatewayMu.Unlock()
 	if err := c.connectGateway(); err != nil {
+		logVoiceJoinDiagnostic(job, "gateway_unavailable")
 		return err
 	}
 	voice, err := c.session.ChannelVoiceJoin(job.GuildID, job.VoiceChannelID, false, false)
 	if err != nil {
+		logVoiceJoinDiagnostic(job, "voice_transport_failed")
 		c.setLastError(err.Error())
 		return err
 	}
@@ -83,7 +87,12 @@ func (c *RealClient) JoinVoice(job VoiceJob) error {
 			c.forwardOpus(job, voiceGeneration, voice.OpusRecv, audioStop, forwarder, source)
 		}()
 	}
+	logVoiceJoinDiagnostic(job, "connected")
 	return nil
+}
+
+func logVoiceJoinDiagnostic(job VoiceJob, reason string) {
+	log.Printf("Discord voice join diagnostic: stream_id=%s job_generation=%d target_revision=%d reason=%s", strings.TrimSpace(job.StreamID), job.JobGeneration, job.DiscordTargetRevision, reason)
 }
 
 func (c *RealClient) LeaveVoice(streamID string) error {
