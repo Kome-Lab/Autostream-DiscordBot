@@ -42,13 +42,20 @@ func (cfg *RuntimeConfig) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	present := false
+	waitingPresent := false
 	for key := range fields {
 		if strings.EqualFold(key, "current_discord_bindings") {
 			present = true
 		}
+		if strings.EqualFold(key, "discord_waiting_monitor") {
+			waitingPresent = true
+		}
 	}
 	if err := validateCurrentBindingJSONKeys(raw); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidCurrentDiscordBinding, err)
+	}
+	if err := validateDiscordWaitingMonitorJSONKeys(raw); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidDiscordWaitingMonitor, err)
 	}
 	var value plain
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -58,6 +65,7 @@ func (cfg *RuntimeConfig) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	value.CurrentDiscordBindingsPresent = present
+	value.DiscordWaitingMonitorPresent = waitingPresent
 	*cfg = RuntimeConfig(value)
 	return nil
 }

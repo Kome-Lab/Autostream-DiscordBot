@@ -7,12 +7,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/autostream-discord-bot/internal/control"
 	"github.com/example/autostream-discord-bot/internal/discord"
 )
 
 type Manager struct {
 	voice                       discord.Client
 	runtimeRefreshMu            sync.Mutex
+	runtimeGatewayReconciler    func(context.Context, control.RuntimeConfig) error
 	gatewayCredentialMu         sync.Mutex
 	gatewayCredentialReference  string
 	gatewayCredentialToken      string

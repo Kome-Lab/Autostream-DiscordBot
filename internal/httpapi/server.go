@@ -199,16 +199,23 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "job_generation_required"})
 		return
 	}
-	if err := s.applyRuntimeDiscordConfig(r.Context(), &req, mode); err != nil {
-		if errors.Is(err, errStreamNotAssignedToService) {
-			writeError(w, err)
+	var runtimeErr error
+	startErr := s.manager.RefreshRuntimeConfig(func() error {
+		if current := s.manager.CurrentStreamID(); current != "" && current != req.StreamID {
+			return errors.New("another stream job is already active")
+		}
+		runtimeErr = s.applyRuntimeDiscordConfig(r.Context(), &req, mode)
+		if runtimeErr != nil {
+			return runtimeErr
+		}
+		return s.manager.Start(req)
+	})
+	if startErr != nil {
+		if runtimeErr != nil && !errors.Is(runtimeErr, errStreamNotAssignedToService) {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"code": "runtime_config_fetch_failed"})
 			return
 		}
-		writeJSON(w, http.StatusBadGateway, map[string]string{"code": "runtime_config_fetch_failed"})
-		return
-	}
-	if err := s.manager.Start(req); err != nil {
-		writeError(w, err)
+		writeError(w, startErr)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, publicJobStatus(s.manager.Status()))
@@ -224,6 +231,9 @@ func (s Server) applyRuntimeDiscordConfig(ctx context.Context, job *discord.Voic
 	}
 	if !isPrimaryDiscordAssignment(cfg, job.StreamID) {
 		return errStreamNotAssignedToService
+	}
+	if err := s.manager.ReconcileRuntimeGateway(ctx, cfg); err != nil {
+		return err
 	}
 	if mode == startJobRequestResolvedTargetV2 {
 		// v2's target is the immutable server-resolved snapshot. Runtime config

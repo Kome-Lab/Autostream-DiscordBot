@@ -96,6 +96,9 @@ func main() {
 		source.SetAudioForwarder(audioforward.Client{Config: cfg}, controlCfg.ServiceID)
 	}
 	manager := jobs.NewManagerWithReporter(voiceClient, buildWorkerReporter())
+	manager.SetRuntimeGatewayReconciler(func(ctx context.Context, cfg control.RuntimeConfig) error {
+		return reconcileRuntimeGateway(ctx, control.Client{Config: control.ConfigFromEnv()}, manager, cfg)
+	})
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		streamController := controlStreamStarter{client: controlClient}
 		manager.SetStreamStarter(streamController)
@@ -469,6 +472,10 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 			}
 			cfg, err := client.RuntimeConfig(ctx)
 			if err != nil {
+				if errors.Is(err, control.ErrInvalidDiscordWaitingMonitor) && manager.CurrentStreamID() == "" {
+					manager.SetStreamVoiceDefaults(nil)
+					_ = manager.ReconcileGatewayCredential("", false, nil)
+				}
 				var rejected control.ControlPanelError
 				if errors.Is(err, control.ErrInvalidCurrentDiscordBinding) || (errors.As(err, &rejected) && (rejected.StatusCode == http.StatusUnauthorized || rejected.StatusCode == http.StatusForbidden)) {
 					manager.SetStreamVoiceDefaults(nil)
@@ -504,8 +511,21 @@ func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager
 		_ = manager.ReconcileGatewayCredential("", false, nil)
 		return err
 	}
+	localStreamID := manager.CurrentStreamID()
+	if localStreamID != "" {
+		if _, owns := authority.current[localStreamID]; !owns {
+			return errors.New("current Discord execution snapshot changed during the active job")
+		}
+	}
 	profileID, selected := manager.GatewayProfileForAssignments(authority.current, authority.mapped, true)
-	if len(authority.current) == 0 {
+	preferCurrent := len(authority.current) != 0
+	if monitor := cfg.DiscordWaitingMonitor; monitor != nil && monitor.Version == 1 && !monitor.ExecutionActive && localStreamID == "" {
+		preferCurrent = false
+	}
+	if !preferCurrent {
+		if cfg.DiscordWaitingMonitorPresent || cfg.DiscordWaitingMonitor != nil {
+			return reconcileWaitingDiscordGateway(ctx, client, manager, cfg, authority)
+		}
 		return manager.ReconcileGatewayCredential("", false, nil)
 	}
 	if !selected || profileID != authority.binding.ProfileID {
@@ -521,6 +541,11 @@ func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager
 }
 
 func applyRuntimeConfigToManager(manager *jobs.Manager, cfg control.RuntimeConfig, baseReconnectPolicy jobs.ReconnectPolicy) jobs.ReconnectPolicy {
+	if cfg.DiscordWaitingMonitor != nil && manager.CurrentStreamID() != "" {
+		monitor := *cfg.DiscordWaitingMonitor
+		monitor.ExecutionActive = true
+		cfg.DiscordWaitingMonitor = &monitor
+	}
 	manager.SetStreamVoiceDefaults(streamDiscordDefaultsFromRuntimeConfig(cfg))
 	reconnectPolicy := reconnectPolicyFromRuntimeConfig(cfg, baseReconnectPolicy)
 	manager.SetReconnectPolicy(reconnectPolicy)
@@ -555,6 +580,17 @@ func reconnectPolicyFromRuntimeConfig(cfg control.RuntimeConfig, fallback jobs.R
 }
 
 func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[string]jobs.VoiceDefaults {
+	if cfg.DiscordWaitingMonitorPresent || cfg.DiscordWaitingMonitor != nil {
+		active, err := currentDiscordGatewayAuthority(cfg, cfg.Service.ServiceID)
+		if err != nil {
+			return nil
+		}
+		selection, err := selectDiscordWaitingGateway(cfg, active)
+		if err != nil {
+			return nil
+		}
+		return selection.defaults
+	}
 	defaults := map[string]jobs.VoiceDefaults{}
 	assignedPrimaryStreams, _ := primaryDiscordAssignmentStreams(cfg)
 	for _, item := range cfg.StreamDiscordConfigs {

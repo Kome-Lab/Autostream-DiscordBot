@@ -98,7 +98,7 @@ func (e ControlPanelError) RetryableAutoStop() bool {
 // Ordinary conflicts are terminal, while the updater's explicit transition
 // conflict, request timeouts, rate limiting, and server failures are transient.
 func (e ControlPanelError) RetryableAutoStart() bool {
-	return (e.StatusCode == http.StatusConflict && e.Code == "service_update_in_progress") ||
+	return (e.StatusCode == http.StatusConflict && (e.Code == "service_update_in_progress" || e.Code == "node_execution_busy")) ||
 		e.StatusCode == http.StatusRequestTimeout ||
 		e.StatusCode == http.StatusTooManyRequests ||
 		(e.StatusCode >= http.StatusInternalServerError && e.StatusCode < 600)
@@ -157,6 +157,8 @@ type RuntimeConfig struct {
 	StreamDiscordConfigs          []StreamDiscordConfig       `json:"stream_discord_configs,omitempty"`
 	CurrentDiscordBindings        *CurrentDiscordBindings     `json:"current_discord_bindings,omitempty"`
 	CurrentDiscordBindingsPresent bool                        `json:"-"`
+	DiscordWaitingMonitor         *DiscordWaitingMonitor      `json:"discord_waiting_monitor,omitempty"`
+	DiscordWaitingMonitorPresent  bool                        `json:"-"`
 }
 
 type RegisteredService struct {
@@ -301,6 +303,7 @@ func serviceCapabilities() map[string]any {
 		"chat_overlay_events":                true,
 		"caption_audio_forward":              true,
 		"discord_resolved_target_v2":         true,
+		CapabilityDiscordWaitingMonitorV1:    true,
 		"health_endpoint":                    true,
 		"job_endpoint":                       true,
 	}
