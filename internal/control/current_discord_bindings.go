@@ -59,6 +59,9 @@ func (cfg *RuntimeConfig) UnmarshalJSON(raw []byte) error {
 	}
 	var value plain
 	if err := json.Unmarshal(raw, &value); err != nil {
+		if errors.Is(err, ErrInvalidDiscordWaitingMonitor) {
+			return err
+		}
 		if present {
 			return fmt.Errorf("%w: malformed authority fields", ErrInvalidCurrentDiscordBinding)
 		}
