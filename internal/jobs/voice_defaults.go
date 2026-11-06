@@ -99,11 +99,29 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 			})
 		}
 	}
-	if len(m.streamDefaults) > 0 {
-		// A start can outlast the waiting projection. Retain only its last
-		// nonempty authority snapshot, not an additional auto-start candidate.
-		m.lastStreamDefaults = m.streamDefaults
+	// An assigned A can disappear from the waiting projection while B remains.
+	// Keep A's previously observed epoch until its verified execution/current
+	// job or pending start no longer references it. Removed unrelated frames
+	// are pruned; retained snapshots are never auto-start candidates.
+	retained := make(map[string]VoiceDefaults, len(m.streamDefaults)+len(m.executionAuthorityStreams)+1)
+	keep := func(id string) bool {
+		_, pending := m.autoStartPending[id]
+		return id == m.current.StreamID || m.executionAuthorityStreams[id] || m.autoStartRetries[id] != nil || pending
 	}
+	for id, previous := range m.lastStreamDefaults {
+		if keep(id) {
+			retained[id] = previous
+		}
+	}
+	for id, previous := range previousDefaults {
+		if keep(id) {
+			retained[id] = previous
+		}
+	}
+	for id, current := range m.streamDefaults {
+		retained[id] = current
+	}
+	m.lastStreamDefaults = retained
 	for streamID := range m.autoStartPending {
 		if _, ok := m.streamDefaults[streamID]; !ok {
 			delete(m.autoStartPending, streamID)

@@ -541,6 +541,8 @@ func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager
 }
 
 func applyRuntimeConfigToManager(manager *jobs.Manager, cfg control.RuntimeConfig, baseReconnectPolicy jobs.ReconnectPolicy) jobs.ReconnectPolicy {
+	primaryStreams, _ := primaryDiscordAssignmentStreams(cfg)
+	manager.SetExecutionAuthorityStreams(primaryStreams)
 	if cfg.DiscordWaitingMonitor != nil && manager.CurrentStreamID() != "" {
 		monitor := *cfg.DiscordWaitingMonitor
 		monitor.ExecutionActive = true

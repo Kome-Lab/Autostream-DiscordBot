@@ -20,3 +20,17 @@ func (m *Manager) ReconcileRuntimeGateway(ctx context.Context, cfg control.Runti
 	}
 	return m.runtimeGatewayReconciler(ctx, cfg)
 }
+
+// SetExecutionAuthorityStreams pins previously observed waiting epochs for
+// actual primary assignments while the Panel's start transaction is in flight.
+// These IDs never authorize Start; the HTTP primary check remains independent.
+func (m *Manager) SetExecutionAuthorityStreams(streams map[string]bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.executionAuthorityStreams = make(map[string]bool, len(streams))
+	for id, allowed := range streams {
+		if allowed {
+			m.executionAuthorityStreams[id] = true
+		}
+	}
+}

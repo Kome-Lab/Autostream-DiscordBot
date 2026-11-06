@@ -232,6 +232,13 @@ func (s Server) applyRuntimeDiscordConfig(ctx context.Context, job *discord.Voic
 	if !isPrimaryDiscordAssignment(cfg, job.StreamID) {
 		return errStreamNotAssignedToService
 	}
+	primaryStreams := map[string]bool{}
+	for _, assignment := range cfg.Assignments {
+		if assignment.ServiceID == cfg.Service.ServiceID && assignment.ServiceType == control.ServiceType && assignment.AssignmentRole == "primary" {
+			primaryStreams[assignment.StreamID] = true
+		}
+	}
+	s.manager.SetExecutionAuthorityStreams(primaryStreams)
 	if err := s.manager.ReconcileRuntimeGateway(ctx, cfg); err != nil {
 		return err
 	}

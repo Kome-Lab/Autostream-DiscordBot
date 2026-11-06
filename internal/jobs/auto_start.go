@@ -29,6 +29,7 @@ type autoStartRetry struct {
 	reconnectGeneration int64
 	guildID             string
 	voiceChannelID      string
+	capacityBusy        bool
 }
 
 func (m *Manager) SetStreamStarter(starter StreamStarter) {
@@ -169,6 +170,7 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 			return
 		}
 		if err := starter.StartStream(streamID); err != nil {
+			m.noteAutoStartCapacityResult(streamID, retry, err)
 			if isRetryableAutoStartError(err) {
 				logAutoStartRetryFailure(streamID, 1, err, true)
 				m.retryAutoStart(retryCtx, retry, starter, streamID)
@@ -261,6 +263,7 @@ func (m *Manager) retryAutoStart(ctx context.Context, retry *autoStartRetry, sta
 		}
 		attempt := index + 2
 		err := starter.StartStream(streamID)
+		m.noteAutoStartCapacityResult(streamID, retry, err)
 		if err == nil {
 			log.Printf("Discord VC auto-start retry accepted by control panel: stream=%s retry_count=%d", streamID, attempt)
 			return
@@ -325,6 +328,9 @@ func (m *Manager) finishAutoStartRetry(streamID string, retry *autoStartRetry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.autoStartRetries[streamID] == retry {
+		if retry.capacityBusy && m.current.StreamID == "" {
+			delete(m.autoStartPending, streamID)
+		}
 		delete(m.autoStartRetries, streamID)
 	}
 	retry.cancel()

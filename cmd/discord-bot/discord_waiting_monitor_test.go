@@ -233,3 +233,57 @@ func TestDiscordWaitingMonitorInactiveRetainedAssignmentCanUseAnotherCredential(
 		t.Fatal("inactive retained assignment pinned the old credential")
 	}
 }
+
+func TestWaitingStartEpochSurvivesOtherWaitingFrameRefreshAndStop(t *testing.T) {
+	voice := &waitingMonitorVoice{present: map[string]bool{}}
+	manager := jobs.NewManager(voice)
+	voice.sink = manager
+	waiting := waitingMonitorFixture()
+	applyRuntimeConfigToManager(manager, waiting, reconnectPolicyFromEnv())
+
+	// A has acquired execution ownership and leaves the waiting projection.
+	// B remains waiting for several refreshes while A's preparation runs.
+	starting := currentWaitingMonitorFixture()
+	starting.Service.CurrentStreamID = "waiting-A"
+	starting.Assignments[0].StreamID = "waiting-A"
+	starting.CurrentDiscordBindings.Bindings[0].StreamID = "waiting-A"
+	starting.DiscordWaitingMonitor.Bindings = starting.DiscordWaitingMonitor.Bindings[1:]
+	for range 3 {
+		applyRuntimeConfigToManager(manager, starting, reconnectPolicyFromEnv())
+	}
+	if err := manager.Start(discord.VoiceJob{StreamID: "waiting-A", GuildID: "100000000000000001", VoiceChannelID: "100000000000000002", JobGeneration: 1}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if id := manager.CurrentStreamID(); id != "" {
+			_ = manager.Stop(id)
+		}
+	})
+	if err := manager.Stop("waiting-A"); err != nil {
+		t.Fatal(err)
+	}
+	starter := fakeStreamStarter{started: make(chan string, 1)}
+	manager.SetStreamStarter(starter)
+	voice.present["100000000000000002"] = true
+	// Rearm uses the unchanged saved selection/target epoch. Existing presence
+	// must keep the explicit Stop fence even though B replaced the old map.
+	applyRuntimeConfigToManager(manager, waiting, reconnectPolicyFromEnv())
+	select {
+	case id := <-starter.started:
+		t.Fatal("same-epoch existing presence restarted explicitly stopped A", id)
+	case <-time.After(100 * time.Millisecond):
+	}
+	binding := waiting.DiscordWaitingMonitor.Bindings[0]
+	manager.VoiceUserJoined(discord.VoiceJoinEvent{
+		GuildID: binding.GuildID, VoiceChannelID: binding.VoiceChannelID, UserID: "human",
+		Authority: &discord.AutoStartAuthority{StreamID: binding.StreamID, AssignmentEpoch: discordWaitingBindingEpoch(binding)},
+	})
+	select {
+	case id := <-starter.started:
+		if id != "waiting-A" {
+			t.Fatal("genuine rejoin selected another waiting frame", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retained Stop fence blocked a genuine later human join")
+	}
+}

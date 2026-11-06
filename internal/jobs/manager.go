@@ -29,7 +29,8 @@ type Manager struct {
 	disconnected                bool
 	defaults                    VoiceDefaults
 	streamDefaults              map[string]VoiceDefaults
-	lastStreamDefaults          map[string]VoiceDefaults // Last nonempty authority snapshot, never start candidates.
+	lastStreamDefaults          map[string]VoiceDefaults // Retained epochs for waiting, pending, current, or assigned streams.
+	executionAuthorityStreams   map[string]bool          // Cache pins only; never execution permission.
 	autoStartPending            map[string]time.Time
 	autoStartStopped            map[string]VoiceDefaults
 	autoStartRetries            map[string]*autoStartRetry
