@@ -175,7 +175,7 @@ jobs:
           CGO_ENABLED=1 \
           CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
           CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
-            go test -mod=readonly -p 1 -race -count=1 ./internal/discord ./internal/jobs
+            go test -mod=readonly -p 1 -race -count=1 ./internal/discord ./internal/jobs ./cmd/discord-bot ./internal/httpapi
       - name: Build Go packages with DAVE-linked DiscordGo
         shell: bash
         run: |
