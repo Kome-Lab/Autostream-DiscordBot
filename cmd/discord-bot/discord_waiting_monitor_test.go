@@ -56,8 +56,8 @@ func waitingMonitorFixture() control.RuntimeConfig {
 		}
 	}
 	return control.RuntimeConfig{
-		Service: control.RegisteredService{ServiceID: "own", ServiceType: control.ServiceType},
-		Assignments: []control.StreamServiceAssignment{},
+		Service:                control.RegisteredService{ServiceID: "own", ServiceType: control.ServiceType},
+		Assignments:            []control.StreamServiceAssignment{},
 		CurrentDiscordBindings: &control.CurrentDiscordBindings{Version: 1, Bindings: []control.CurrentDiscordCredentialBinding{}},
 		DiscordWaitingMonitor: &control.DiscordWaitingMonitor{Version: 1, Bindings: []control.DiscordWaitingMonitorBinding{
 			binding("waiting-A", "profile-A", "100000000000000002"),
@@ -140,14 +140,20 @@ func TestDiscordWaitingMonitorSameCredentialMultipleVCsAndCachedGateway(t *testi
 
 func TestDiscordWaitingMonitorRejectsUnsupportedAndAmbiguousAuthority(t *testing.T) {
 	tests := []struct {
-		name string
+		name   string
 		mutate func(*control.RuntimeConfig)
 	}{
 		{"version", func(cfg *control.RuntimeConfig) { cfg.DiscordWaitingMonitor.Version = 2 }},
 		{"null bindings", func(cfg *control.RuntimeConfig) { cfg.DiscordWaitingMonitor.Bindings = nil }},
-		{"same VC", func(cfg *control.RuntimeConfig) { cfg.DiscordWaitingMonitor.Bindings[1].VoiceChannelID = cfg.DiscordWaitingMonitor.Bindings[0].VoiceChannelID }},
-		{"different credentials", func(cfg *control.RuntimeConfig) { cfg.DiscordWaitingMonitor.Bindings[1].SecretName = "discord_bot_token_other" }},
-		{"foreign owner", func(cfg *control.RuntimeConfig) { cfg.DiscordWaitingMonitor.Bindings[0].ProfileOwnerServiceID = "foreign" }},
+		{"same VC", func(cfg *control.RuntimeConfig) {
+			cfg.DiscordWaitingMonitor.Bindings[1].VoiceChannelID = cfg.DiscordWaitingMonitor.Bindings[0].VoiceChannelID
+		}},
+		{"different credentials", func(cfg *control.RuntimeConfig) {
+			cfg.DiscordWaitingMonitor.Bindings[1].SecretName = "discord_bot_token_other"
+		}},
+		{"foreign owner", func(cfg *control.RuntimeConfig) {
+			cfg.DiscordWaitingMonitor.Bindings[0].ProfileOwnerServiceID = "foreign"
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

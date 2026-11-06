@@ -81,7 +81,7 @@ func selectDiscordWaitingGateway(cfg control.RuntimeConfig, active currentGatewa
 		}
 		result.defaults[binding.StreamID] = jobs.VoiceDefaults{
 			AssignmentEpoch: discordWaitingBindingEpoch(binding),
-			GuildID: binding.GuildID, VoiceChannelID: binding.VoiceChannelID,
+			GuildID:         binding.GuildID, VoiceChannelID: binding.VoiceChannelID,
 			TextChannelID: binding.TextChannelID, AutoStartEnabled: true,
 		}
 		if !result.selected {

@@ -107,3 +107,31 @@ func TestWaitingEpochCacheRetainsOnlyReferencedStreams(t *testing.T) {
 		t.Fatal("unreferenced epochs accumulated in the retention cache")
 	}
 }
+
+func TestWaitingEpochCacheDistinguishesUnobservedAndEmptyExecutionAuthority(t *testing.T) {
+	manager := NewManager(&discord.NoopClient{})
+	defaults := VoiceDefaults{AssignmentEpoch: "epoch-A", GuildID: "guild", VoiceChannelID: "voice-A", AutoStartEnabled: true}
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{"A": defaults})
+	manager.SetStreamVoiceDefaults(nil)
+	if manager.executionAuthorityStreams != nil || manager.lastStreamDefaults["A"].AssignmentEpoch != "epoch-A" {
+		t.Fatal("unobserved authority removed the legacy last-nonempty snapshot")
+	}
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{
+		"B": {AssignmentEpoch: "epoch-B", GuildID: "guild", VoiceChannelID: "voice-B", AutoStartEnabled: true},
+	})
+	if len(manager.lastStreamDefaults) != 1 || manager.lastStreamDefaults["B"].AssignmentEpoch != "epoch-B" {
+		t.Fatal("legacy snapshot no longer replaces its last nonempty projection")
+	}
+	manager.SetStreamVoiceDefaults(nil)
+	manager.SetExecutionAuthorityStreams(nil)
+	manager.SetStreamVoiceDefaults(nil)
+	if manager.executionAuthorityStreams == nil || len(manager.lastStreamDefaults) != 0 {
+		t.Fatal("explicit empty authority retained an unreferenced legacy epoch")
+	}
+	manager.SetStreamVoiceDefaults(map[string]VoiceDefaults{"A": defaults})
+	manager.SetExecutionAuthorityStreams(map[string]bool{"A": true})
+	manager.SetStreamVoiceDefaults(nil)
+	if manager.lastStreamDefaults["A"].AssignmentEpoch != "epoch-A" {
+		t.Fatal("explicit primary authority failed to retain the pending start epoch")
+	}
+}

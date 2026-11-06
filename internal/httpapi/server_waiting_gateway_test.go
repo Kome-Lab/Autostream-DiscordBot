@@ -68,7 +68,7 @@ func TestStartRefreshReconcilesCurrentCredentialBeforeVoiceJoin(t *testing.T) {
 	handler := NewServerWithRuntimeConfig("discord_bot", manager, TokenVerifier{PlainToken: "expected"}, func(context.Context) (control.RuntimeConfig, error) {
 		reads++
 		return control.RuntimeConfig{
-			Service: control.RegisteredService{ServiceID: "own", ServiceType: control.ServiceType, CurrentStreamID: "selected"},
+			Service:     control.RegisteredService{ServiceID: "own", ServiceType: control.ServiceType, CurrentStreamID: "selected"},
 			Assignments: []control.StreamServiceAssignment{{StreamID: "selected", ServiceID: "own", ServiceType: control.ServiceType, AssignmentRole: "primary", AssignedAt: time.Unix(200, 0).UTC()}},
 			// Resolved v2 target IDs must survive runtime refresh unchanged.
 			StreamDiscordConfigs: []control.StreamDiscordConfig{{StreamID: "selected", GuildID: "other", VoiceChannelID: "other"}},
@@ -128,11 +128,11 @@ func TestWaitingMonitoringCannotAuthorizeVoiceExecution(t *testing.T) {
 	})
 	handler := NewServerWithRuntimeConfig("discord_bot", manager, TokenVerifier{PlainToken: "expected"}, func(context.Context) (control.RuntimeConfig, error) {
 		return control.RuntimeConfig{
-			Service: control.RegisteredService{ServiceID: "own", ServiceType: control.ServiceType},
+			Service:     control.RegisteredService{ServiceID: "own", ServiceType: control.ServiceType},
 			Assignments: []control.StreamServiceAssignment{},
 			DiscordWaitingMonitor: &control.DiscordWaitingMonitor{Version: 1, Bindings: []control.DiscordWaitingMonitorBinding{{
 				DiscordWaitingCredentialBinding: control.DiscordWaitingCredentialBinding{StreamID: "selected", ServiceID: "own", Ready: true},
-				GuildID: "100000000000000001", VoiceChannelID: "100000000000000003", TargetRevision: 11,
+				GuildID:                         "100000000000000001", VoiceChannelID: "100000000000000003", TargetRevision: 11,
 			}}},
 		}, nil
 	})
