@@ -520,6 +520,9 @@ func reconcileRuntimeGateway(ctx context.Context, client control.Client, manager
 	localStreamID := manager.CurrentStreamID()
 	if localStreamID != "" {
 		if _, owns := authority.current[localStreamID]; !owns {
+			manager.SetStreamVoiceDefaults(nil)
+			manager.GatewayProfileForAssignments(nil, nil, true)
+			_ = manager.ReconcileGatewayCredential("", false, nil)
 			return errors.New("current Discord execution snapshot changed during the active job")
 		}
 	}
