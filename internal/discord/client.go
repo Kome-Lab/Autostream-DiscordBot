@@ -122,20 +122,23 @@ func (client *RealClient) newGatewaySession(cfg Config) (*discordgo.Session, err
 func (c *RealClient) ReconcileGateway(cfg Config, selected bool) error {
 	c.gatewayMu.Lock()
 	defer c.gatewayMu.Unlock()
+	if !selected {
+		return c.revokeGateway()
+	}
 	c.mu.Lock()
 	old := c.session
 	active := c.job.StreamID != ""
 	unchanged := old != nil && c.cfg.BotToken == cfg.BotToken
 	c.mu.Unlock()
-	// Never disrupt the legitimate connection of an active job. Updated
+	// A normal credential refresh never disrupts an active job. Updated
 	// credentials take effect after that job leaves voice.
 	if active {
 		return nil
 	}
-	if selected && cfg.Validate() != nil {
+	if cfg.Validate() != nil {
 		return errors.New("selected Bot credential unavailable")
 	}
-	if selected && unchanged {
+	if unchanged {
 		return c.connectGateway()
 	}
 	if old != nil {
@@ -147,9 +150,6 @@ func (c *RealClient) ReconcileGateway(cfg Config, selected bool) error {
 	c.session, c.cfg = nil, Config{}
 	c.status.Connected = false
 	c.mu.Unlock()
-	if !selected {
-		return nil
-	}
 	session, err := c.newGatewaySession(cfg)
 	if err != nil {
 		return errors.New("Discord Gateway configuration failed")
@@ -158,6 +158,29 @@ func (c *RealClient) ReconcileGateway(cfg Config, selected bool) error {
 	c.session, c.cfg = session, cfg
 	c.mu.Unlock()
 	return c.connectGateway()
+}
+
+// Called with gatewayMu held so a revoked client cannot race a new voice join.
+func (c *RealClient) revokeGateway() error {
+	c.mu.Lock()
+	old := c.session
+	c.session, c.cfg = nil, Config{}
+	c.status.Connected = false
+	c.unknownAutoStartJoins = nil
+	c.mu.Unlock()
+
+	// Detach authority before closing transports: late Gateway callbacks must
+	// not restore a revoked session. Always attempt both voice and Gateway
+	// teardown, including when one transport reports a close error.
+	voiceErr := c.LeaveVoice("")
+	var gatewayErr error
+	if old != nil {
+		gatewayErr = old.Close()
+	}
+	if voiceErr != nil || gatewayErr != nil {
+		return errors.New("Discord Gateway revocation failed")
+	}
+	return nil
 }
 
 func (c *RealClient) SetEventSink(sink EventSink) {
