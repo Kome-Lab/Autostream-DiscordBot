@@ -43,22 +43,30 @@ func (cfg *RuntimeConfig) UnmarshalJSON(raw []byte) error {
 	}
 	present := false
 	waitingPresent := false
-	for key := range fields {
+	var waitingRaw json.RawMessage
+	withoutWaiting := make(map[string]json.RawMessage, len(fields))
+	for key, value := range fields {
 		if strings.EqualFold(key, "current_discord_bindings") {
 			present = true
 		}
 		if strings.EqualFold(key, "discord_waiting_monitor") {
 			waitingPresent = true
+			waitingRaw = value
+			continue
 		}
+		withoutWaiting[key] = value
 	}
 	if err := validateCurrentBindingJSONKeys(raw); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidCurrentDiscordBinding, err)
 	}
-	if err := validateDiscordWaitingMonitorJSONKeys(raw); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidDiscordWaitingMonitor, err)
+	// Decode the existing execution authority independently and first. A bad
+	// monitor must never mask current-binding revocation through field order.
+	baseRaw, err := json.Marshal(withoutWaiting)
+	if err != nil {
+		return err
 	}
 	var value plain
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if err := json.Unmarshal(baseRaw, &value); err != nil {
 		if present {
 			return fmt.Errorf("%w: malformed authority fields", ErrInvalidCurrentDiscordBinding)
 		}
@@ -67,6 +75,18 @@ func (cfg *RuntimeConfig) UnmarshalJSON(raw []byte) error {
 	value.CurrentDiscordBindingsPresent = present
 	value.DiscordWaitingMonitorPresent = waitingPresent
 	*cfg = RuntimeConfig(value)
+	// A monitor-only error deliberately retains the decoded execution snapshot.
+	// Callers must still validate that snapshot before keeping an active job.
+	if err := validateDiscordWaitingMonitorJSONKeys(raw); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidDiscordWaitingMonitor, err)
+	}
+	if waitingPresent {
+		var monitor *DiscordWaitingMonitor
+		if err := json.Unmarshal(waitingRaw, &monitor); err != nil {
+			return ErrInvalidDiscordWaitingMonitor
+		}
+		cfg.DiscordWaitingMonitor = monitor
+	}
 	return nil
 }
 

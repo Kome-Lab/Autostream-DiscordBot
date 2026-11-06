@@ -362,6 +362,9 @@ func (c Client) RuntimeConfig(ctx context.Context) (RuntimeConfig, error) {
 	endpoint := "/services/runtime-config?service_id=" + url.QueryEscape(c.Config.ServiceID)
 	var cfg RuntimeConfig
 	if err := c.get(ctx, endpoint, &cfg); err != nil {
+		if errors.Is(err, ErrInvalidDiscordWaitingMonitor) {
+			return cfg, err
+		}
 		return RuntimeConfig{}, err
 	}
 	return cfg, nil

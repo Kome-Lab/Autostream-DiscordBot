@@ -472,9 +472,15 @@ func runRuntimeConfigRefreshLoop(ctx context.Context, client control.Client, man
 			}
 			cfg, err := client.RuntimeConfig(ctx)
 			if err != nil {
-				if errors.Is(err, control.ErrInvalidDiscordWaitingMonitor) && manager.CurrentStreamID() == "" {
-					manager.SetStreamVoiceDefaults(nil)
-					_ = manager.ReconcileGatewayCredential("", false, nil)
+				if errors.Is(err, control.ErrInvalidDiscordWaitingMonitor) {
+					authority, currentErr := currentDiscordGatewayAuthority(cfg, client.Config.ServiceID)
+					localStreamID := manager.CurrentStreamID()
+					_, ownsCurrent := authority.current[localStreamID]
+					if currentErr != nil || localStreamID == "" || !ownsCurrent {
+						manager.SetStreamVoiceDefaults(nil)
+						manager.GatewayProfileForAssignments(nil, nil, true)
+						_ = manager.ReconcileGatewayCredential("", false, nil)
+					}
 				}
 				var rejected control.ControlPanelError
 				if errors.Is(err, control.ErrInvalidCurrentDiscordBinding) || (errors.As(err, &rejected) && (rejected.StatusCode == http.StatusUnauthorized || rejected.StatusCode == http.StatusForbidden)) {

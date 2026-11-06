@@ -95,7 +95,7 @@ func (monitor *DiscordWaitingMonitor) UnmarshalJSON(raw []byte) error {
 	type plain DiscordWaitingMonitor
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return err
+		return ErrInvalidDiscordWaitingMonitor
 	}
 	active, exists := fields["execution_active"]
 	if !exists || bytes.Equal(bytes.TrimSpace(active), []byte("null")) {
@@ -107,7 +107,7 @@ func (monitor *DiscordWaitingMonitor) UnmarshalJSON(raw []byte) error {
 	}
 	var value plain
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return err
+		return ErrInvalidDiscordWaitingMonitor
 	}
 	*monitor = DiscordWaitingMonitor(value)
 	return nil

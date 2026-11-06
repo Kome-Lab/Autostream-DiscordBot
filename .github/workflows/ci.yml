@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          fetch-depth: 0
       - name: Verify authored sources and raw distributions
         shell: bash
         run: |
@@ -36,11 +37,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          fmt_status=0
-          diff="$(gofmt -d cmd/discord-bot/discord_waiting_monitor.go cmd/discord-bot/discord_waiting_monitor_test.go cmd/discord-bot/main.go internal/control/client.go internal/control/current_discord_bindings.go internal/control/discord_waiting_monitor.go internal/control/discord_waiting_monitor_test.go internal/httpapi/server.go internal/httpapi/server_waiting_gateway_test.go internal/jobs/auto_start.go internal/jobs/auto_start_capacity.go internal/jobs/auto_start_capacity_test.go internal/jobs/manager.go internal/jobs/runtime_gateway.go internal/jobs/voice_defaults.go)" || fmt_status=$?
-          printf '%s\n' "$diff"
-          if [[ -n "$diff" || "$fmt_status" -ne 0 ]]; then
-            exit 1
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMRT e1805ba5c16c9ed3b61ef83bf7864af6bdb045cd -- '*.go')
+          if (( ${#files[@]} > 0 )); then
+            fmt_status=0
+            diff="$(gofmt -d "${files[@]}")" || fmt_status=$?
+            printf '%s\n' "$diff"
+            if [[ -n "$diff" || "$fmt_status" -ne 0 ]]; then
+              exit 1
+            fi
           fi
       - name: Resolve DAVE cache key
         id: dave-cache-key
