@@ -105,9 +105,6 @@ func TestActiveSpeakerCallbackMayReadClientStatusWithoutDeadlock(t *testing.T) {
 func TestForwardOpusPreservesJobGenerationAndUpdatesStatus(t *testing.T) {
 	forwarder := newFakeAudioForwarder()
 	client := &RealClient{}
-	packets := make(chan *discordgo.Packet, 20)
-	stop := make(chan struct{})
-	done := make(chan struct{})
 	job := VoiceJob{
 		StreamID:          "stream-01",
 		JobGeneration:     17,
@@ -118,29 +115,9 @@ func TestForwardOpusPreservesJobGenerationAndUpdatesStatus(t *testing.T) {
 	}
 	activateVoiceJobForTest(client, job, 1)
 	client.onVoiceSpeakingUpdate(nil, &discordgo.VoiceSpeakingUpdate{UserID: "user-01", SSRC: 42, Speaking: true})
-	go func() {
-		defer close(done)
-		client.forwardOpus(job, 1, packets, stop, forwarder, "discord-bot-01")
-	}()
-	for i := 0; i < 20; i++ {
-		packets <- &discordgo.Packet{
-			SSRC:      42,
-			Sequence:  uint16(100 + i),
-			Timestamp: uint32(960 * i),
-			Opus:      []byte{byte(i), 0xaa, 0xbb},
-		}
-	}
-	select {
-	case <-forwarder.called:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for opus batch to be forwarded")
-	}
-	close(stop)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for forward loop to stop")
-	}
+	// A forwarded request is observable before its result callback updates
+	// status. Wait for that callback before cancelling the receive loop.
+	runSyntheticForwardBatch(t, client, forwarder, job, 1)
 	encoderAudioURL, streamID, source, tokenOverride, forwarded := forwarder.snapshot()
 	if encoderAudioURL != job.EncoderAudioURL || streamID != "stream-01" || source != "discord-bot-01" || tokenOverride != "job-ingest-token" {
 		t.Fatalf("unexpected forward context url=%q stream=%q source=%q token=%q", encoderAudioURL, streamID, source, tokenOverride)

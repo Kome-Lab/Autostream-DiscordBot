@@ -372,7 +372,7 @@
       },
       {
         "path": "internal/discord/client_audio_generation_test.go",
-        "sha256": "8625ab73cb09e74b4ea1209b9f96b769c8103e510c4ee3d6ee453e96638c805e",
+        "sha256": "ea8f8945b1248693acc2d4d2214516e31756a53a8c3b15be701234b71f4bad54",
         "symbols": [
           "TestActiveSpeakerCallbackMayReadClientStatusWithoutDeadlock",
           "TestCaptionForwardErrorIsSanitizedInStatus",
@@ -384,7 +384,7 @@
           "TestUserForSSRCRejectsStaleVoiceGeneration",
           "TestVoiceSpeakingUpdateReportsActiveSpeaker"
         ],
-        "physical_lines": 291
+        "physical_lines": 268
       },
       {
         "path": "internal/discord/client_audio_shutdown_test.go",
