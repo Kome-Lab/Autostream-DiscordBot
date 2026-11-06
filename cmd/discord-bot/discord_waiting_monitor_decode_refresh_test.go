@@ -41,8 +41,12 @@ func TestWaitingMonitorDecodeFailurePreservesActiveGatewayOnPeriodicRefresh(t *t
 		{name: "null current", current: "null", disconnect: true},
 		{name: "unsupported current version", mutate: func(cfg *control.RuntimeConfig) { cfg.CurrentDiscordBindings.Version = 2 }, disconnect: true},
 		{name: "current no longer ready", mutate: func(cfg *control.RuntimeConfig) { cfg.CurrentDiscordBindings.Bindings[0].Ready = false }, disconnect: true},
-		{name: "current owner changed", mutate: func(cfg *control.RuntimeConfig) { cfg.CurrentDiscordBindings.Bindings[0].ProfileOwnerServiceID = "another" }, disconnect: true},
-		{name: "current profile mismatch", mutate: func(cfg *control.RuntimeConfig) { cfg.Profiles["discord_config"][0].Config["bot_token_fingerprint"] = "another" }, disconnect: true},
+		{name: "current owner changed", mutate: func(cfg *control.RuntimeConfig) {
+			cfg.CurrentDiscordBindings.Bindings[0].ProfileOwnerServiceID = "another"
+		}, disconnect: true},
+		{name: "current profile mismatch", mutate: func(cfg *control.RuntimeConfig) {
+			cfg.Profiles["discord_config"][0].Config["bot_token_fingerprint"] = "another"
+		}, disconnect: true},
 		{name: "local owner removed", mutate: func(cfg *control.RuntimeConfig) {
 			cfg.Assignments = []control.StreamServiceAssignment{}
 			cfg.CurrentDiscordBindings.Bindings = []control.CurrentDiscordCredentialBinding{}
