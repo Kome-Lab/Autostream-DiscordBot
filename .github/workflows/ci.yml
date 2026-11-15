@@ -192,3 +192,146 @@ jobs:
           CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
           CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
             go build ./...
+      - name: Vet all native Go packages with the pinned DAVE build
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+          GOFLAGS: '-mod=readonly'
+          GOTELEMETRY: 'off'
+        shell: bash
+        run: |
+          set -euo pipefail
+          libdave_build="$PWD/third_party/discordgo/dave/libdave/cpp/build"
+          vcpkg_libdir="$(find "$libdave_build/vcpkg_installed" -maxdepth 2 -type d -name lib -print -quit)"
+          test -n "$vcpkg_libdir"
+          vcpkg_libs="$(find "$vcpkg_libdir" -maxdepth 1 -type f -name '*.a' -print | sort | tr '\n' ' ')"
+          CGO_ENABLED=1 \
+          CGO_CFLAGS="-I$PWD/third_party/discordgo/dave/libdave/cpp/includes" \
+          CGO_LDFLAGS="-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread" \
+            go vet -p 1 ./...
+
+  v3-product-integration-checks:
+    name: v3-product-integration-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOFLAGS: '-mod=readonly'
+      GOTELEMETRY: 'off'
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
+      - name: Required typed audioforward and original-Attempt UNKNOWN inventory
+        run: bash scripts/ci/iu-checks.sh
+      - name: Preserve exact root execution evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iu-bot-root-events-${{ github.sha }}
+          path: ${{ runner.temp }}/iu-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  v3-product-cross-repository-checks:
+    name: v3-product-cross-repository-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOFLAGS: '-mod=readonly'
+      GOTELEMETRY: 'off'
+      GOMAXPROCS: '2'
+      IU_BOT_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      # Publication is blocked until this is replaced by the reviewed Encoder
+      # candidate containing its actual HTTP process helper and frozen manifest.
+      IU_ER_CANDIDATE_SHA: '06075915574acb85b5756d7dbcec0decc7ad0767'
+    defaults:
+      run:
+        working-directory: bot
+        shell: bash
+    steps:
+      - name: Checkout exact Bot candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.IU_BOT_CANDIDATE_SHA }}
+          path: bot
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Require a frozen Encoder candidate
+        run: |
+          set -euo pipefail
+          test "$IU_ER_CANDIDATE_SHA" != 0000000000000000000000000000000000000000
+          test "${#IU_ER_CANDIDATE_SHA}" = 40
+      - name: Checkout exact Encoder candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Kome-Lab/Autostream-Encoder-Recorder
+          ref: ${{ env.IU_ER_CANDIDATE_SHA }}
+          path: encoder
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
+      - name: Verify both tested source trees and the same immutable shared pin
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IU_BOT_CANDIDATE_SHA"
+          test "$(git -C ../encoder rev-parse HEAD)" = "$IU_ER_CANDIDATE_SHA"
+          test "$(go env GOVERSION)" = go1.26.5
+          git log -1 --format='Bot tested commit: %H%nBot tested tree: %T'
+          git -C ../encoder log -1 --format='Encoder tested commit: %H%nEncoder tested tree: %T'
+          python3 scripts/ci/iu-source-boundary.py
+          python3 scripts/ci/iu-module-pin.py a05e4d24bc9ffef54244dc5424b32d090f87e849 --download
+          (cd ../encoder && python3 scripts/ci/iu-source-boundary.py)
+          (cd ../encoder && python3 scripts/ci/iu-module-pin.py 8c17e7389ccdb3429f1e59a1a6147b27fe3c3793 --download)
+      - name: Actual Bot HTTP client to independent Encoder process, Native and Race
+        run: |
+          set -euo pipefail
+          export IU_WS3_ER_SOURCE="$GITHUB_WORKSPACE/encoder"
+          for mode in native race; do
+            flags=()
+            if test "$mode" = race; then
+              flags=(-race)
+              export CGO_ENABLED=1
+            else
+              export CGO_ENABLED=0
+            fi
+            export IU_WS3_ER_BINARY="$RUNNER_TEMP/iu-encoder-http-$mode.test"
+            (cd ../encoder && go test -p 1 "${flags[@]}" -tags=iu_crossrepo -c ./internal/httpapi -o "$IU_WS3_ER_BINARY")
+            go test -p 1 "${flags[@]}" -tags=iu_crossrepo -count=1 -timeout=5m -json ./internal/audioforward -run '^TestIUWS3CrossRepositoryBotEncoder$' | tee "$RUNNER_TEMP/iu-cross-repository-$mode.json"
+            python3 scripts/ci/iu-json-events.py scripts/ci/ws3-crossrepo-required-tests.txt "$RUNNER_TEMP/iu-cross-repository-$mode.json"
+            for name in actual_raw_and_queue stale_vector_has_no_product_effect ack_loss_inspects_same_attempt_without_resend http_2xx_without_typed_body_is_unknown; do
+              for action in run pass; do
+                test "$(jq -sr --arg name "TestIUWS3CrossRepositoryBotEncoder/$name" --arg action "$action" '[.[] | select(.Package=="github.com/example/autostream-discord-bot/internal/audioforward" and .Test==$name and .Action==$action)] | length' "$RUNNER_TEMP/iu-cross-repository-$mode.json")" = 1
+              done
+            done
+          done
+          git diff --exit-code -- go.mod go.sum
+          git -C ../encoder diff --exit-code -- go.mod go.sum
+      - name: Preserve cross-repository execution evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iu-bot-encoder-root-events-${{ github.sha }}
+          path: ${{ runner.temp }}/iu-cross-repository-*.json
+          if-no-files-found: error
+          retention-days: 14

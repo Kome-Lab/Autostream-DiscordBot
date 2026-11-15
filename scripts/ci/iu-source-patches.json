@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "baseline": "a05e4d24bc9ffef54244dc5424b32d090f87e849",
+  "new": {
+    "docs/v3-lifecycle-producer.md": "e92a270cc084a163f02cc7eba6f1b0f4248252a5cecbe4c6c9820e7ff88dfc28",
+    "internal/audioforward/lifecycle_client.go": "bc1f0caff1670c0afe689a5ddf6246a5d5132c48d34587df0298985df0ac3f67",
+    "internal/audioforward/lifecycle_client_test.go": "43db75883b720c76733c8ff7cfa0e576b04628b15bf2ee970b93650d6e87585c",
+    "internal/audioforward/lifecycle_crossrepo_test.go": "af8b974cf53bdc4f1fd50322f84bc477b60e6167be60d9620fa831cf310541c5",
+    "scripts/ci/iu-checks.sh": "786c12193561fbe4ef6ab28bcca6aa0a8b5a9c65a47ceac03600294acb5ed6bc",
+    "scripts/ci/iu-json-events.py": "bd8fce46868353156b77c9ec0f8fdfa1908fa27121460227e0951559fe12fadc",
+    "scripts/ci/iu-module-pin.py": "73149fa31efa702ad80579a901ed77d6d67f2d9b8d29184c95e46e595b5ccc32",
+    "scripts/ci/iu-required-tests.txt": "2bb1fcff54a8444497df7a37629dbe60c50d2a6a80cdec9081b9d1f2a5f81b34",
+    "scripts/ci/iu-secret-scan.py": "e684ff48169e29687e9b41f0aa219c0efe05291dfb51bdbfd71edc1d768eb8a6",
+    "scripts/ci/iu-source-boundary.py": "4e652e3a0b259c42f1a1cacb3bd11d9f9bf1a1d4a21ec67f02144ba6978d8974",
+    "scripts/ci/iu-workflow-preserve.py": "2cb9c350c0c2763ed31b4a9e015c4f6a24573f399b68e86f77d63b962755cb0e",
+    "scripts/ci/test_iu_json_events.py": "f11ec9ce8cb0ebfcbfe30814c06db35798e107a90f43383a75a266ad329a4a01",
+    "scripts/ci/test_iu_workflow_preserve.py": "b35bf15473a55f8c3fc3b2be80c2ed1915a270b009b122ec689f2130044cc96a",
+    "scripts/ci/ws3-crossrepo-required-tests.txt": "4554716db86767658ab1577426620e1f55e091aae4b5999248d113c73a6853ea"
+  },
+  "patches": {
+    ".github/workflows/ci.yml": {
+      "before_sha256": "12ac7e50cc1e424835dae07366cc461883e014a72470e0384c98a8100b4cee81",
+      "after_sha256": "289a491b90aa28f259d15e12f9c6e2c596cf30a2b18b5341ab38df6c99dd02f0",
+      "edits": [
+        {
+          "old": "            go build ./...\n",
+          "new": "            go build ./...\n      - name: Vet all native Go packages with the pinned DAVE build\n        env:\n          GOTOOLCHAIN: local\n          GOWORK: 'off'\n          GOFLAGS: '-mod=readonly'\n          GOTELEMETRY: 'off'\n        shell: bash\n        run: |\n          set -euo pipefail\n          libdave_build=\"$PWD/third_party/discordgo/dave/libdave/cpp/build\"\n          vcpkg_libdir=\"$(find \"$libdave_build/vcpkg_installed\" -maxdepth 2 -type d -name lib -print -quit)\"\n          test -n \"$vcpkg_libdir\"\n          vcpkg_libs=\"$(find \"$vcpkg_libdir\" -maxdepth 1 -type f -name '*.a' -print | sort | tr '\\n' ' ')\"\n          CGO_ENABLED=1 \\\n          CGO_CFLAGS=\"-I$PWD/third_party/discordgo/dave/libdave/cpp/includes\" \\\n          CGO_LDFLAGS=\"-L$vcpkg_libdir $libdave_build/libdave.a -Wl,--start-group $vcpkg_libs -Wl,--end-group -lstdc++ -lm -ldl -lpthread\" \\\n            go vet -p 1 ./...\n\n  v3-product-integration-checks:\n    name: v3-product-integration-checks\n    runs-on: ubuntu-24.04\n    timeout-minutes: 25\n    permissions:\n      contents: read\n    env:\n      GOTOOLCHAIN: local\n      GOWORK: 'off'\n      GOFLAGS: '-mod=readonly'\n      GOTELEMETRY: 'off'\n      GOMAXPROCS: '2'\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          fetch-depth: 0\n          submodules: recursive\n          persist-credentials: false\n      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n        with:\n          go-version: '1.26.5'\n          check-latest: false\n          cache: false\n      - name: Required typed audioforward and original-Attempt UNKNOWN inventory\n        run: bash scripts/ci/iu-checks.sh\n      - name: Preserve exact root execution evidence\n        if: always()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n        with:\n          name: iu-bot-root-events-${{ github.sha }}\n          path: ${{ runner.temp }}/iu-*.json\n          if-no-files-found: error\n          retention-days: 14\n\n  v3-product-cross-repository-checks:\n    name: v3-product-cross-repository-checks\n    runs-on: ubuntu-24.04\n    timeout-minutes: 25\n    permissions:\n      contents: read\n    env:\n      GOTOOLCHAIN: local\n      GOWORK: 'off'\n      GOFLAGS: '-mod=readonly'\n      GOTELEMETRY: 'off'\n      GOMAXPROCS: '2'\n      IU_BOT_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n      # Publication is blocked until this is replaced by the reviewed Encoder\n      # candidate containing its actual HTTP process helper and frozen manifest.\n      IU_ER_CANDIDATE_SHA: '06075915574acb85b5756d7dbcec0decc7ad0767'\n    defaults:\n      run:\n        working-directory: bot\n        shell: bash\n    steps:\n      - name: Checkout exact Bot candidate\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: ${{ env.IU_BOT_CANDIDATE_SHA }}\n          path: bot\n          fetch-depth: 0\n          submodules: recursive\n          persist-credentials: false\n      - name: Require a frozen Encoder candidate\n        run: |\n          set -euo pipefail\n          test \"$IU_ER_CANDIDATE_SHA\" != 0000000000000000000000000000000000000000\n          test \"${#IU_ER_CANDIDATE_SHA}\" = 40\n      - name: Checkout exact Encoder candidate\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          repository: Kome-Lab/Autostream-Encoder-Recorder\n          ref: ${{ env.IU_ER_CANDIDATE_SHA }}\n          path: encoder\n          fetch-depth: 0\n          persist-credentials: false\n      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n        with:\n          go-version: '1.26.5'\n          check-latest: false\n          cache: false\n      - name: Verify both tested source trees and the same immutable shared pin\n        run: |\n          set -euo pipefail\n          test \"$(git rev-parse HEAD)\" = \"$IU_BOT_CANDIDATE_SHA\"\n          test \"$(git -C ../encoder rev-parse HEAD)\" = \"$IU_ER_CANDIDATE_SHA\"\n          test \"$(go env GOVERSION)\" = go1.26.5\n          git log -1 --format='Bot tested commit: %H%nBot tested tree: %T'\n          git -C ../encoder log -1 --format='Encoder tested commit: %H%nEncoder tested tree: %T'\n          python3 scripts/ci/iu-source-boundary.py\n          python3 scripts/ci/iu-module-pin.py a05e4d24bc9ffef54244dc5424b32d090f87e849 --download\n          (cd ../encoder && python3 scripts/ci/iu-source-boundary.py)\n          (cd ../encoder && python3 scripts/ci/iu-module-pin.py 8c17e7389ccdb3429f1e59a1a6147b27fe3c3793 --download)\n      - name: Actual Bot HTTP client to independent Encoder process, Native and Race\n        run: |\n          set -euo pipefail\n          export IU_WS3_ER_SOURCE=\"$GITHUB_WORKSPACE/encoder\"\n          for mode in native race; do\n            flags=()\n            if test \"$mode\" = race; then\n              flags=(-race)\n              export CGO_ENABLED=1\n            else\n              export CGO_ENABLED=0\n            fi\n            export IU_WS3_ER_BINARY=\"$RUNNER_TEMP/iu-encoder-http-$mode.test\"\n            (cd ../encoder && go test -p 1 \"${flags[@]}\" -tags=iu_crossrepo -c ./internal/httpapi -o \"$IU_WS3_ER_BINARY\")\n            go test -p 1 \"${flags[@]}\" -tags=iu_crossrepo -count=1 -timeout=5m -json ./internal/audioforward -run '^TestIUWS3CrossRepositoryBotEncoder$' | tee \"$RUNNER_TEMP/iu-cross-repository-$mode.json\"\n            python3 scripts/ci/iu-json-events.py scripts/ci/ws3-crossrepo-required-tests.txt \"$RUNNER_TEMP/iu-cross-repository-$mode.json\"\n            for name in actual_raw_and_queue stale_vector_has_no_product_effect ack_loss_inspects_same_attempt_without_resend http_2xx_without_typed_body_is_unknown; do\n              for action in run pass; do\n                test \"$(jq -sr --arg name \"TestIUWS3CrossRepositoryBotEncoder/$name\" --arg action \"$action\" '[.[] | select(.Package==\"github.com/example/autostream-discord-bot/internal/audioforward\" and .Test==$name and .Action==$action)] | length' \"$RUNNER_TEMP/iu-cross-repository-$mode.json\")\" = 1\n              done\n            done\n          done\n          git diff --exit-code -- go.mod go.sum\n          git -C ../encoder diff --exit-code -- go.mod go.sum\n      - name: Preserve cross-repository execution evidence\n        if: always()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n        with:\n          name: iu-bot-encoder-root-events-${{ github.sha }}\n          path: ${{ runner.temp }}/iu-cross-repository-*.json\n          if-no-files-found: error\n          retention-days: 14\n"
+        }
+      ]
+    },
+    "go.mod": {
+      "before_sha256": "e88f73a97b1c6919c60e03a59cc9f50d64f20759a6a50b1b8cdbe0bbbced578c",
+      "after_sha256": "591d9963940e52082c4c147c09ed3edea4c662cf107bd095d36e6b57b4aa14b8",
+      "edits": [
+        {
+          "old": "\tgithub.com/gorilla/websocket v1.5.3 // indirect\n",
+          "new": "\tgithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c\n\tgithub.com/gorilla/websocket v1.5.3 // indirect\n"
+        }
+      ]
+    },
+    "go.sum": {
+      "before_sha256": "c3ab4b03737f9a2b65934d4f8a36da96f2a1f202df151102d978f249e2f04abb",
+      "after_sha256": "d36a35f8b4472b93c8c6d7dd581481601510df2b9012eb18257fff1aea255954",
+      "edits": [
+        {
+          "old": "github.com/dlclark/regexp2 v1.12.0 h1:0j4c5qQmnC6XOWNjP3PIXURXN2gWx76rd3KvgdPkCz8=\n",
+          "new": "github.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c h1:HfswOPIR7VcFoko8a5LL0YqtRP1UGc6wfuFyggBOIXo=\ngithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c/go.mod h1:4mdtG844J5jWEQgB78LBHQEjzbhK+qc0ACLS7+Vlmzw=\ngithub.com/dlclark/regexp2 v1.12.0 h1:0j4c5qQmnC6XOWNjP3PIXURXN2gWx76rd3KvgdPkCz8=\n"
+        }
+      ]
+    }
+  }
+}

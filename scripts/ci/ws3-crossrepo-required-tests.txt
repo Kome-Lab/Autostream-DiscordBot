@@ -1,0 +1,2 @@
+# Actual Bot client -> separately compiled Encoder HTTP/Raw/Queue test process.
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3CrossRepositoryBotEncoder
