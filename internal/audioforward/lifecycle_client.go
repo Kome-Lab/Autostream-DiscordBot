@@ -41,6 +41,7 @@ type lifecycleIngestRequest struct {
 // LifecycleFrameSource supplies a previously bound attempt from the product's
 // trusted participant. It does not issue a permit or qualify a deployment.
 // A caller must retain the returned frame to inspect an uncertain dispatch.
+// Prepare supplies a stable snapshot; the client detaches it before network I/O.
 type LifecycleFrameSource interface {
 	Prepare(context.Context, string, []OpusPacket) (lifecycle.Record, error)
 }
@@ -148,6 +149,10 @@ func (c *LifecycleClient) Forward(ctx context.Context, endpoint, streamID, sourc
 	if err != nil {
 		return ForwardObservation{}, &LifecycleError{clientResult(lifecycle.NeedsEvidence, "BOUND_ATTEMPT_UNAVAILABLE")}
 	}
+	frame, err = freezeLifecycleRecord(frame)
+	if err != nil {
+		return ForwardObservation{}, &LifecycleError{clientResult(lifecycle.NeedsEvidence, "ATTEMPT_SNAPSHOT_UNAVAILABLE")}
+	}
 	if r := c.validateFrame(frame, streamID, packets); r.Kind != lifecycle.StructurallyCoherent {
 		return ForwardObservation{Request: frame, Assessment: r}, &LifecycleError{r}
 	}
@@ -176,10 +181,27 @@ func (c *LifecycleClient) Inspect(ctx context.Context, endpoint, streamID, token
 	if c == nil {
 		return ForwardObservation{}, &LifecycleError{clientResult(lifecycle.NeedsEvidence, "PARTICIPANT_REQUIRED")}
 	}
+	frozen, err := freezeLifecycleRecord(original)
+	if err != nil {
+		return ForwardObservation{}, &LifecycleError{clientResult(lifecycle.NeedsEvidence, "ATTEMPT_SNAPSHOT_UNAVAILABLE")}
+	}
+	original = frozen
 	if r := c.validateFrame(original, streamID, nil); r.Kind != lifecycle.StructurallyCoherent {
 		return ForwardObservation{Request: original, Assessment: r}, &LifecycleError{r}
 	}
 	return c.exchange(ctx, endpoint, streamID, token, original, nil, true)
+}
+
+func freezeLifecycleRecord(record lifecycle.Record) (lifecycle.Record, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return lifecycle.Record{}, err
+	}
+	var frozen lifecycle.Record
+	if err = json.Unmarshal(data, &frozen); err != nil {
+		return lifecycle.Record{}, err
+	}
+	return frozen, nil
 }
 
 func (c *LifecycleClient) validateFrame(frame lifecycle.Record, streamID string, packets []OpusPacket) lifecycle.Result {

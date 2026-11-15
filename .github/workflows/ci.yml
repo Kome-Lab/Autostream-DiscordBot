@@ -259,7 +259,7 @@ jobs:
       IU_BOT_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       # Publication is blocked until this is replaced by the reviewed Encoder
       # candidate containing its actual HTTP process helper and frozen manifest.
-      IU_ER_CANDIDATE_SHA: '06075915574acb85b5756d7dbcec0decc7ad0767'
+      IU_ER_CANDIDATE_SHA: '7c7ec14d2b06b866ebd5b006331f55ba01da8dfe'
     defaults:
       run:
         working-directory: bot

@@ -173,7 +173,7 @@ func TestIUWS3CrossRepositoryBotEncoder(t *testing.T) {
 		}
 	})
 	t.Run("stale_vector_has_no_product_effect", func(t *testing.T) {
-		stale := frames.record
+		var stale lifecycle.Record
 		data, _ := json.Marshal(frame)
 		_ = json.Unmarshal(data, &stale)
 		stale.Header.Correlation.AttemptID = "attempt-stale"

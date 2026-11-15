@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -185,6 +186,7 @@ func TestIUWS3BotRejectsMismatched2XX(t *testing.T) {
 }
 
 func TestIUWS3BotACKLossInspectOriginalAttempt(t *testing.T) {
+	t.Run("immutable_frame_snapshot", testBotImmutableFrameSnapshot)
 	config, frame, packets := botLifecycleFixture()
 	var dispatch, inspect atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -218,6 +220,126 @@ func TestIUWS3BotACKLossInspectOriginalAttempt(t *testing.T) {
 	out, err = client.Inspect(t.Context(), server.URL, "stream-fixture", "fixture-token", out.Request)
 	if err != nil || !out.QueueAdmitted || dispatch.Load() != 1 || inspect.Load() != 1 || config.Frames.(*fixtureFrames).calls.Load() != 1 {
 		t.Fatalf("inspect reissued attempt: %+v %v", out.Assessment, err)
+	}
+}
+
+func testBotImmutableFrameSnapshot(t *testing.T) {
+	config, frame, packets := botLifecycleFixture()
+	// Freeze the fixed test input independently of the candidate's clone helper.
+	data, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var baseline lifecycle.Record
+	if err = json.Unmarshal(data, &baseline); err != nil {
+		t.Fatal(err)
+	}
+	forwardEntered, inspectEntered := make(chan struct{}), make(chan struct{})
+	forwardRelease, inspectRelease := make(chan struct{}), make(chan struct{})
+	var forwardOnce, inspectOnce sync.Once
+	releaseForward := func() { forwardOnce.Do(func() { close(forwardRelease) }) }
+	releaseInspect := func() { inspectOnce.Do(func() { close(inspectRelease) }) }
+	metadata := make(chan lifecycle.Record, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, decodeErr := base64.RawURLEncoding.DecodeString(r.Header.Get(lifecycleHeader))
+		var received lifecycle.Record
+		if decodeErr != nil || json.Unmarshal(raw, &received) != nil {
+			t.Error("shared request metadata missing")
+		}
+		metadata <- received
+		if r.URL.Path == "/v3/streams/stream-fixture/audio/opus/inspect" {
+			close(inspectEntered)
+			<-inspectRelease
+		} else {
+			close(forwardEntered)
+			<-forwardRelease
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(botInspection(config, baseline))
+	}))
+	defer server.Close()
+	defer releaseForward()
+	defer releaseInspect()
+	client, err := NewLifecycleClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type answer struct {
+		observation ForwardObservation
+		err         error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		out, callErr := client.Forward(t.Context(), server.URL, "stream-fixture", "bot-fixture", "fixture-token", packets)
+		answers <- answer{out, callErr}
+	}()
+	select {
+	case <-forwardEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("forward did not reach HTTP barrier")
+	}
+	assertOriginal := func(record lifecycle.Record) {
+		t.Helper()
+		if record.Vector == nil || len(record.Header.DomainRef.Resources) == 0 || record.Header.DomainRef.Resources[0].ResourceID != "stream-fixture" {
+			t.Fatal("retained attempt changed its original domain")
+		}
+		jobFound := false
+		for _, entry := range record.Vector.Vector {
+			if entry.Key == config.JobAxisKey && entry.Value.Uint64 != nil && *entry.Value.Uint64 == 1 {
+				jobFound = true
+			}
+		}
+		if !jobFound {
+			t.Fatal("retained attempt changed its original generation")
+		}
+	}
+	assertOriginal(<-metadata)
+	mutate := func(record *lifecycle.Record) {
+		record.Header.DomainRef.Resources[0].ResourceID = "mutated-source-resource"
+		for i := range record.Vector.Vector {
+			if record.Vector.Vector[i].Key == config.JobAxisKey {
+				*record.Vector.Vector[i].Value.Uint64 = 99
+			}
+		}
+	}
+	// The owner changes reused slices only after the request is on the wire.
+	// This must not change the returned original-attempt snapshot or its ACK.
+	mutate(&config.Frames.(*fixtureFrames).record)
+	releaseForward()
+	var forwarded answer
+	select {
+	case forwarded = <-answers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("forward did not finish")
+	}
+	if forwarded.err != nil || !forwarded.observation.QueueAdmitted {
+		t.Fatalf("source alias changed ACK binding: %v", forwarded.err)
+	}
+	assertOriginal(forwarded.observation.Request)
+	original := forwarded.observation.Request
+	go func(input lifecycle.Record) {
+		out, callErr := client.Inspect(t.Context(), server.URL, "stream-fixture", "fixture-token", input)
+		answers <- answer{out, callErr}
+	}(original)
+	select {
+	case <-inspectEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Inspect did not reach HTTP barrier")
+	}
+	assertOriginal(<-metadata)
+	mutate(&original)
+	releaseInspect()
+	select {
+	case inspected := <-answers:
+		if inspected.err != nil || !inspected.observation.QueueAdmitted {
+			t.Fatalf("caller alias changed Inspect binding: %v", inspected.err)
+		}
+		assertOriginal(inspected.observation.Request)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Inspect did not finish")
+	}
+	if config.Frames.(*fixtureFrames).calls.Load() != 1 {
+		t.Fatal("Inspect prepared a new attempt")
 	}
 }
 
