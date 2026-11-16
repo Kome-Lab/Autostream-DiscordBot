@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/example/autostream-discord-bot/internal/control"
 	"github.com/example/autostream-discord-bot/internal/discord"
 )
 
@@ -30,6 +31,8 @@ type autoStartRetry struct {
 	guildID             string
 	voiceChannelID      string
 	capacityBusy        bool
+	managed             bool
+	request             control.AutoStartRequest
 }
 
 func (m *Manager) SetStreamStarter(starter StreamStarter) {
@@ -158,6 +161,8 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 		reconnectGeneration: m.reconnectGeneration,
 		guildID:             event.GuildID,
 		voiceChannelID:      event.VoiceChannelID,
+		managed:             m.streamDefaults[streamID].AutoStartHoldRequired,
+		request:             managedAutoStartRequest(streamID, m.streamDefaults[streamID]),
 	}
 	m.autoStartRetries[streamID] = retry
 	m.lastEventAt = now
@@ -167,6 +172,29 @@ func (m *Manager) VoiceUserJoined(event discord.VoiceJoinEvent) {
 	go func() {
 		defer m.finishAutoStartRetry(streamID, retry)
 		if retryCtx.Err() != nil || !m.autoStartRetryStillValid(streamID, retry) {
+			return
+		}
+		if retry.managed {
+			managed, ok := starter.(ManagedStreamStarter)
+			if !ok || !m.claimManagedAutoStartDispatch(streamID, retry) {
+				return
+			}
+			if err := managed.StartManagedStream(streamID, retry.request); err != nil {
+				m.SetAutoStartSourceAvailable(false)
+				// The original CP attempt is now the only result-query target.
+				// No legacy retry, stale-successor replay or new request is issued.
+				logAutoStartRetryFailure(streamID, 1, err, false)
+				if inspector, ok := starter.(ManagedStreamInspector); ok {
+					inspection, inspectErr := inspector.InspectManagedStream(streamID, retry.request.RequestID)
+					if inspectErr != nil {
+						log.Printf("Discord auto-start diagnostic: stage=inspect stream_id=%s knowledge=unknown", streamID)
+					} else {
+						// Boundary observations never establish an aggregate Start result.
+						// Retain the unknown dispatch latch and unavailable source view.
+						log.Printf("Discord auto-start diagnostic: stage=inspect stream_id=%s knowledge=partial boundary_count=%d", streamID, len(inspection.StartObservations))
+					}
+				}
+			}
 			return
 		}
 		if err := starter.StartStream(streamID); err != nil {
@@ -286,7 +314,7 @@ func (m *Manager) autoStartRetryStillValid(streamID string, retry *autoStartRetr
 	}
 	source, ok := m.voice.(discord.AutoStartVoicePresenceSource)
 	if !ok {
-		return true
+		return !retry.managed
 	}
 	// The initial Gateway callback may have been queued before the last human
 	// left. Re-read current presence for the first request and every bounded
@@ -318,10 +346,14 @@ func (m *Manager) autoStartRetryStillValid(streamID string, retry *autoStartRetr
 }
 
 func (m *Manager) autoStartRetryStillValidLocked(streamID string, retry *autoStartRetry) bool {
-	if m.autoStartRetries[streamID] != retry || m.current.StreamID != "" || m.reconnectGeneration != retry.reconnectGeneration {
+	if retry == nil || m.autoStartRetries[streamID] != retry || m.current.StreamID != "" || m.reconnectGeneration != retry.reconnectGeneration {
 		return false
 	}
-	return m.streamDefaults[streamID].AssignmentEpoch == retry.assignmentEpoch && m.matchingAutoStartStreamLocked(retry.guildID, retry.voiceChannelID) == streamID
+	current := m.streamDefaults[streamID]
+	if !m.autoStartHoldAllowsLocked(streamID, current) || (retry.managed && managedAutoStartRequest(streamID, current) != retry.request) {
+		return false
+	}
+	return current.AssignmentEpoch == retry.assignmentEpoch && m.matchingAutoStartStreamLocked(retry.guildID, retry.voiceChannelID) == streamID
 }
 
 func (m *Manager) finishAutoStartRetry(streamID string, retry *autoStartRetry) {
@@ -366,7 +398,7 @@ func (m *Manager) matchingAutoStartStreamLocked(guildID, voiceChannelID string) 
 	}
 	matched := ""
 	for streamID, defaults := range m.streamDefaults {
-		if !defaults.AutoStartEnabled {
+		if !defaults.AutoStartEnabled || !m.autoStartHoldAllowsLocked(streamID, defaults) {
 			continue
 		}
 		if defaults.GuildID != guildID || defaults.VoiceChannelID != voiceChannelID {

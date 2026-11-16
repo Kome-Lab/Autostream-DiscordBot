@@ -1,0 +1,7 @@
+# Reviewed WS3 Bot pure audioforward product package; no live Discord/Opus input.
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3BotTypedAdmission
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3BotRejectsMismatched2XX
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3BotACKLossInspectOriginalAttempt
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3BotStaleGenerationHasNoDispatch
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3BotRequiresExplicitProfile
+github.com/example/autostream-discord-bot/internal/audioforward TestIUWS3BotNoRedispatch

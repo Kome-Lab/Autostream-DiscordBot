@@ -83,6 +83,13 @@ func selectDiscordWaitingGateway(cfg control.RuntimeConfig, active currentGatewa
 			AssignmentEpoch: discordWaitingBindingEpoch(binding),
 			GuildID:         binding.GuildID, VoiceChannelID: binding.VoiceChannelID,
 			TextChannelID: binding.TextChannelID, AutoStartEnabled: true,
+			AutoStartHoldRequired:    binding.AutoStartHoldRequired,
+			AutoStartHoldKnown:       binding.AutoStartHoldKnown,
+			AutoStartHold:            binding.AutoStartHold,
+			AutoStartHoldRevision:    binding.AutoStartHoldRevision,
+			ExpectedStreamRevision:   binding.ExpectedStreamRevision,
+			ExpectedSettingsRevision: binding.ExpectedSettingsRevision,
+			ExpectedRunID:            binding.ExpectedRunID,
 		}
 		if !result.selected {
 			result.binding, result.selected = binding.DiscordWaitingCredentialBinding, true

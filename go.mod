@@ -14,6 +14,7 @@ replace github.com/cartridge-gg/discordgo => ./third_party/discordgo
 replace github.com/example/autostream-contracts => github.com/Kome-Lab/Autostream-Contracts v1.2.12-0.20260903202917-82716abd84f2
 
 require (
+	github.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	golang.org/x/crypto v0.55.0 // indirect

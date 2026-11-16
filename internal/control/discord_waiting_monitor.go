@@ -37,11 +37,18 @@ type DiscordWaitingCredentialBinding struct {
 
 type DiscordWaitingMonitorBinding struct {
 	DiscordWaitingCredentialBinding
-	GuildID          string `json:"guild_id"`
-	VoiceChannelID   string `json:"voice_channel_id"`
-	TextChannelID    string `json:"text_channel_id,omitempty"`
-	TargetRevision   uint64 `json:"target_revision"`
-	AutoStartTrigger string `json:"auto_start_trigger"`
+	GuildID                  string `json:"guild_id"`
+	VoiceChannelID           string `json:"voice_channel_id"`
+	TextChannelID            string `json:"text_channel_id,omitempty"`
+	TargetRevision           uint64 `json:"target_revision"`
+	AutoStartTrigger         string `json:"auto_start_trigger"`
+	AutoStartHoldRequired    bool   `json:"auto_start_hold_required"`
+	AutoStartHoldKnown       bool   `json:"auto_start_hold_known"`
+	AutoStartHold            bool   `json:"auto_start_hold"`
+	AutoStartHoldRevision    uint64 `json:"auto_start_hold_revision"`
+	ExpectedStreamRevision   string `json:"expected_stream_revision"`
+	ExpectedSettingsRevision string `json:"expected_settings_revision"`
+	ExpectedRunID            string `json:"expected_run_id"`
 }
 
 // Monitoring uses the existing service-level secret lease. No execution,

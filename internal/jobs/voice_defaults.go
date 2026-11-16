@@ -10,7 +10,11 @@ import (
 func (m *Manager) RefreshRuntimeConfig(refresh func() error) error {
 	m.runtimeRefreshMu.Lock()
 	defer m.runtimeRefreshMu.Unlock()
-	return refresh()
+	err := refresh()
+	if err != nil {
+		m.SetAutoStartSourceAvailable(false)
+	}
+	return err
 }
 
 func (m *Manager) ReconcileGateway(cfg discord.Config, selected bool) error {
@@ -52,11 +56,18 @@ func (m *Manager) ReconcileGatewayCredential(reference string, selected bool, re
 }
 
 type VoiceDefaults struct {
-	AssignmentEpoch  string
-	GuildID          string
-	VoiceChannelID   string
-	TextChannelID    string
-	AutoStartEnabled bool
+	AssignmentEpoch          string
+	GuildID                  string
+	VoiceChannelID           string
+	TextChannelID            string
+	AutoStartEnabled         bool
+	AutoStartHoldRequired    bool
+	AutoStartHoldKnown       bool
+	AutoStartHold            bool
+	AutoStartHoldRevision    uint64
+	ExpectedStreamRevision   string
+	ExpectedSettingsRevision string
+	ExpectedRunID            string
 }
 
 func (m *Manager) SetVoiceDefaults(defaults VoiceDefaults) {
@@ -73,6 +84,10 @@ func (m *Manager) SetVoiceDefaults(defaults VoiceDefaults) {
 func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 	m.mu.Lock()
 	previousDefaults := m.streamDefaults
+	m.autoStartSourceUnavailable = false
+	if m.managedAutoStartStreams == nil {
+		m.managedAutoStartStreams = map[string]bool{}
+	}
 	m.streamDefaults = map[string]VoiceDefaults{}
 	targets := make([]discord.AutoStartVoiceTarget, 0, len(defaults))
 	for streamID, item := range defaults {
@@ -80,15 +95,32 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 		if streamID == "" {
 			continue
 		}
+		if m.requireAutoStartHold && !item.AutoStartHoldRequired {
+			item.AutoStartHoldRequired, item.AutoStartHoldKnown = true, false
+		}
+		if item.AutoStartHoldRequired {
+			m.managedAutoStartStreams[streamID] = true
+		} else if m.managedAutoStartStreams[streamID] {
+			// A managed target cannot downgrade to a legacy cached observation.
+			item.AutoStartHoldRequired, item.AutoStartHoldKnown = true, false
+		}
+		item = m.observeManagedHoldLocked(streamID, item)
 		if old, ok := previousDefaults[streamID]; ok && old.AssignmentEpoch != item.AssignmentEpoch {
 			delete(m.autoStartPending, streamID)
 		}
 		m.streamDefaults[streamID] = VoiceDefaults{
-			AssignmentEpoch:  item.AssignmentEpoch,
-			GuildID:          strings.TrimSpace(item.GuildID),
-			VoiceChannelID:   strings.TrimSpace(item.VoiceChannelID),
-			TextChannelID:    strings.TrimSpace(item.TextChannelID),
-			AutoStartEnabled: item.AutoStartEnabled,
+			AssignmentEpoch:          item.AssignmentEpoch,
+			GuildID:                  strings.TrimSpace(item.GuildID),
+			VoiceChannelID:           strings.TrimSpace(item.VoiceChannelID),
+			TextChannelID:            strings.TrimSpace(item.TextChannelID),
+			AutoStartEnabled:         item.AutoStartEnabled,
+			AutoStartHoldRequired:    item.AutoStartHoldRequired,
+			AutoStartHoldKnown:       item.AutoStartHoldKnown,
+			AutoStartHold:            item.AutoStartHold,
+			AutoStartHoldRevision:    item.AutoStartHoldRevision,
+			ExpectedStreamRevision:   item.ExpectedStreamRevision,
+			ExpectedSettingsRevision: item.ExpectedSettingsRevision,
+			ExpectedRunID:            item.ExpectedRunID,
 		}
 		if item.AutoStartEnabled {
 			targets = append(targets, discord.AutoStartVoiceTarget{
@@ -137,7 +169,7 @@ func (m *Manager) SetStreamVoiceDefaults(defaults map[string]VoiceDefaults) {
 	}
 	for streamID := range m.autoStartRetries {
 		item, ok := m.streamDefaults[streamID]
-		if !ok || !item.AutoStartEnabled || item.AssignmentEpoch != m.autoStartRetries[streamID].assignmentEpoch {
+		if !ok || !item.AutoStartEnabled || !m.autoStartHoldAllowsLocked(streamID, item) || item.AssignmentEpoch != m.autoStartRetries[streamID].assignmentEpoch || (m.autoStartRetries[streamID].managed && item.AutoStartHoldRevision != m.autoStartRetries[streamID].request.ExpectedHoldRevision) {
 			m.cancelAutoStartRetryLocked(streamID)
 		}
 	}

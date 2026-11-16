@@ -191,13 +191,20 @@ type RuntimeProfile struct {
 }
 
 type StreamDiscordConfig struct {
-	StreamID         string `json:"stream_id"`
-	AssignmentRole   string `json:"assignment_role"`
-	DiscordConfigID  string `json:"discord_config_id"`
-	GuildID          string `json:"guild_id"`
-	VoiceChannelID   string `json:"voice_channel_id"`
-	TextChannelID    string `json:"text_channel_id,omitempty"`
-	AutoStartTrigger string `json:"auto_start_trigger,omitempty"`
+	StreamID                 string `json:"stream_id"`
+	AssignmentRole           string `json:"assignment_role"`
+	DiscordConfigID          string `json:"discord_config_id"`
+	GuildID                  string `json:"guild_id"`
+	VoiceChannelID           string `json:"voice_channel_id"`
+	TextChannelID            string `json:"text_channel_id,omitempty"`
+	AutoStartTrigger         string `json:"auto_start_trigger,omitempty"`
+	AutoStartHoldRequired    bool   `json:"auto_start_hold_required"`
+	AutoStartHoldKnown       bool   `json:"auto_start_hold_known"`
+	AutoStartHold            bool   `json:"auto_start_hold"`
+	AutoStartHoldRevision    uint64 `json:"auto_start_hold_revision"`
+	ExpectedStreamRevision   string `json:"expected_stream_revision"`
+	ExpectedSettingsRevision string `json:"expected_settings_revision"`
+	ExpectedRunID            string `json:"expected_run_id"`
 }
 
 func (cfg RuntimeConfig) DiscordConfigForStream(streamID string) (StreamDiscordConfig, bool) {

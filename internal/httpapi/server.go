@@ -137,6 +137,8 @@ func NewServerWithRuntimeConfigAndUpdaterIdentity(serviceType string, manager *j
 	mux.HandleFunc("POST /jobs/start", server.startJob)
 	mux.HandleFunc("POST /jobs/{id}/stop", server.stopJob)
 	mux.HandleFunc("GET /streams/{id}/participants", server.participants)
+	mux.HandleFunc("GET /streams/{id}/auto-start-condition", server.autoStartCondition)
+	mux.HandleFunc("GET /streams/{id}/auto-start-presence", server.autoStartPresence)
 	mux.HandleFunc("POST /streams/{id}/active-speaker", server.activeSpeaker)
 	mux.HandleFunc("POST /streams/{id}/notifications/youtube-live", server.youtubeLiveNotification)
 	return securityHeaders(mux)
