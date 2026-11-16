@@ -335,3 +335,64 @@ jobs:
           path: ${{ runner.temp }}/iu-cross-repository-*.json
           if-no-files-found: error
           retention-days: 14
+
+  v3-manual-auto-start-hold-checks:
+    name: v3-manual-auto-start-hold-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOFLAGS: '-mod=readonly'
+      GOTELEMETRY: 'off'
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
+      - name: Resolve DAVE cache key
+        id: dave-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          vcpkg_root="$PWD/third_party/discordgo/dave/libdave/cpp/vcpkg"
+          echo "vcpkg_commit=$(git -C "$vcpkg_root" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache DAVE native build
+        id: dave-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            third_party/discordgo/dave/libdave/cpp/build
+            third_party/discordgo/dave/libdave/cpp/vcpkg/vcpkg
+            third_party/discordgo/dave/libdave/cpp/vcpkg/downloads
+            third_party/discordgo/dave/libdave/cpp/vcpkg/packages
+            third_party/discordgo/dave/libdave/cpp/vcpkg/installed
+          key: ${{ runner.os }}-${{ runner.arch }}-dave-${{ steps.dave-cache-key.outputs.vcpkg_commit }}-${{ hashFiles('third_party/discordgo/dave/libdave/cpp/CMakeLists.txt', 'third_party/discordgo/dave/libdave/cpp/Makefile', 'third_party/discordgo/dave/libdave/cpp/src/**', 'third_party/discordgo/dave/libdave/cpp/includes/**', 'third_party/discordgo/dave/libdave/cpp/vcpkg-alts/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-dave-${{ steps.dave-cache-key.outputs.vcpkg_commit }}-
+      - name: Required Bot public path and original-request roots with pinned DAVE
+        env:
+          MSR_DAVE_CACHE_HIT: ${{ steps.dave-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/msr-native-dave.sh "$RUNNER_TEMP/msr-dave.env"
+          source "$RUNNER_TEMP/msr-dave.env"
+          bash scripts/ci/msr-checks.sh
+      - name: Preserve exact MSR root execution evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: manual-auto-start-hold-${{ github.sha }}
+          path: ${{ runner.temp }}/msr-*.json
+          if-no-files-found: error
+          retention-days: 14

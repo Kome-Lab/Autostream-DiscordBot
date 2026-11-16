@@ -96,6 +96,7 @@ func main() {
 		source.SetAudioForwarder(audioforward.Client{Config: cfg}, controlCfg.ServiceID)
 	}
 	manager := jobs.NewManagerWithReporter(voiceClient, buildWorkerReporter())
+	manager.RequireAutoStartHoldObservations()
 	manager.SetRuntimeGatewayReconciler(func(ctx context.Context, cfg control.RuntimeConfig) error {
 		return reconcileRuntimeGateway(ctx, control.Client{Config: control.ConfigFromEnv()}, manager, cfg)
 	})
@@ -628,11 +629,18 @@ func streamDiscordDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) map[strin
 			continue
 		}
 		defaults[item.StreamID] = jobs.VoiceDefaults{
-			AssignmentEpoch:  epoch,
-			GuildID:          item.GuildID,
-			VoiceChannelID:   item.VoiceChannelID,
-			TextChannelID:    item.TextChannelID,
-			AutoStartEnabled: strings.TrimSpace(item.AutoStartTrigger) == "discord_voice_join",
+			AssignmentEpoch:          epoch,
+			GuildID:                  item.GuildID,
+			VoiceChannelID:           item.VoiceChannelID,
+			TextChannelID:            item.TextChannelID,
+			AutoStartEnabled:         strings.TrimSpace(item.AutoStartTrigger) == "discord_voice_join",
+			AutoStartHoldRequired:    item.AutoStartHoldRequired,
+			AutoStartHoldKnown:       item.AutoStartHoldKnown,
+			AutoStartHold:            item.AutoStartHold,
+			AutoStartHoldRevision:    item.AutoStartHoldRevision,
+			ExpectedStreamRevision:   item.ExpectedStreamRevision,
+			ExpectedSettingsRevision: item.ExpectedSettingsRevision,
+			ExpectedRunID:            item.ExpectedRunID,
 		}
 	}
 	return defaults

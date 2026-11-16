@@ -1,0 +1,12 @@
+# CGO-free adapters only. Native DAVE voice binary is not qualified by this file.
+github.com/example/autostream-discord-bot/internal/control TestMSRManagedAutoStartSendsOriginalObservationOnce
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetClosedFrameSurvivesRestartAndRejectsDelayedStart
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetManualStartPreservesHoldAndRequestCannotReplay
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetSecondLiveCheckAndUnknownRemainDistinct
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetHoldWaitsForLaunchExclusionAcrossGuards
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetRestartIdentityAndCorruptStoreReject
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetHTTPInspectorUsesTrustedOriginAndNoRetries
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetEnrollmentSurvivesConfigurationLoss
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetHistorySegmentationNeverForgetsRequest
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetProcessBarrier
+github.com/example/autostream-discord-bot/internal/manualhold TestMSRTargetProcessACKLossKeepsUnknownAndExclusion

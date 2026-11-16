@@ -34,6 +34,11 @@ type Manager struct {
 	autoStartPending            map[string]time.Time
 	autoStartStopped            map[string]VoiceDefaults
 	autoStartRetries            map[string]*autoStartRetry
+	managedAutoStartStreams     map[string]bool
+	managedAutoStartAttempts    map[string]bool
+	managedHoldObservations     map[string]managedHoldObservation
+	autoStartSourceUnavailable  bool
+	requireAutoStartHold        bool
 	autoStopPending             map[string]bool
 	autoStopGeneration          map[string]uint64
 	autoStopAttempts            map[string]int
@@ -85,21 +90,24 @@ func NewManagerWithReporter(voice discord.Client, reporter EventReporter) *Manag
 		voice = &discord.NoopClient{}
 	}
 	return &Manager{
-		voice:               voice,
-		reporter:            reporter,
-		participants:        map[string]Participant{},
-		activeSpeakers:      map[string]bool{},
-		streamDefaults:      map[string]VoiceDefaults{},
-		autoStartPending:    map[string]time.Time{},
-		autoStartStopped:    map[string]VoiceDefaults{},
-		autoStartRetries:    map[string]*autoStartRetry{},
-		autoStopPending:     map[string]bool{},
-		autoStopGeneration:  map[string]uint64{},
-		autoStopAttempts:    map[string]int{},
-		autoStopInFlight:    map[string]autoStopInFlight{},
-		autoStopLastAttempt: map[string]time.Time{},
-		rejoinIntents:       map[string]autoStopRejoinIntent{},
-		rejoinReconcileRun:  map[string]bool{},
+		voice:                    voice,
+		reporter:                 reporter,
+		participants:             map[string]Participant{},
+		activeSpeakers:           map[string]bool{},
+		streamDefaults:           map[string]VoiceDefaults{},
+		autoStartPending:         map[string]time.Time{},
+		autoStartStopped:         map[string]VoiceDefaults{},
+		autoStartRetries:         map[string]*autoStartRetry{},
+		managedAutoStartStreams:  map[string]bool{},
+		managedAutoStartAttempts: map[string]bool{},
+		managedHoldObservations:  map[string]managedHoldObservation{},
+		autoStopPending:          map[string]bool{},
+		autoStopGeneration:       map[string]uint64{},
+		autoStopAttempts:         map[string]int{},
+		autoStopInFlight:         map[string]autoStopInFlight{},
+		autoStopLastAttempt:      map[string]time.Time{},
+		rejoinIntents:            map[string]autoStopRejoinIntent{},
+		rejoinReconcileRun:       map[string]bool{},
 		// The Panel stops Bot, Encoder, and Worker in sequence (each service
 		// call may take its bounded timeout) before it persists a newly rearmed
 		// waiting stream. Keep a deliberately bounded, but operationally wider,
